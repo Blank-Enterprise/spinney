@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::diff::{FileDiff, LineKind};
+use crate::diff::{FileDiff, Line, LineKind};
 use crate::git;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -15,6 +15,8 @@ pub enum Direction {
 /// Build a patch from the selected `(hunk_idx, line_idx)` lines of `fd`.
 /// Stage takes an index→worktree diff; Unstage takes a HEAD→index diff, applied reversed.
 /// `None` when the file is binary or no Add/Del line is selected.
+/// Only for Modified files: added, deleted, untracked and mode-changed files are staged
+/// at file level (`stage_file` / `unstage_file`), since the patch carries no mode headers.
 pub fn build_patch(
     fd: &FileDiff,
     selected: &HashSet<(usize, usize)>,
@@ -36,7 +38,8 @@ pub fn build_patch(
         }
         // (prefix, text, no_newline) per emitted line.
         let mut out: Vec<(char, &str, bool)> = Vec::new();
-        for (li, l) in h.lines.iter().enumerate() {
+        for li in pair_order(&h.lines) {
+            let l = &h.lines[li];
             let prefix = match (l.kind, picked(li), dir) {
                 (LineKind::Context, ..) => ' ',
                 (LineKind::Add, true, _) => '+',
@@ -71,6 +74,33 @@ pub fn build_patch(
     Some(format!(
         "diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n{body}"
     ))
+}
+
+/// Line indices of `lines` with each change run (all Dels, then all Adds) interleaved as
+/// Del i, Add i, then the longer side's leftovers. Each side keeps its own order, and an
+/// unselected line turned into context stays beside its partner instead of reordering
+/// the result.
+fn pair_order(lines: &[Line]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind == LineKind::Context {
+            order.push(i);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < lines.len() && lines[i].kind != LineKind::Context {
+            i += 1;
+        }
+        let (dels, adds): (Vec<usize>, Vec<usize>) =
+            (start..i).partition(|&k| lines[k].kind == LineKind::Del);
+        for k in 0..dels.len().max(adds.len()) {
+            order.extend(dels.get(k));
+            order.extend(adds.get(k));
+        }
+    }
+    order
 }
 
 /// The side the patch matches against (old for Stage, new for Unstage) keeps the diff's
@@ -256,7 +286,8 @@ mod tests {
         // `-e` carries the marker but reverse-applying it puts lines after it.
         let sel = pick(&fd, &[(Del, "e")]);
         stage(d, "f.txt", &sel, Direction::Unstage);
-        assert_eq!(index(d, "f.txt"), "a\nB\nc\ne\nD\ne\nf");
+        // `-e` pairs with `+e`, so the restored `e` lands beside it, after `D`.
+        assert_eq!(index(d, "f.txt"), "a\nB\nc\nD\ne\ne\nf");
     }
 
     #[test]
@@ -272,6 +303,51 @@ mod tests {
                 ('+', "y", false)
             ]
         );
+    }
+
+    const PAIR_BASE: &str = "c\nd\ne\nz\n";
+    const PAIR_WORK: &str = "c\nD\nE\nz\n";
+
+    /// Apply `want` from the two-pair block `-d -e +D +E` and return the index.
+    fn pair_case(want: &[(LineKind, &str)], dir: Direction) -> String {
+        let tmp = repo("p.txt", PAIR_BASE, PAIR_WORK);
+        let d = tmp.path();
+        if dir == Direction::Unstage {
+            g(d, &["add", "p.txt"]);
+        }
+        let fd = file_diff(d, "p.txt", dir == Direction::Unstage).unwrap();
+        stage(d, "p.txt", &pick(&fd, want), dir);
+        index(d, "p.txt")
+    }
+
+    #[test]
+    fn stage_first_pair() {
+        let got = pair_case(&[(Del, "d"), (Add, "D")], Direction::Stage);
+        assert_eq!(got, "c\nD\ne\nz\n");
+    }
+
+    #[test]
+    fn stage_second_pair() {
+        let got = pair_case(&[(Del, "e"), (Add, "E")], Direction::Stage);
+        assert_eq!(got, "c\nd\nE\nz\n");
+    }
+
+    #[test]
+    fn unstage_first_pair() {
+        let got = pair_case(&[(Del, "d"), (Add, "D")], Direction::Unstage);
+        assert_eq!(got, "c\nd\nE\nz\n");
+    }
+
+    #[test]
+    fn unstage_second_pair() {
+        let got = pair_case(&[(Del, "e"), (Add, "E")], Direction::Unstage);
+        assert_eq!(got, "c\nD\ne\nz\n");
+    }
+
+    #[test]
+    fn stage_add_only() {
+        let got = pair_case(&[(Add, "D")], Direction::Stage);
+        assert_eq!(got, "c\nd\nD\ne\nz\n");
     }
 
     const LONG_BASE: &str =
