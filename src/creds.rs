@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::config::Space;
+use crate::config::{Config, Space};
 use crate::git;
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -26,12 +26,21 @@ pub fn delete_token(space_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pure core of the `get` operation. `stdin` is git's request; Spinney answers every host the
-/// same way because the helper is only installed into repos that belong to the space.
-pub fn helper_response(_stdin: &str, token: Option<&str>) -> String {
+/// Pure core of the `get` operation. Answers only for https requests to exactly the space's
+/// host, so the PAT never goes to submodule, redirect or insteadOf targets elsewhere.
+pub fn helper_response(stdin: &str, host: &str, token: Option<&str>) -> String {
+    let mut https = false;
+    let mut host_ok = false;
+    for line in stdin.lines() {
+        match line.split_once('=') {
+            Some(("protocol", v)) => https = v == "https",
+            Some(("host", v)) => host_ok = v.eq_ignore_ascii_case(host),
+            _ => {}
+        }
+    }
     match token {
-        Some(t) => format!("username=x-access-token\npassword={t}\n"),
-        None => String::new(),
+        Some(t) if https && host_ok => format!("username=x-access-token\npassword={t}\n"),
+        _ => String::new(),
     }
 }
 
@@ -46,9 +55,19 @@ pub fn helper_main(args: &[String]) -> i32 {
     }
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    let cfg = match Config::load_from(&Config::path()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("spinney credential: {e}");
+            return 1;
+        }
+    };
+    let Some(space) = cfg.spaces.iter().find(|s| &s.id == space_id) else {
+        return 0;
+    };
     match get_token(space_id) {
         Ok(token) => {
-            print!("{}", helper_response(&input, token.as_deref()));
+            print!("{}", helper_response(&input, &space.host, token.as_deref()));
             0
         }
         Err(e) => {
@@ -58,9 +77,14 @@ pub fn helper_main(args: &[String]) -> i32 {
     }
 }
 
+/// Single-quote `exe` for `sh -c`, escaping embedded quotes as `'\''`.
+fn helper_command(exe: &str, space_id: &str) -> String {
+    format!("!'{}' credential {}", exe.replace('\'', "'\\''"), space_id)
+}
+
 fn helper_value(space: &Space) -> Result<String> {
     let exe = std::env::current_exe().context("cannot locate spinney executable")?;
-    Ok(format!("!'{}' credential {}", exe.display(), space.id))
+    Ok(helper_command(&exe.to_string_lossy(), &space.id))
 }
 
 /// Write author identity and the Spinney-only credential helper into a repo's local config.
@@ -104,14 +128,33 @@ mod tests {
     #[test]
     fn helper_get_with_token() {
         assert_eq!(
-            helper_response("protocol=https\nhost=github.com\n\n", Some("abc")),
+            helper_response("protocol=https\nhost=github.com\n\n", "github.com", Some("abc")),
+            "username=x-access-token\npassword=abc\n"
+        );
+        assert_eq!(
+            helper_response("protocol=https\nhost=GitHub.com\n\n", "github.com", Some("abc")),
             "username=x-access-token\npassword=abc\n"
         );
     }
 
     #[test]
+    fn helper_get_rejects_other_host_or_http() {
+        let other = "protocol=https\nhost=evil.example.com\n\n";
+        assert_eq!(helper_response(other, "github.com", Some("abc")), "");
+        let http = "protocol=http\nhost=github.com\n\n";
+        assert_eq!(helper_response(http, "github.com", Some("abc")), "");
+        let port = "protocol=https\nhost=github.com:8443\n\n";
+        assert_eq!(helper_response(port, "github.com", Some("abc")), "");
+    }
+
+    #[test]
+    fn helper_command_escapes_quotes() {
+        assert_eq!(helper_command("/a b/it's/spinney", "id"), "!'/a b/it'\\''s/spinney' credential id");
+    }
+
+    #[test]
     fn helper_get_without_token_empty() {
-        assert_eq!(helper_response("host=github.com\n", None), "");
+        assert_eq!(helper_response("protocol=https\nhost=github.com\n", "github.com", None), "");
     }
 
     #[test]
