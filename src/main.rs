@@ -8,6 +8,7 @@ mod project;
 mod refs;
 mod stage;
 mod status;
+mod ui;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,12 +18,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Spinney",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(App))),
+        Box::new(|cc| Ok(Box::new(ui::SpinneyApp::new(cc.egui_ctx.clone())))),
     )
-}
-
-struct App;
-
-impl eframe::App for App {
-    fn ui(&mut self, _ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {}
 }
