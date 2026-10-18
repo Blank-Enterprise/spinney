@@ -1,7 +1,9 @@
 mod config;
 mod creds;
+mod diff;
 mod git;
 mod project;
+mod status;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
