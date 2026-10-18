@@ -1,3 +1,6 @@
+mod config;
+mod git;
+
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("credential") {

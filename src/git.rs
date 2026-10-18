@@ -1,0 +1,81 @@
+#![allow(dead_code)]
+
+use anyhow::{bail, Context, Result};
+use std::io::Write;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C");
+    cmd
+}
+
+fn finish(child: Child, args: &[&str]) -> Result<String> {
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run git in `dir`, returning stdout. A non-zero exit becomes an error carrying stderr.
+pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
+    run_stdin(dir, args, &[])
+}
+
+pub fn run_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Result<String> {
+    let mut child = command(dir, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git")?;
+    // Write on a thread so a large stdin cannot deadlock against full stdout/stderr pipes.
+    let mut pipe = child.stdin.take().expect("stdin piped");
+    let data = stdin.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = pipe.write_all(&data); // git may exit before reading everything
+    });
+    let result = finish(child, args);
+    let _ = writer.join();
+    result
+}
+
+/// Spawn git with stdout piped for streaming; the caller owns the child.
+pub fn spawn_stream(dir: &Path, args: &[&str]) -> Result<Child> {
+    command(dir, args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn git")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_returns_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), &["init", "-q"]).unwrap();
+        let out = run(tmp.path(), &["rev-parse", "--is-inside-work-tree"]).unwrap();
+        assert_eq!(out, "true\n");
+    }
+
+    #[test]
+    fn run_error_has_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), &["init", "-q"]).unwrap();
+        let err = run(tmp.path(), &["rev-parse", "HEAD"]).unwrap_err();
+        assert!(err.to_string().contains("fatal"), "{err}");
+    }
+}
