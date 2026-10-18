@@ -50,7 +50,10 @@ impl Space {
 
 impl Config {
     pub fn path() -> PathBuf {
-        dirs::config_dir().unwrap_or_default().join("Spinney").join("config.toml")
+        dirs::config_dir()
+            .unwrap_or_default()
+            .join("Spinney")
+            .join("config.toml")
     }
 
     pub fn load_from(path: &Path) -> Result<Config> {
@@ -108,9 +111,15 @@ mod tests {
 
     #[test]
     fn api_base_enterprise() {
-        let s = Space { host: "ghe.example.com".into(), ..Default::default() };
+        let s = Space {
+            host: "ghe.example.com".into(),
+            ..Default::default()
+        };
         assert_eq!(s.api_base(), "https://ghe.example.com/api/v3");
-        let s = Space { host: "github.com".into(), ..Default::default() };
+        let s = Space {
+            host: "github.com".into(),
+            ..Default::default()
+        };
         assert_eq!(s.api_base(), "https://api.github.com");
     }
 

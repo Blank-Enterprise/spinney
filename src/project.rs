@@ -53,7 +53,10 @@ fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<(
     let bare_str = bare.to_str().context("non-UTF-8 path")?;
     let env = creds::git_env_args(space)?;
     let with_env = |rest: &[&str]| -> Vec<String> {
-        env.iter().cloned().chain(rest.iter().map(|s| s.to_string())).collect()
+        env.iter()
+            .cloned()
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
     };
     let run_env = |dir: &Path, rest: &[&str]| -> Result<String> {
         let args = with_env(rest);
@@ -65,7 +68,11 @@ fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<(
     std::fs::write(root.join(".git"), "gitdir: ./.bare\n")?;
     git::run(
         &bare,
-        &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
     )?;
     run_env(&bare, &["fetch", "origin"])?;
     let default = git::run(&bare, &["symbolic-ref", "--short", "HEAD"])?
@@ -75,7 +82,11 @@ fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<(
     git::run(root, &["worktree", "add", &dir, &default])?;
     git::run(
         root,
-        &["branch", &format!("--set-upstream-to=origin/{default}"), &default],
+        &[
+            "branch",
+            &format!("--set-upstream-to=origin/{default}"),
+            &default,
+        ],
     )?;
     creds::configure_repo(&bare, space)
 }
@@ -133,7 +144,11 @@ pub fn add_worktree_existing(root: &Path, branch: &str) -> Result<PathBuf> {
 
 pub fn remove_worktree(root: &Path, path: &Path, force: bool) -> Result<()> {
     let path_str = path.to_str().context("non-UTF-8 path")?;
-    if !force && !git::run(path, &["status", "--porcelain"])?.trim().is_empty() {
+    if !force
+        && !git::run(path, &["status", "--porcelain"])?
+            .trim()
+            .is_empty()
+    {
         bail!("worktree has uncommitted changes");
     }
     let mut args = vec!["worktree", "remove"];
@@ -197,7 +212,10 @@ mod tests {
     #[test]
     fn clone_creates_layout() {
         let (_tmp, root) = cloned();
-        assert_eq!(std::fs::read_to_string(root.join(".git")).unwrap(), "gitdir: ./.bare\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git")).unwrap(),
+            "gitdir: ./.bare\n"
+        );
         assert!(root.join("main").is_dir());
         let main = root.join("main");
         let up = git::run(&main, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
@@ -248,7 +266,10 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("keep.txt"), "keep").unwrap();
         assert!(add_worktree(&root, "feature/a-b", "main").is_err());
-        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+            "keep"
+        );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 

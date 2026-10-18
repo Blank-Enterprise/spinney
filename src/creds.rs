@@ -91,11 +91,29 @@ fn helper_value(space: &Space) -> Result<String> {
 /// `git_dir` is a bare repo or a `.git` directory.
 pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
     let helper = helper_value(space)?;
-    git::run(git_dir, &["config", "--local", "user.name", &space.author_name])?;
-    git::run(git_dir, &["config", "--local", "user.email", &space.author_email])?;
+    git::run(
+        git_dir,
+        &["config", "--local", "user.name", &space.author_name],
+    )?;
+    git::run(
+        git_dir,
+        &["config", "--local", "user.email", &space.author_email],
+    )?;
     // The empty value resets helpers inherited from system/global config.
-    git::run(git_dir, &["config", "--local", "--replace-all", "credential.helper", ""])?;
-    git::run(git_dir, &["config", "--local", "--add", "credential.helper", &helper])?;
+    git::run(
+        git_dir,
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            "credential.helper",
+            "",
+        ],
+    )?;
+    git::run(
+        git_dir,
+        &["config", "--local", "--add", "credential.helper", &helper],
+    )?;
     Ok(())
 }
 
@@ -128,11 +146,19 @@ mod tests {
     #[test]
     fn helper_get_with_token() {
         assert_eq!(
-            helper_response("protocol=https\nhost=github.com\n\n", "github.com", Some("abc")),
+            helper_response(
+                "protocol=https\nhost=github.com\n\n",
+                "github.com",
+                Some("abc")
+            ),
             "username=x-access-token\npassword=abc\n"
         );
         assert_eq!(
-            helper_response("protocol=https\nhost=GitHub.com\n\n", "github.com", Some("abc")),
+            helper_response(
+                "protocol=https\nhost=GitHub.com\n\n",
+                "github.com",
+                Some("abc")
+            ),
             "username=x-access-token\npassword=abc\n"
         );
     }
@@ -149,12 +175,18 @@ mod tests {
 
     #[test]
     fn helper_command_escapes_quotes() {
-        assert_eq!(helper_command("/a b/it's/spinney", "id"), "!'/a b/it'\\''s/spinney' credential id");
+        assert_eq!(
+            helper_command("/a b/it's/spinney", "id"),
+            "!'/a b/it'\\''s/spinney' credential id"
+        );
     }
 
     #[test]
     fn helper_get_without_token_empty() {
-        assert_eq!(helper_response("protocol=https\nhost=github.com\n", "github.com", None), "");
+        assert_eq!(
+            helper_response("protocol=https\nhost=github.com\n", "github.com", None),
+            ""
+        );
     }
 
     #[test]
@@ -162,9 +194,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         git::run(dir, &["init", "-q", "--bare"]).unwrap();
-        git::run(dir, &["config", "--local", "credential.helper", "osxkeychain"]).unwrap();
+        git::run(
+            dir,
+            &["config", "--local", "credential.helper", "osxkeychain"],
+        )
+        .unwrap();
         configure_repo(dir, &space()).unwrap();
-        let out = git::run(dir, &["config", "--local", "--get-all", "credential.helper"]).unwrap();
+        let out = git::run(
+            dir,
+            &["config", "--local", "--get-all", "credential.helper"],
+        )
+        .unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "{out:?}");
         assert_eq!(lines[0], "");
@@ -185,6 +225,9 @@ mod tests {
     #[ignore]
     fn smoke_keychain_set() {
         set_token("smoke-test", "smoke-token").unwrap();
-        assert_eq!(get_token("smoke-test").unwrap().as_deref(), Some("smoke-token"));
+        assert_eq!(
+            get_token("smoke-test").unwrap().as_deref(),
+            Some("smoke-token")
+        );
     }
 }
