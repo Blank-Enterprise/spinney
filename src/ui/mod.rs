@@ -429,6 +429,8 @@ impl SpinneyApp {
         }
         match kind {
             JobKind::Clone => {
+                // Separate job: a commit-graph failure must not orphan the finished clone.
+                self.jobs.commit_graph(root.clone(), root.join(".bare"));
                 if add_project(&mut self.config, &space_id, &root) {
                     self.save_config();
                 }
@@ -769,9 +771,7 @@ impl SpinneyApp {
         let root = parent.join(&name);
         let id = space.id.clone();
         self.jobs.spawn(JobKind::Clone, root, id, move || {
-            let root = project::clone_into(&url, &parent, &name, &space)?;
-            let common = root.join(".bare");
-            git::run(&common, &["commit-graph", "write", "--reachable"]).map(|_| ())
+            project::clone_into(&url, &parent, &name, &space).map(|_| ())
         });
     }
 
@@ -1104,6 +1104,51 @@ mod tests {
             got.canonicalize().unwrap(),
             tmp.path().join(".bare").canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn clone_success_adds_project_even_if_commit_graph_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let ctx = egui::Context::default();
+        let mut app = SpinneyApp {
+            config: cfg(),
+            config_path: Some(cfg_path.clone()),
+            tabs: vec![],
+            active_tab: 0,
+            jobs: Jobs::new(ctx.clone()),
+            errors: vec![],
+            dialogs: Dialogs::default(),
+            ctx,
+        };
+        // Not a repo, so the follow-up commit-graph job is bound to fail.
+        let root = tmp.path().join("cloned");
+        app.job_done(JobDone {
+            kind: JobKind::Clone,
+            root: root.clone(),
+            space_id: "b".into(),
+            result: Ok(()),
+        });
+        assert_eq!(app.jobs.pending, 1, "commit-graph runs as its own job");
+        let saved = Config::load_from(&cfg_path).unwrap();
+        assert!(saved.spaces[1].projects.contains(&root));
+        let mut done = None;
+        for _ in 0..500 {
+            done = app.jobs.try_recv();
+            if done.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let done = done.expect("commit-graph job finished");
+        assert_eq!(done.kind, JobKind::CommitGraph);
+        assert!(done.result.is_err());
+        app.job_done(done);
+        assert!(app
+            .errors
+            .iter()
+            .any(|e| e.starts_with("CommitGraph failed")));
+        assert!(app.config.spaces[1].projects.contains(&root), "still added");
     }
 
     #[test]
