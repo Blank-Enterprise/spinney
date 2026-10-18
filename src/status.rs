@@ -31,7 +31,9 @@ fn change_of(code: char, from: Option<&str>) -> Change {
     match code {
         'A' => Change::Added,
         'D' => Change::Deleted,
-        'R' => Change::Renamed { from: from.unwrap_or_default().to_string() },
+        'R' => Change::Renamed {
+            from: from.unwrap_or_default().to_string(),
+        },
         _ => Change::Modified, // M, T, C
     }
 }
@@ -39,13 +41,23 @@ fn change_of(code: char, from: Option<&str>) -> Change {
 pub fn status(worktree: &Path) -> Result<Status> {
     let out = git::run(
         worktree,
-        &["-c", "core.quotepath=off", "status", "--porcelain=v2", "-z", "--untracked-files=all"],
+        &[
+            "-c",
+            "core.quotepath=off",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+        ],
     )?;
     let mut st = Status::default();
     let mut entries = out.split('\0').filter(|e| !e.is_empty());
     while let Some(e) = entries.next() {
         let (kind, rest) = e.split_at(1);
-        let fs = |path: &str, change| FileStatus { path: path.to_string(), change };
+        let fs = |path: &str, change| FileStatus {
+            path: path.to_string(),
+            change,
+        };
         match kind {
             "1" | "2" => {
                 // 1 XY sub mH mI mW hH hI path / 2 XY sub mH mI mW hH hI score path, then origPath
@@ -82,7 +94,10 @@ mod tests {
     }
 
     fn fs_(path: &str, change: Change) -> FileStatus {
-        FileStatus { path: path.into(), change }
+        FileStatus {
+            path: path.into(),
+            change,
+        }
     }
 
     #[test]
@@ -93,10 +108,20 @@ mod tests {
         for f in ["mod.txt", "del.txt", "old.txt"] {
             fs::write(d.join(f), "one\ntwo\nthree\n").unwrap();
         }
+        fs::write(d.join("tracked.bin"), b"\x00one").unwrap();
         g(d, &["add", "."]);
         g(
             d,
-            &["-c", "user.name=Test User", "-c", "user.email=test@example.com", "commit", "-q", "-m", "init"],
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
         );
         fs::write(d.join("mod.txt"), "one\nTWO\nthree\n").unwrap();
         fs::remove_file(d.join("del.txt")).unwrap();
@@ -105,13 +130,19 @@ mod tests {
         g(d, &["add", "added.txt"]);
         fs::write(d.join("untracked.txt"), "u\n").unwrap();
         fs::write(d.join("bin.dat"), b"\x00\x01\x02binary").unwrap();
+        fs::write(d.join("tracked.bin"), b"\x00two").unwrap();
 
         let s = status(d).unwrap();
         assert_eq!(
             s.staged,
             vec![
                 fs_("added.txt", Change::Added),
-                fs_("new.txt", Change::Renamed { from: "old.txt".into() }),
+                fs_(
+                    "new.txt",
+                    Change::Renamed {
+                        from: "old.txt".into()
+                    }
+                ),
             ]
         );
         assert_eq!(
@@ -119,6 +150,7 @@ mod tests {
             vec![
                 fs_("del.txt", Change::Deleted),
                 fs_("mod.txt", Change::Modified),
+                fs_("tracked.bin", Change::Modified),
                 fs_("bin.dat", Change::Untracked),
                 fs_("untracked.txt", Change::Untracked),
             ]
@@ -127,6 +159,8 @@ mod tests {
 
         let bin = crate::diff::file_diff(d, "bin.dat", false).unwrap();
         assert!(bin.binary && bin.hunks.is_empty());
+        let tb = crate::diff::file_diff(d, "tracked.bin", false).unwrap();
+        assert!(tb.binary && tb.hunks.is_empty());
         let un = crate::diff::file_diff(d, "untracked.txt", false).unwrap();
         assert_eq!(un.hunks[0].lines[0].text, "u");
         let m = crate::diff::file_diff(d, "mod.txt", false).unwrap();
@@ -138,7 +172,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         let c = |args: &[&str]| {
-            let mut a = vec!["-c", "user.name=Test User", "-c", "user.email=test@example.com"];
+            let mut a = vec![
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+            ];
             a.extend_from_slice(args);
             git::run(d, &a).unwrap();
         };

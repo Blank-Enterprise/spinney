@@ -57,8 +57,14 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 // ponytail: quoted paths (tabs, quotes in names) are not unescaped.
 fn header_path(rest: &str) -> String {
     let half = rest.len() / 2;
-    if rest.len() % 2 == 1 && rest.is_char_boundary(half) && rest[..half].strip_prefix("a/") == rest[half + 1..].strip_prefix("b/") {
-        return rest[half + 3..].to_string();
+    if rest.len() % 2 == 1 {
+        if let (Some(a), Some(b)) = (rest.get(..half), rest.get(half + 1..)) {
+            if let (Some(a), Some(b)) = (a.strip_prefix("a/"), b.strip_prefix("b/")) {
+                if a == b {
+                    return b.to_string();
+                }
+            }
+        }
     }
     match rest.rfind(" b/") {
         Some(i) => rest[i + 3..].to_string(),
@@ -100,16 +106,33 @@ pub fn parse(unified: &str) -> Vec<FileDiff> {
                     rem_new = rem_new.saturating_sub(1);
                 }
                 let hunk = file.hunks.last_mut().expect("open hunk");
-                hunk.lines.push(Line { kind, old_no: o, new_no: n, text: text.to_string(), no_newline: false });
+                hunk.lines.push(Line {
+                    kind,
+                    old_no: o,
+                    new_no: n,
+                    text: text.to_string(),
+                    no_newline: false,
+                });
                 continue;
             }
         }
         if let Some(rest) = raw.strip_prefix("diff --git ") {
-            files.push(FileDiff { path: header_path(rest), binary: false, hunks: Vec::new() });
+            files.push(FileDiff {
+                path: header_path(rest),
+                binary: false,
+                hunks: Vec::new(),
+            });
         } else if let Some(file) = files.last_mut() {
             if let Some((os, ol, ns, nl)) = parse_hunk_header(raw) {
                 (old_no, new_no, rem_old, rem_new) = (os, ns, ol, nl);
-                file.hunks.push(Hunk { old_start: os, old_len: ol, new_start: ns, new_len: nl, header: raw.to_string(), lines: Vec::new() });
+                file.hunks.push(Hunk {
+                    old_start: os,
+                    old_len: ol,
+                    new_start: ns,
+                    new_len: nl,
+                    header: raw.to_string(),
+                    lines: Vec::new(),
+                });
             } else if raw.starts_with("Binary files ") || raw == "GIT binary patch" {
                 file.binary = true;
             } else if let Some(p) = raw.strip_prefix("rename to ") {
@@ -121,13 +144,40 @@ pub fn parse(unified: &str) -> Vec<FileDiff> {
 }
 
 fn empty(path: &str) -> FileDiff {
-    FileDiff { path: path.to_string(), binary: false, hunks: Vec::new() }
+    FileDiff {
+        path: path.to_string(),
+        binary: false,
+        hunks: Vec::new(),
+    }
 }
 
 pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> {
-    let base = ["-c", "core.quotepath=off", "diff", "--no-color", "--no-ext-diff", "-U3"];
+    let base = [
+        "--literal-pathspecs",
+        "-c",
+        "core.quotepath=off",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "-U3",
+    ];
     let untracked = !staged
-        && !git::run(worktree, &["ls-files", "--others", "--exclude-standard", "-z", "--", path])?.is_empty();
+        && !git::run(
+            worktree,
+            &[
+                "--literal-pathspecs",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                path,
+            ],
+        )?
+        .is_empty();
     let out = if untracked {
         // --no-index exits 1 when the files differ.
         let mut args = base.to_vec();
@@ -141,16 +191,32 @@ pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> 
         args.extend(["--", path]);
         git::run(worktree, &args)?
     };
-    Ok(parse(&out).into_iter().next().map(|mut f| {
-        f.path = path.to_string();
-        f
-    }).unwrap_or_else(|| empty(path)))
+    Ok(parse(&out)
+        .into_iter()
+        .next()
+        .map(|mut f| {
+            f.path = path.to_string();
+            f
+        })
+        .unwrap_or_else(|| empty(path)))
 }
 
 pub fn commit_diff(worktree: &Path, sha: &str) -> Result<Vec<FileDiff>> {
     let out = git::run(
         worktree,
-        &["-c", "core.quotepath=off", "show", "--format=", "--no-color", "-U3", sha],
+        &[
+            "-c",
+            "core.quotepath=off",
+            "show",
+            "--format=",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U3",
+            sha,
+        ],
     )?;
     Ok(parse(&out))
 }
@@ -196,9 +262,16 @@ mod tests {
         assert_eq!(d[0].path, "f.txt");
         assert!(!d[0].binary);
         let h = &d[0].hunks[0];
-        assert_eq!((h.old_start, h.old_len, h.new_start, h.new_len), (2, 4, 2, 5));
+        assert_eq!(
+            (h.old_start, h.old_len, h.new_start, h.new_len),
+            (2, 4, 2, 5)
+        );
         assert_eq!(h.header, "@@ -2,4 +2,5 @@ fn main() {");
-        let nos: Vec<_> = h.lines.iter().map(|l| (l.kind, l.old_no, l.new_no)).collect();
+        let nos: Vec<_> = h
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.old_no, l.new_no))
+            .collect();
         use LineKind::*;
         assert_eq!(
             nos,
@@ -225,6 +298,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_non_ascii_rename_header_does_not_panic() {
+        let s = "diff --git a/xx é b/y\nsimilarity index 100%\nrename from xx é\nrename to y\n";
+        let d = parse(s);
+        assert_eq!(d[0].path, "y");
+    }
+
+    #[test]
+    fn file_diff_ignores_user_diff_config_and_globs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git::run(d, &["init", "-q"]).unwrap();
+        git::run(d, &["config", "diff.noprefix", "true"]).unwrap();
+        for f in ["[id].tsx", "i.tsx"] {
+            std::fs::write(d.join(f), "a\n").unwrap();
+        }
+        git::run(d, &["add", "."]).unwrap();
+        git::run(
+            d,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "i",
+            ],
+        )
+        .unwrap();
+        for f in ["[id].tsx", "i.tsx"] {
+            std::fs::write(d.join(f), "b\n").unwrap();
+        }
+        let fd = file_diff(d, "[id].tsx", false).unwrap();
+        assert_eq!(fd.path, "[id].tsx");
+        assert_eq!(fd.hunks.len(), 1);
+        assert_eq!(fd.hunks[0].lines.len(), 2);
+        let all = parse(&git::run(d, &["diff", "--src-prefix=a/", "--dst-prefix=b/"]).unwrap());
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
     fn parse_binary() {
         let s = "diff --git a/img.png b/img.png\nindex 1..2 100644\nBinary files a/img.png and b/img.png differ\ndiff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-x\n+y\n";
         let d = parse(s);
@@ -244,7 +359,13 @@ mod tests {
 
     #[test]
     fn side_by_side_pairs_runs() {
-        let l = |kind| Line { kind, old_no: None, new_no: None, text: String::new(), no_newline: false };
+        let l = |kind| Line {
+            kind,
+            old_no: None,
+            new_no: None,
+            text: String::new(),
+            no_newline: false,
+        };
         use LineKind::*;
         let h = Hunk {
             old_start: 1,
@@ -256,7 +377,12 @@ mod tests {
         };
         assert_eq!(
             side_by_side(&h),
-            vec![(Some(0), Some(0)), (Some(1), Some(3)), (Some(2), None), (Some(4), Some(4))]
+            vec![
+                (Some(0), Some(0)),
+                (Some(1), Some(3)),
+                (Some(2), None),
+                (Some(4), Some(4))
+            ]
         );
     }
 }
