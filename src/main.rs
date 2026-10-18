@@ -3,6 +3,7 @@ mod creds;
 mod diff;
 mod git;
 mod project;
+mod stage;
 mod status;
 
 fn main() -> eframe::Result {
