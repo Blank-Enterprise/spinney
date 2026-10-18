@@ -1,11 +1,11 @@
 mod config;
+mod creds;
 mod git;
 
 fn main() -> eframe::Result {
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("credential") {
-        // Credential helper: wired up later.
-        return Ok(());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("credential") {
+        std::process::exit(creds::helper_main(&args[1..]));
     }
     eframe::run_native(
         "Spinney",
