@@ -2,7 +2,9 @@ mod config;
 mod creds;
 mod diff;
 mod git;
+mod graph;
 mod project;
+mod refs;
 mod stage;
 mod status;
 
