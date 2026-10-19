@@ -121,6 +121,8 @@ pub struct ProjectTab {
     status: Status,
     commit_summary: String,
     commit_desc: String,
+    /// "Amend previous commit" is ticked: Commit replaces HEAD instead.
+    amend: bool,
     /// Sidebar filter text.
     filter: String,
 }
@@ -181,6 +183,7 @@ impl ProjectTab {
             status: Status::default(),
             commit_summary: String::new(),
             commit_desc: String::new(),
+            amend: false,
             filter: String::new(),
         };
         tab.log.request(PAGE);
@@ -375,7 +378,12 @@ pub enum Action {
     AskDiscardAll,
     DiscardAll,
     CancelDiscard,
+    /// Tick or untick "Amend previous commit".
+    SetAmend(bool),
+    /// Commit or amend; amending a pushed HEAD asks first (`ConfirmAmend` / `CancelAmend`).
     Commit,
+    ConfirmAmend,
+    CancelAmend,
     ToggleInline,
     CloseDiff,
 }
@@ -398,6 +406,8 @@ pub struct SpinneyApp {
     focused: bool,
     /// Root of the tab whose "Discard all" is awaiting confirmation in the top bar.
     confirm_discard: Option<PathBuf>,
+    /// Root of the tab whose amend of a pushed HEAD is awaiting confirmation.
+    confirm_amend: Option<PathBuf>,
 }
 
 impl SpinneyApp {
@@ -425,6 +435,7 @@ impl SpinneyApp {
             ctx,
             focused: true,
             confirm_discard: None,
+            confirm_amend: None,
         };
         app.open_visible_tabs();
         app
@@ -550,6 +561,7 @@ impl SpinneyApp {
             Action::SelectTab(i) => {
                 self.active_tab = i;
                 self.confirm_discard = None;
+                self.confirm_amend = None;
                 self.new_tab = false;
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
@@ -596,10 +608,32 @@ impl SpinneyApp {
             Action::CancelDiscard => self.confirm_discard = None,
             Action::DiscardAll => {
                 // Only for the tab that asked; the bar is hidden on other tabs anyway.
-                if let Some(tab) = self.discard_tab() {
+                if let Some(tab) = self.asking_tab(self.confirm_discard.clone()) {
                     tab.discard_all(&mut errors);
                 }
                 self.confirm_discard = None;
+            }
+            Action::Commit => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    // Amending pushed history asks first; so does a failed check.
+                    let pushed = tab.amend
+                        && actions::head_pushed(&tab.active_worktree).unwrap_or_else(|e| {
+                            errors.push(format!("upstream: {e:#}"));
+                            true
+                        });
+                    if pushed {
+                        self.confirm_amend = Some(tab.root.clone());
+                    } else {
+                        tab.commit(&ctx, &mut errors);
+                    }
+                }
+            }
+            Action::CancelAmend => self.confirm_amend = None,
+            Action::ConfirmAmend => {
+                if let Some(tab) = self.asking_tab(self.confirm_amend.clone()) {
+                    tab.commit(&ctx, &mut errors);
+                }
+                self.confirm_amend = None;
             }
             Action::SelectCommit(_)
             | Action::DeselectCommit
@@ -609,10 +643,10 @@ impl SpinneyApp {
             | Action::ApplyPatch(..)
             | Action::StageAll
             | Action::UnstageAll
-            | Action::Commit
+            | Action::SetAmend(_)
             | Action::CloseDiff => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    tab_action(tab, action, &ctx, &mut errors);
+                    tab_action(tab, action, &mut errors);
                 }
             }
             Action::NewWorktreeFrom(base) => {
@@ -725,15 +759,43 @@ impl SpinneyApp {
         self.new_tab || self.tabs.is_empty()
     }
 
-    /// The active tab, when it is the one with a pending "Discard all".
-    fn discard_tab(&mut self) -> Option<&mut ProjectTab> {
-        let root = self.confirm_discard.as_ref()?;
+    /// The active tab, when it is `asking` (the root of a pending confirmation).
+    fn asking_tab(&mut self, asking: Option<PathBuf>) -> Option<&mut ProjectTab> {
+        let root = asking?;
         if self.showing_new_tab() {
             return None;
         }
         self.tabs
             .get_mut(self.active_tab)
-            .filter(|t| &t.root == root)
+            .filter(|t| t.root == root)
+    }
+
+    /// "The last commit is already pushed" with Amend / Cancel.
+    fn amend_bar(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("⚠").color(theme::WARN));
+            ui.label(
+                egui::RichText::new(
+                    "The last commit is already pushed. Amending rewrites history.",
+                )
+                .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() {
+                    actions.push(Action::CancelAmend);
+                }
+                let amend = egui::Button::new(
+                    egui::RichText::new("Amend")
+                        .color(theme::ON_ACCENT)
+                        .strong(),
+                )
+                .fill(theme::WARN)
+                .small();
+                if ui.add(amend).clicked() {
+                    actions.push(Action::ConfirmAmend);
+                }
+            });
+        });
     }
 
     /// "Discard all N changes?" with Discard / Cancel.
@@ -782,7 +844,7 @@ impl SpinneyApp {
 }
 
 /// Changes-panel and diff-view actions on the active tab.
-fn tab_action(tab: &mut ProjectTab, action: Action, ctx: &egui::Context, errors: &mut Vec<String>) {
+fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
     match action {
         Action::SelectCommit(i) => tab.select_commit(i, errors),
         Action::DeselectCommit => {
@@ -795,7 +857,7 @@ fn tab_action(tab: &mut ProjectTab, action: Action, ctx: &egui::Context, errors:
         Action::ApplyPatch(p, dir) => tab.apply_patch(&p, dir, errors),
         Action::StageAll => tab.stage_all(false, errors),
         Action::UnstageAll => tab.stage_all(true, errors),
-        Action::Commit => tab.commit(ctx, errors),
+        Action::SetAmend(on) => tab.set_amend(on, errors),
         Action::CloseDiff => tab.center = Center::Graph,
         _ => {}
     }
@@ -858,7 +920,8 @@ impl eframe::App for SpinneyApp {
                 });
             }
         }
-        if let Some(n) = self.discard_tab().map(|t| t.status.unstaged.len()) {
+        let discard = self.confirm_discard.clone();
+        if let Some(n) = self.asking_tab(discard).map(|t| t.status.unstaged.len()) {
             if n == 0 {
                 self.confirm_discard = None; // nothing left to discard (e.g. cleaned outside)
             } else {
@@ -868,6 +931,19 @@ impl eframe::App for SpinneyApp {
                 egui::Panel::top("discard_confirm")
                     .frame(bar)
                     .show(ui, |ui| Self::discard_bar(ui, n, &mut actions));
+            }
+        }
+        let amend = self.confirm_amend.clone();
+        if let Some(on) = self.asking_tab(amend).map(|t| t.amend) {
+            if !on {
+                self.confirm_amend = None; // unticked while asking
+            } else {
+                let bar = egui::Frame::new()
+                    .fill(theme::WARN.gamma_multiply(0.12))
+                    .inner_margin(Margin::symmetric(14, 6));
+                egui::Panel::top("amend_confirm")
+                    .frame(bar)
+                    .show(ui, |ui| Self::amend_bar(ui, &mut actions));
             }
         }
         if !self.errors.is_empty() {
@@ -1158,6 +1234,7 @@ mod tests {
             ctx,
             focused: true,
             confirm_discard: None,
+            confirm_amend: None,
         }
     }
 

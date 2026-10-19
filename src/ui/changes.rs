@@ -9,9 +9,9 @@ use crate::stage::{self, Direction};
 use crate::status::{self, Change, FileStatus, Status};
 use eframe::egui::{self, Align, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
-/// Commit needs a non-blank summary and something staged.
-pub fn commit_enabled(summary: &str, status: &Status) -> bool {
-    !summary.trim().is_empty() && !status.staged.is_empty()
+/// Commit needs a non-blank summary and something staged; an amend may stage nothing.
+pub fn commit_enabled(summary: &str, status: &Status, amend: bool) -> bool {
+    !summary.trim().is_empty() && (amend || !status.staged.is_empty())
 }
 
 /// The message git gets: the summary, then a blank line and the description if there is one.
@@ -22,6 +22,12 @@ pub fn commit_message(summary: &str, description: &str) -> String {
         m += description.trim_end();
     }
     m
+}
+
+/// A commit message back into (summary, description): the first line, then the rest.
+pub fn split_message(message: &str) -> (String, String) {
+    let (summary, rest) = message.split_once('\n').unwrap_or((message, ""));
+    (summary.trim().to_string(), rest.trim().to_string())
 }
 
 /// Every path of `files`, both sides of a rename (for "Stage all" / "Unstage all").
@@ -67,7 +73,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &
         Center::Diff(w) => Some((w.fd.path.clone(), w.staged)),
         _ => None,
     };
-    let enabled = commit_enabled(&tab.commit_summary, &tab.status);
+    let enabled = commit_enabled(&tab.commit_summary, &tab.status, tab.amend);
     // Before the text fields see the key, so ⌘↵ never inserts a newline.
     if shortcuts && enabled && ui.input_mut(|i| i.consume_shortcut(&COMMIT_KEY)) {
         actions.push(Action::Commit);
@@ -114,8 +120,16 @@ fn commit_card(ui: &mut egui::Ui, tab: &mut ProjectTab, enabled: bool, actions: 
                 .desired_width(f32::INFINITY),
         );
         ui.add_space(4.0);
+        let mut amend = tab.amend;
+        if ui.checkbox(&mut amend, "Amend previous commit").changed() {
+            actions.push(Action::SetAmend(amend));
+        }
         let k = tab.status.staged.len();
-        let label = format!("Commit {k} {}", if k == 1 { "file" } else { "files" });
+        let label = if tab.amend {
+            "Amend commit".to_string()
+        } else {
+            format!("Commit {k} {}", if k == 1 { "file" } else { "files" })
+        };
         let button = theme::primary(label).min_size(egui::vec2(ui.available_width(), 28.0));
         let r = ui.add_enabled(enabled, button).on_hover_text("⌘↵");
         if r.clicked() {
@@ -361,13 +375,39 @@ impl ProjectTab {
         self.after_stage(errors);
     }
 
-    /// Commit the staged changes; on success clear the message and refresh everything.
+    /// Tick or untick "Amend previous commit". Ticking loads HEAD's message into empty
+    /// fields; without a HEAD it stays unticked. Unticking clears that message again if it
+    /// is unedited, so a plain Commit never reuses it by accident.
+    pub(super) fn set_amend(&mut self, on: bool, errors: &mut Vec<String>) {
+        if on && self.commit_summary.is_empty() && self.commit_desc.is_empty() {
+            match actions::head_message(&self.active_worktree) {
+                Ok(m) => (self.commit_summary, self.commit_desc) = split_message(&m),
+                Err(e) => return errors.push(format!("amend: {e:#}")),
+            }
+        } else if !on {
+            let head = actions::head_message(&self.active_worktree).map(|m| split_message(&m));
+            if head.is_ok_and(|h| h == (self.commit_summary.clone(), self.commit_desc.clone())) {
+                self.commit_summary.clear();
+                self.commit_desc.clear();
+            }
+        }
+        self.amend = on;
+    }
+
+    /// Commit the staged changes, or amend HEAD with them; on success clear the message
+    /// and refresh everything.
     pub(super) fn commit(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
         let message = commit_message(&self.commit_summary, &self.commit_desc);
-        match actions::commit(&self.active_worktree, &message) {
+        let res = if self.amend {
+            actions::amend(&self.active_worktree, &message)
+        } else {
+            actions::commit(&self.active_worktree, &message)
+        };
+        match res {
             Ok(()) => {
                 self.commit_summary.clear();
                 self.commit_desc.clear();
+                self.amend = false;
                 self.refresh(ctx, errors);
             }
             Err(e) => errors.push(format!("commit: {e:#}")),
@@ -400,14 +440,25 @@ mod tests {
     #[test]
     fn commit_needs_message_and_staged_files() {
         let mut st = Status::default();
-        assert!(!commit_enabled("msg", &st));
+        assert!(!commit_enabled("msg", &st, false));
+        assert!(commit_enabled("msg", &st, true), "message-only amend");
+        assert!(!commit_enabled(" ", &st, true));
         st.staged.push(FileStatus {
             path: "f".into(),
             change: Change::Modified,
         });
-        assert!(commit_enabled("msg", &st));
-        assert!(!commit_enabled("", &st));
-        assert!(!commit_enabled("  \n\t", &st));
+        assert!(commit_enabled("msg", &st, false));
+        assert!(!commit_enabled("", &st, false));
+        assert!(!commit_enabled("  \n\t", &st, false));
+    }
+
+    #[test]
+    fn split_message_inverts_commit_message() {
+        assert_eq!(split_message("fix: x"), ("fix: x".into(), "".into()));
+        let m = "fix: x\n\nwhy\nmore";
+        let (summary, desc) = split_message(m);
+        assert_eq!((summary.as_str(), desc.as_str()), ("fix: x", "why\nmore"));
+        assert_eq!(commit_message(&summary, &desc), m);
     }
 
     #[test]

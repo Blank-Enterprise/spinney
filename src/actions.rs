@@ -20,6 +20,32 @@ pub fn commit(worktree: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Replace the last commit with `message` plus whatever is staged (nothing staged: message only).
+pub fn amend(worktree: &Path, message: &str) -> Result<()> {
+    if message.trim().is_empty() {
+        bail!("empty commit message");
+    }
+    let args = ["commit", "--amend", "-F", "-"];
+    git::run_stdin(worktree, &args, message.as_bytes())?;
+    Ok(())
+}
+
+/// The full message of HEAD, without git's trailing newline.
+pub fn head_message(worktree: &Path) -> Result<String> {
+    let out = git::run(worktree, &["log", "-1", "--format=%B", "HEAD"])?;
+    Ok(out.trim_end().to_string())
+}
+
+/// Whether HEAD is already on its upstream, so amending it rewrites pushed history.
+/// No upstream means nothing was pushed.
+pub fn head_pushed(worktree: &Path) -> Result<bool> {
+    if git::run(worktree, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err() {
+        return Ok(false);
+    }
+    let ahead = git::run(worktree, &["rev-list", "--count", "@{u}..HEAD"])?;
+    Ok(ahead.trim() == "0")
+}
+
 pub fn fetch(dir: &Path) -> Result<()> {
     git::run(dir, &["fetch", "--all", "--prune"])?;
     Ok(())
@@ -164,6 +190,72 @@ mod tests {
         git::run(&main, &["add", "."]).unwrap();
         assert!(commit(&main, "").is_err());
         assert!(commit(&main, " \n\t").is_err());
+    }
+
+    fn g(dir: &Path, args: &[&str]) -> String {
+        git::run(dir, args).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn amend_rewrites_message_only() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        let count = g(&main, &["rev-list", "--count", "HEAD"]);
+        let parent = g(&main, &["rev-parse", "HEAD~1"]);
+        amend(&main, "better\n\nwhy").unwrap();
+        assert_eq!(head_message(&main).unwrap(), "better\n\nwhy");
+        assert_eq!(
+            g(&main, &["rev-list", "--count", "HEAD"]),
+            count,
+            "no new commit"
+        );
+        assert_eq!(g(&main, &["rev-parse", "HEAD~1"]), parent);
+        let files = g(&main, &["show", "--format=", "--name-only", "HEAD"]);
+        assert_eq!(files, "c.txt");
+    }
+
+    #[test]
+    fn amend_adds_staged_changes_to_last_commit() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        let count = g(&main, &["rev-list", "--count", "HEAD"]);
+        std::fs::write(main.join("d.txt"), "d\n").unwrap();
+        git::run(&main, &["add", "d.txt"]).unwrap();
+        amend(&main, "add files").unwrap();
+        assert_eq!(
+            g(&main, &["rev-list", "--count", "HEAD"]),
+            count,
+            "no new commit"
+        );
+        let files = g(&main, &["show", "--format=", "--name-only", "HEAD"]);
+        assert_eq!(files, "c.txt\nd.txt");
+        assert_eq!(head_message(&main).unwrap(), "add files");
+        assert!(
+            g(&main, &["status", "--porcelain"]).is_empty(),
+            "nothing left staged"
+        );
+    }
+
+    #[test]
+    fn amend_empty_message_err() {
+        let (_tmp, _root, main) = cloned();
+        assert!(amend(&main, " \n\t").is_err());
+        assert_eq!(head_message(&main).unwrap(), "init");
+    }
+
+    #[test]
+    fn head_pushed_follows_upstream() {
+        let (_tmp, _root, main) = cloned();
+        assert!(
+            head_pushed(&main).unwrap(),
+            "fresh clone: HEAD is origin/main"
+        );
+        write_commit(&main, "c.txt");
+        assert!(!head_pushed(&main).unwrap());
+        push(&main).unwrap();
+        assert!(head_pushed(&main).unwrap());
+        git::run(&main, &["switch", "-q", "-c", "topic"]).unwrap();
+        assert!(!head_pushed(&main).unwrap(), "no upstream");
     }
 
     #[test]
