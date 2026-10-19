@@ -2,18 +2,7 @@ use crate::graph::Row;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 /// Lane colours cycle through this many hues.
-pub const HUES: usize = 8;
-
-const PALETTE: [Color32; HUES] = [
-    Color32::from_rgb(0x4e, 0x9a, 0xf1),
-    Color32::from_rgb(0xe5, 0x6b, 0x6f),
-    Color32::from_rgb(0x5c, 0xb8, 0x5c),
-    Color32::from_rgb(0xf0, 0xad, 0x4e),
-    Color32::from_rgb(0xa6, 0x7c, 0xe0),
-    Color32::from_rgb(0x3f, 0xc1, 0xc9),
-    Color32::from_rgb(0xe0, 0x7c, 0xc0),
-    Color32::from_rgb(0xb5, 0xa6, 0x42),
-];
+pub const HUES: usize = super::theme::LANES.len();
 
 const ROW_H: f32 = 22.0;
 const LANE_W: f32 = 14.0;
@@ -26,7 +15,7 @@ pub struct GraphOutput {
 }
 
 fn color(lane: usize) -> Color32 {
-    PALETTE[lane_color_index(lane)]
+    super::theme::LANES[lane_color_index(lane)]
 }
 
 pub fn show(ui: &mut egui::Ui, rows: &[Row], selected: Option<usize>) -> GraphOutput {

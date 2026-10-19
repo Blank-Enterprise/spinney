@@ -1,6 +1,8 @@
 //! Modal dialogs: clone, create, new worktree, confirm worktree removal.
 
-use super::{add_project, paths, project, repo_name_from_url, spaces, JobKind, SpinneyApp};
+use super::{
+    actions, add_project, checkout, paths, project, repo_name_from_url, spaces, JobKind, SpinneyApp,
+};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -114,6 +116,8 @@ fn github_label(host: &str) -> String {
 pub(super) struct NewWorktreeDialog {
     pub(super) base: String,
     pub(super) branch: String,
+    /// Create a worktree for the branch; otherwise create it and switch to it (normal clone).
+    pub(super) worktree: bool,
 }
 
 #[derive(Default)]
@@ -151,7 +155,12 @@ impl SpinneyApp {
         }
         if let Some(mut d) = self.dialogs.new_worktree.take() {
             let mut result = None;
-            egui::Window::new("New worktree")
+            let title = if d.worktree {
+                "New worktree"
+            } else {
+                "New branch"
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -253,9 +262,17 @@ impl SpinneyApp {
         let ctx = self.ctx.clone();
         let mut errors = vec![];
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            match project::add_worktree(&tab.root, d.branch.trim(), &d.base) {
-                Ok(path) => tab.active_worktree = path,
-                Err(e) => errors.push(format!("{e:#}")),
+            let branch = d.branch.trim();
+            if d.worktree {
+                match project::add_worktree(&tab.root, branch, &d.base) {
+                    Ok(path) => tab.active_worktree = path,
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
+            } else {
+                match actions::create_branch(&tab.active_worktree, branch, &d.base) {
+                    Ok(()) => checkout(tab, branch, &mut errors),
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
             }
             tab.refresh(&ctx, &mut errors);
         }

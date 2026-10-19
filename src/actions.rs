@@ -63,6 +63,21 @@ pub fn checkout(
     }
 }
 
+/// Open Terminal.app at `dir`.
+pub fn open_terminal(dir: &Path) -> Result<()> {
+    let out = std::process::Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(dir)
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "open Terminal: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub fn create_branch(worktree: &Path, name: &str, base: &str) -> Result<()> {
     git::run(worktree, &["branch", name, base])?;
     Ok(())

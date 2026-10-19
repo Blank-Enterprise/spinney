@@ -1,30 +1,34 @@
-use super::{active_space, paths, Action};
+use super::{active_space, paths, theme, Action};
 use crate::config::{Config, Space};
 use eframe::egui;
 
 const SCOPE_HINT: &str = "Needs repo contents read/write, pull requests read/write, metadata read.";
 
-/// Space combo box: pick a space, or create/edit one.
+/// "● Space ▾" menu: pick a space, or create/edit one.
 pub fn switcher(ui: &mut egui::Ui, cfg: &Config, actions: &mut Vec<Action>) {
     let active = active_space(cfg);
     let current = active.map_or("No space", |s| s.name.as_str());
-    egui::ComboBox::from_id_salt("space")
-        .selected_text(current)
-        .show_ui(ui, |ui| {
-            for s in &cfg.spaces {
-                let is_active = active.is_some_and(|a| a.id == s.id);
-                if ui.selectable_label(is_active, &s.name).clicked() && !is_active {
-                    actions.push(Action::SwitchSpace(s.id.clone()));
-                }
+    let button = egui::Button::new((
+        egui::RichText::new("●").color(theme::ACCENT),
+        egui::RichText::new(current).color(theme::TEXT),
+        egui::RichText::new("▾").color(theme::MUTED),
+    ))
+    .frame(false);
+    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        for s in &cfg.spaces {
+            let is_active = active.is_some_and(|a| a.id == s.id);
+            if ui.selectable_label(is_active, &s.name).clicked() && !is_active {
+                actions.push(Action::SwitchSpace(s.id.clone()));
             }
-            ui.separator();
-            if ui.button("New space…").clicked() {
-                actions.push(Action::NewSpace);
-            }
-            if active.is_some() && ui.button("Edit space…").clicked() {
-                actions.push(Action::EditSpace);
-            }
-        });
+        }
+        ui.separator();
+        if ui.button("New space…").clicked() {
+            actions.push(Action::NewSpace);
+        }
+        if active.is_some() && ui.button("Edit space…").clicked() {
+            actions.push(Action::EditSpace);
+        }
+    });
 }
 
 /// Space editor window; `Some(true)` = save, `Some(false)` = cancel, `None` = still open.

@@ -6,6 +6,8 @@ mod new_tab;
 mod paths;
 mod sidebar;
 mod spaces;
+mod theme;
+mod toolbar;
 
 use crate::actions::{self, CheckoutOutcome};
 use crate::config::{Config, Space};
@@ -17,7 +19,7 @@ use crate::stage::Direction;
 use crate::status::{FileStatus, Status};
 use crate::{creds, git};
 use dialogs::{CloneDialog, CreateDialog, Dialogs, NewWorktreeDialog};
-use eframe::egui;
+use eframe::egui::{self, Margin};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
@@ -118,6 +120,8 @@ pub struct ProjectTab {
     center: Center,
     status: Status,
     commit_msg: String,
+    /// Sidebar filter text.
+    filter: String,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -175,6 +179,7 @@ impl ProjectTab {
             center: Center::Graph,
             status: Status::default(),
             commit_msg: String::new(),
+            filter: String::new(),
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -254,7 +259,8 @@ struct JobDone {
 pub struct Jobs {
     tx: Sender<JobDone>,
     rx: Receiver<JobDone>,
-    pending: usize,
+    /// Kind and project of each job in flight.
+    active: Vec<(JobKind, PathBuf)>,
     ctx: egui::Context,
 }
 
@@ -264,7 +270,7 @@ impl Jobs {
         Jobs {
             tx,
             rx,
-            pending: 0,
+            active: vec![],
             ctx,
         }
     }
@@ -277,7 +283,7 @@ impl Jobs {
         work: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
     ) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        self.pending += 1;
+        self.active.push((kind, root.clone()));
         std::thread::spawn(move || {
             let result = work().map_err(|e| format!("{e:#}"));
             let _ = tx.send(JobDone {
@@ -299,8 +305,29 @@ impl Jobs {
 
     fn try_recv(&mut self) -> Option<JobDone> {
         let done = self.rx.try_recv().ok()?;
-        self.pending -= 1;
+        if let Some(i) = self
+            .active
+            .iter()
+            .position(|(k, r)| *k == done.kind && *r == done.root)
+        {
+            self.active.swap_remove(i);
+        }
         Some(done)
+    }
+
+    fn any(&self, kind: JobKind) -> bool {
+        self.active.iter().any(|(k, _)| *k == kind)
+    }
+
+    fn running(&self, kind: JobKind, root: &Path) -> bool {
+        self.active.iter().any(|(k, r)| *k == kind && r == root)
+    }
+
+    /// A fetch, pull or push is in flight for `root`.
+    fn network_busy(&self, root: &Path) -> bool {
+        [JobKind::Fetch, JobKind::Pull, JobKind::Push]
+            .into_iter()
+            .any(|k| self.running(k, root))
     }
 }
 
@@ -327,6 +354,10 @@ pub enum Action {
     Push,
     Checkout(String),
     NewWorktreeFrom(String),
+    /// New branch from the given base: a worktree in the worktree layout, else a switch.
+    NewBranch(String),
+    /// Open Terminal.app at the active worktree.
+    OpenTerminal,
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
     SelectCommit(usize),
@@ -361,6 +392,7 @@ pub struct SpinneyApp {
 
 impl SpinneyApp {
     pub fn new(ctx: egui::Context) -> SpinneyApp {
+        theme::apply(&ctx);
         let path = Config::path();
         let (config, config_path, errors) = match Config::load_from(&path) {
             Ok(c) => (c, Some(path), vec![]),
@@ -562,7 +594,24 @@ impl SpinneyApp {
                 self.dialogs.new_worktree = Some(NewWorktreeDialog {
                     base,
                     branch: String::new(),
+                    worktree: true,
                 });
+            }
+            Action::NewBranch(base) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
+                        base,
+                        branch: String::new(),
+                        worktree: tab.layout == Layout::WorktreeRoot,
+                    });
+                }
+            }
+            Action::OpenTerminal => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    if let Err(e) = actions::open_terminal(&tab.active_worktree) {
+                        errors.push(format!("{e:#}"));
+                    }
+                }
             }
             Action::Checkout(name) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -637,51 +686,6 @@ impl SpinneyApp {
         }
     }
 
-    fn top_bar(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.horizontal(|ui| {
-            spaces::switcher(ui, &self.config, actions);
-            ui.separator();
-            for (i, tab) in self.tabs.iter().enumerate() {
-                if ui
-                    .selectable_label(i == self.active_tab && !self.new_tab, tab.name())
-                    .clicked()
-                {
-                    actions.push(Action::SelectTab(i));
-                }
-                if ui.small_button("×").on_hover_text("Close tab").clicked() {
-                    actions.push(Action::CloseTab(i));
-                }
-            }
-            if self.new_tab {
-                let _ = ui.selectable_label(true, "New Tab");
-                let closable = !self.tabs.is_empty(); // with no tabs the page shows anyway
-                if closable && ui.small_button("×").on_hover_text("Close tab").clicked() {
-                    actions.push(Action::CloseNewTab);
-                }
-            }
-            let has_space = active_space(&self.config).is_some();
-            let plus = ui.add_enabled(has_space, egui::Button::new("+"));
-            if plus.on_hover_text("New tab").clicked() {
-                actions.push(Action::NewTab);
-            }
-            ui.separator();
-            ui.add_enabled_ui(!self.showing_new_tab(), |ui| {
-                for (label, action) in [
-                    ("Fetch", Action::Fetch),
-                    ("Pull", Action::Pull),
-                    ("Push", Action::Push),
-                ] {
-                    if ui.button(label).clicked() {
-                        actions.push(action);
-                    }
-                }
-            });
-            if self.jobs.pending > 0 {
-                ui.add(egui::Spinner::new());
-            }
-        });
-    }
-
     /// Whether the centre shows the New Tab page instead of the active project.
     fn showing_new_tab(&self) -> bool {
         self.new_tab || self.tabs.is_empty()
@@ -754,7 +758,30 @@ impl eframe::App for SpinneyApp {
         }
         self.focused = focused;
         let mut actions = vec![];
-        egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui, &mut actions));
+        let strip = egui::Frame::new().fill(theme::TABS).inner_margin(Margin {
+            left: 10,
+            right: 12,
+            top: 6,
+            bottom: 0,
+        });
+        egui::Panel::top("tabs")
+            .frame(strip)
+            .show_separator_line(false)
+            .show(ui, |ui| self.tab_strip(ui, &mut actions));
+        if !self.showing_new_tab() {
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                let projects = active_space(&self.config).map_or(&[][..], |s| &s.projects[..]);
+                let jobs = &self.jobs;
+                let bar = egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(Margin::symmetric(14, 6));
+                egui::Panel::top("toolbar").frame(bar).show(ui, |ui| {
+                    let busy = jobs.network_busy(&tab.root);
+                    let running = |k| jobs.running(k, &tab.root);
+                    toolbar::toolbar(ui, tab, projects, busy, running, &mut actions)
+                });
+            }
+        }
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
@@ -765,15 +792,20 @@ impl eframe::App for SpinneyApp {
         };
         if let Some(tab) = tab {
             egui::Panel::left("sidebar")
+                .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(220.0)
                 .show(ui, |ui| sidebar::show(ui, tab, &mut actions));
             egui::Panel::right("changes")
+                .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(260.0)
                 .show(ui, |ui| changes::show(ui, tab, &mut actions));
             let inline = self.config.diff_inline;
-            egui::CentralPanel::default().show(ui, |ui| {
+            let center = egui::Frame::new()
+                .fill(theme::BG)
+                .inner_margin(Margin::symmetric(12, 6));
+            egui::CentralPanel::default().frame(center).show(ui, |ui| {
                 if !matches!(tab.center, Center::Graph) {
                     return diff_view::show(ui, &mut tab.center, inline, &mut actions);
                 }
@@ -1075,7 +1107,7 @@ mod tests {
             space_id: "b".into(),
             result: Ok(()),
         });
-        assert_eq!(app.jobs.pending, 1, "commit-graph runs as its own job");
+        assert_eq!(app.jobs.active.len(), 1, "commit-graph runs as its own job");
         let saved = Config::load_from(&cfg_path).unwrap();
         assert!(saved.spaces[1].projects.contains(&root));
         let mut done = None;
@@ -1095,6 +1127,31 @@ mod tests {
             .iter()
             .any(|e| e.starts_with("CommitGraph failed")));
         assert!(app.config.spaces[1].projects.contains(&root), "still added");
+    }
+
+    #[test]
+    fn jobs_track_what_is_running() {
+        let mut jobs = Jobs::new(egui::Context::default());
+        let (a, b) = (Path::new("/tmp/a"), Path::new("/tmp/b"));
+        let (go, wait) = mpsc::channel::<()>();
+        jobs.spawn(JobKind::Pull, a.into(), String::new(), move || {
+            let _ = wait.recv();
+            Ok(())
+        });
+        assert!(jobs.running(JobKind::Pull, a) && jobs.any(JobKind::Pull));
+        assert!(!jobs.running(JobKind::Push, a) && !jobs.any(JobKind::Clone));
+        assert!(jobs.network_busy(a) && !jobs.network_busy(b));
+        go.send(()).unwrap();
+        let mut done = None;
+        for _ in 0..500 {
+            done = jobs.try_recv();
+            if done.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(done.expect("job finished").kind, JobKind::Pull);
+        assert!(!jobs.network_busy(a) && jobs.active.is_empty());
     }
 
     #[test]
