@@ -418,10 +418,13 @@ impl SpinneyApp {
             .position(|(r, _)| *r == root)
             .map(|i| self.converting.swap_remove(i).1);
         match &result {
-            Ok(()) => self.notices.push(format!(
-                "{} now uses the worktree layout",
-                folder_name(&root)
-            )),
+            Ok(()) => {
+                let mut notice = format!("{} now uses the worktree layout", folder_name(&root));
+                if let Some(t) = &target {
+                    notice += &convert_strays_note(&root, t);
+                }
+                self.notices.push(notice);
+            }
             Err(e) => self.errors.push(format!("Convert failed: {e}")),
         }
         let Some(space) = self.space() else { return };
@@ -516,6 +519,23 @@ impl SpinneyApp {
             tab.refresh(&ctx, &mut errors);
         }
         self.errors.extend(errors);
+    }
+}
+
+/// Names of entries that appeared in `root` while converting (they did not move), if any.
+fn convert_strays_note(root: &Path, target: &Path) -> String {
+    match convert::strays(root, target) {
+        Ok(s) if s.is_empty() => String::new(),
+        Ok(s) => {
+            let names: Vec<_> = s.iter().map(|p| p.display().to_string()).collect();
+            format!(
+                ". These appeared in the project folder while converting and were not moved \
+                 into {}: {}",
+                folder_name(target),
+                names.join(", ")
+            )
+        }
+        Err(e) => format!(". Could not check the project folder for leftovers: {e:#}"),
     }
 }
 
@@ -954,6 +974,20 @@ mod tests {
         assert!(after.ends_with("   └─ … 2 more\n"), "{after}");
         let (_, after) = convert_preview("proj", &plan_with(1));
         assert!(after.ends_with("feature-x/\n   └─ f0\n"), "{after}");
+    }
+
+    #[test]
+    fn success_notice_lists_strays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for d in [".bare", "main"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join(".git"), "gitdir: ./.bare\n").unwrap();
+        assert_eq!(convert_strays_note(root, &root.join("main")), "");
+        std::fs::write(root.join(".DS_Store"), "x").unwrap();
+        let note = convert_strays_note(root, &root.join("main"));
+        assert!(note.contains("not moved into main: .DS_Store"), "{note}");
     }
 
     #[test]
