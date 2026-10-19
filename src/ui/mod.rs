@@ -256,7 +256,9 @@ impl ProjectTab {
                 .map(|s| s.conflicted.into_iter().map(|f| f.path).collect())
                 .unwrap_or_default()
         };
-        let before = conflicted(wt);
+        // Only apply/pop can add conflicts; skip the status scan for the others.
+        let applying = matches!(action, Action::ApplyStash(_) | Action::PopStash(_));
+        let before = if applying { conflicted(wt) } else { vec![] };
         let mut notice = None;
         let mut applies = false;
         let (pop, drop) = (
@@ -789,9 +791,14 @@ impl SpinneyApp {
             Action::DismissPush => self.rejected_push = None,
             Action::Stash | Action::ApplyStash(_) | Action::PopStash(_) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let wt = tab.active_worktree.clone();
-                    let notice = tab.stash_action(action, &wt, &ctx, &mut errors);
-                    self.notices.extend(notice);
+                    // A pull or push may be rewriting the same files (the toolbar disables it).
+                    if self.jobs.network_busy(&tab.root) {
+                        errors.push("stash: wait for the running fetch, pull or push".into());
+                    } else {
+                        let wt = tab.active_worktree.clone();
+                        let notice = tab.stash_action(action, &wt, &ctx, &mut errors);
+                        self.notices.extend(notice);
+                    }
                 }
             }
             Action::DropStashConfirmed(_) => {} // sent by the confirm dialog only
@@ -1228,7 +1235,26 @@ fn checkout(tab: &mut ProjectTab, name: &str, errors: &mut Vec<String>) {
     }
 }
 
+impl SpinneyApp {
+    /// Refuse to close while a conversion runs: its undo journal lives only in memory,
+    /// so quitting would strand the repo half-converted.
+    fn hold_close(&mut self, ctx: &egui::Context) {
+        if !self.converting.is_empty() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            let wait = "Spinney can quit once the conversion finishes".to_string();
+            if !self.notices.contains(&wait) {
+                self.notices.push(wait);
+            }
+        }
+    }
+}
+
 impl eframe::App for SpinneyApp {
+    /// Runs every pass, even minimized, so a close request is always seen.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.hold_close(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
@@ -1720,6 +1746,34 @@ mod tests {
         );
         app.apply(Action::DismissPush);
         assert!(app.rejected_push.is_none());
+    }
+
+    #[test]
+    fn close_is_held_only_while_converting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let ctx = egui::Context::default();
+        let mut close = egui::RawInput::default();
+        close
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let held = |app: &mut SpinneyApp| {
+            let out = ctx.run_logic(&close, |ctx| app.hold_close(ctx));
+            out.viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|c| c.contains(&egui::ViewportCommand::CancelClose))
+        };
+        assert!(!held(&mut app), "nothing running: close normally");
+        app.converting
+            .push((PathBuf::from("/p/root"), PathBuf::from("/p/root/main")));
+        assert!(held(&mut app));
+        assert!(app
+            .notices
+            .iter()
+            .any(|n| n.contains("conversion finishes")));
     }
 
     #[test]

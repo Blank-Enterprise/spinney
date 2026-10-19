@@ -54,10 +54,9 @@ pub fn index_of(worktree: &Path, hash: &str) -> Result<Option<usize>> {
 
 /// Stash tracked and untracked changes. `false` (and no stash) when there is nothing to save.
 pub fn save(worktree: &Path, message: Option<&str>) -> Result<bool> {
-    if git::run(worktree, &["status", "--porcelain"])?
-        .trim()
-        .is_empty()
-    {
+    // Untracked files explicitly: `push -u` saves them whatever status.showUntrackedFiles says.
+    let args = ["status", "--porcelain", "--untracked-files=all"];
+    if git::run(worktree, &args)?.trim().is_empty() {
         return Ok(false);
     }
     let mut args = vec!["stash", "push", "-u"];
@@ -123,6 +122,15 @@ mod tests {
     #[test]
     fn save_untracked_only_saves() {
         let tmp = repo();
+        fs::write(tmp.path().join("new.txt"), "x\n").unwrap();
+        assert!(save(tmp.path(), None).unwrap());
+        assert_eq!(list(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn save_untracked_only_ignores_status_config() {
+        let tmp = repo();
+        g(tmp.path(), &["config", "status.showUntrackedFiles", "no"]);
         fs::write(tmp.path().join("new.txt"), "x\n").unwrap();
         assert!(save(tmp.path(), None).unwrap());
         assert_eq!(list(tmp.path()).unwrap().len(), 1);

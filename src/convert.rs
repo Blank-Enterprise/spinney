@@ -82,7 +82,7 @@ pub fn plan(root: &Path) -> Result<Plan> {
     if config(&root, "extensions.refStorage")?.is_some_and(|v| v != "files") {
         bail!("extensions.refStorage is not \"files\"; reftable repositories are not supported");
     }
-    for (name, why) in [
+    let checks = [
         ("MERGE_HEAD", "a merge is in progress"),
         ("rebase-merge", "a rebase is in progress"),
         ("rebase-apply", "a rebase or am is in progress"),
@@ -102,20 +102,31 @@ pub fn plan(root: &Path) -> Result<Plan> {
             "sparse checkout is set up (info/sparse-checkout)",
         ),
         ("refs/worktree", "per-worktree refs exist (refs/worktree)"),
-    ] {
-        let rel = git::run(&root, &["rev-parse", "--git-path", name])?;
-        if taken(&root.join(rel.trim())) {
+    ];
+    // One git process for all of them: rev-parse prints one path per --git-path, in order.
+    let mut args = vec!["rev-parse"];
+    for (name, _) in &checks {
+        args.extend(["--git-path", name]);
+    }
+    let paths = git::run(&root, &args)?;
+    let paths: Vec<&str> = paths.lines().collect();
+    if paths.len() != checks.len() {
+        bail!("unexpected `git rev-parse --git-path` output");
+    }
+    for ((_, why), rel) in checks.iter().zip(paths) {
+        if taken(&root.join(rel)) {
             bail!("{why}; finish or remove it first");
         }
     }
     // Its files would move into the new worktree and git would lose track of it.
     if let Ok(entries) = fs::read_dir(git_dir.join("worktrees")) {
         for e in entries {
-            let Ok(link) = fs::read_to_string(e?.path().join("gitdir")) else {
+            let gitdir = e?.path().join("gitdir");
+            let Ok(link) = fs::read_to_string(&gitdir) else {
                 continue;
             };
-            let wt = Path::new(link.trim()).parent().unwrap_or(Path::new(""));
-            let wt = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
+            let link = linked_git_file(&gitdir, &link);
+            let wt = link.parent().unwrap_or(Path::new(""));
             if wt.starts_with(&root) {
                 bail!(
                     "the linked worktree {} is inside the project folder; move it out first \
@@ -353,6 +364,17 @@ struct Saved {
     others: Vec<PathBuf>,
 }
 
+/// The linked worktree's `.git` file named by its admin dir's `gitdir` file, which git
+/// 2.48+ may write relative to that admin dir (`extensions.relativeWorktrees`).
+fn linked_git_file(gitdir: &Path, contents: &str) -> PathBuf {
+    let link = Path::new(contents.trim());
+    let link = match gitdir.parent() {
+        Some(admin) if link.is_relative() => admin.join(link),
+        _ => link.to_path_buf(),
+    };
+    link.canonicalize().unwrap_or(link)
+}
+
 impl Saved {
     fn record(git_dir: &Path) -> Result<Saved> {
         let mut files = vec![];
@@ -365,7 +387,7 @@ impl Saved {
                 let Ok(bytes) = fs::read(&gitdir) else {
                     continue;
                 };
-                let link = PathBuf::from(String::from_utf8_lossy(&bytes).trim());
+                let link = linked_git_file(&gitdir, &String::from_utf8_lossy(&bytes));
                 files.push((gitdir, bytes));
                 if let Ok(b) = fs::read(&link) {
                     others.extend(link.parent().map(Path::to_path_buf));
@@ -1396,6 +1418,46 @@ mod tests {
             &["worktree", "add", "-q", ".worktrees/feat", "-b", "feat"],
         );
         assert_refused(&root, "inside the project folder");
+    }
+
+    /// `git worktree add --relative-paths` (git 2.48+); false on an older git.
+    fn add_relative_worktree(root: &Path, path: &str, branch: &str) -> bool {
+        let args = [
+            "worktree",
+            "add",
+            "-q",
+            "--relative-paths",
+            path,
+            "-b",
+            branch,
+        ];
+        git::run(root, &args).is_ok()
+    }
+
+    #[test]
+    fn refuses_relative_linked_worktree_inside_root() {
+        let (_tmp, root) = normal_clone();
+        if !add_relative_worktree(&root, ".worktrees/feat", "feat") {
+            return; // git too old for relative worktree paths
+        }
+        assert_refused(&root, "inside the project folder");
+    }
+
+    #[test]
+    fn relative_linked_worktree_keeps_working() {
+        let (tmp, root) = normal_clone();
+        let other = tmp.path().canonicalize().unwrap().join("other");
+        if !add_relative_worktree(&root, "../other", "other") {
+            return; // git too old for relative worktree paths
+        }
+        fs::write(other.join("o.txt"), "wip\n").unwrap();
+        let other_status = g(&other, &["status", "--porcelain"]);
+        convert_ok(&root);
+        assert_eq!(g(&other, &["status", "--porcelain"]), other_status);
+        let list = project::list_worktrees(&root).unwrap();
+        assert!(list
+            .iter()
+            .any(|w| w.path == other && w.branch.as_deref() == Some("other")));
     }
 
     #[test]
