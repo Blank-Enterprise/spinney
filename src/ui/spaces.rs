@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 const SCOPE_HINT: &str =
-    "A classic token with repo, read:org and write:public_key (to add SSH keys).";
+    "A classic token with repo, read:org, write:public_key (to add SSH keys) and workflow.";
 
 /// "● Space ▾" menu: pick a space, or create/edit one.
 pub fn switcher(ui: &mut egui::Ui, cfg: &Config, actions: &mut Vec<Action>) {

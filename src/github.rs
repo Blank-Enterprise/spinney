@@ -122,7 +122,8 @@ pub fn filter<'a>(repos: &'a [Repo], query: &str) -> Vec<&'a Repo> {
 /// Spinney's OAuth App (public; the device flow needs no client secret).
 pub const GITHUB_CLIENT_ID: &str = "Ov23liCPm15HJJ4KHBlA";
 /// `write:public_key` lets sign-in add the space's SSH key to the account.
-const DEVICE_SCOPE: &str = "repo read:org write:public_key";
+/// `workflow` lets pushes change `.github/workflows/` files.
+const DEVICE_SCOPE: &str = "repo read:org write:public_key workflow";
 /// The device flow only ever talks to github.com.
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -237,8 +238,9 @@ fn post_form<T: serde::de::DeserializeOwned>(url: &str, form: &[(&str, &str)]) -
     }
 }
 
-/// Classic-token scopes Spinney asks for: repos, org membership (org repos), adding SSH keys.
-pub const TOKEN_SCOPES: &str = "repo,read:org,write:public_key";
+/// Classic-token scopes Spinney asks for: repos, org membership (org repos), adding SSH keys,
+/// pushing workflow files.
+pub const TOKEN_SCOPES: &str = "repo,read:org,write:public_key,workflow";
 
 /// The "new personal access token" page on `host`, with Spinney's description and scopes
 /// filled in. `None` unless `host` is a bare host name (it ends up in a URL the browser opens).
@@ -371,7 +373,7 @@ mod tests {
     fn token_page_only_for_bare_hosts() {
         assert_eq!(
             new_token_url("github.mit.edu").as_deref(),
-            Some("https://github.mit.edu/settings/tokens/new?description=Spinney&scopes=repo,read:org,write:public_key")
+            Some("https://github.mit.edu/settings/tokens/new?description=Spinney&scopes=repo,read:org,write:public_key,workflow")
         );
         assert!(new_token_url("ghe.example.com:8443").is_some());
         for bad in [
