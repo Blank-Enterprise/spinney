@@ -2,6 +2,7 @@ mod changes;
 mod dialogs;
 mod diff_view;
 mod graph_view;
+mod paths;
 mod sidebar;
 mod spaces;
 

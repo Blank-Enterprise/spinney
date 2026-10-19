@@ -1,7 +1,6 @@
-use super::{active_space, Action};
+use super::{active_space, paths, Action};
 use crate::config::{Config, Space};
 use eframe::egui;
-use std::path::PathBuf;
 
 const SCOPE_HINT: &str = "Needs repo contents read/write, pull requests read/write, metadata read.";
 
@@ -30,7 +29,7 @@ pub fn switcher(ui: &mut egui::Ui, cfg: &Config, actions: &mut Vec<Action>) {
 
 /// Space editor window; `Some(true)` = save, `Some(false)` = cancel, `None` = still open.
 pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
-    let mut result = None;
+    let (mut result, mut browse) = (None, false);
     let title = if e.id.is_some() {
         "Edit space"
     } else {
@@ -46,12 +45,17 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
                     ("Host", &mut e.host),
                     ("Author name", &mut e.author_name),
                     ("Author email", &mut e.author_email),
-                    ("Default clone dir", &mut e.clone_dir),
                 ] {
                     ui.label(label);
                     ui.text_edit_singleline(value);
                     ui.end_row();
                 }
+                ui.label("Default clone folder");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut e.clone_dir);
+                    browse = ui.button("Browse").clicked();
+                });
+                ui.end_row();
                 ui.label("Personal access token");
                 let hint = if e.id.is_some() {
                     "unchanged"
@@ -75,6 +79,13 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
                 }
             });
         });
+    if browse {
+        let start = paths::expand_tilde(&e.clone_dir, paths::home().as_deref());
+        if let Some(dir) = paths::pick_folder("Default clone folder", Some(&start)) {
+            e.clone_dir = dir.display().to_string();
+            ctx.request_repaint(); // show the pick now, not on the next input
+        }
+    }
     result
 }
 
@@ -131,13 +142,16 @@ impl SpaceEdit {
         if author_name.is_empty() || author_email.is_empty() {
             return Err("space needs an author name and email".into());
         }
-        let dir = self.clone_dir.trim();
+        let dir = match self.clone_dir.trim() {
+            "" => None,
+            d => Some(paths::absolute(d, paths::home().as_deref())?),
+        };
         let fill = |s: &mut Space| {
             s.name = name.to_string();
             s.host = host.clone();
             s.author_name = author_name.to_string();
             s.author_email = author_email.to_string();
-            s.default_clone_dir = (!dir.is_empty()).then(|| PathBuf::from(dir));
+            s.default_clone_dir = dir.clone();
         };
         match &self.id {
             Some(id) => {
@@ -177,6 +191,7 @@ pub fn normalize_host(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn new_space_defaults_and_validation() {
@@ -225,6 +240,18 @@ mod tests {
         e.author_email = "test@example.com".into();
         e.apply(&mut cfg).unwrap();
         assert_eq!(cfg.spaces[0].host, "ghe.example.com");
+    }
+
+    #[test]
+    fn clone_dir_must_be_absolute() {
+        let mut cfg = Config::default();
+        let mut e = SpaceEdit::new_space();
+        e.name = "Work".into();
+        e.author_name = "Test User".into();
+        e.author_email = "test@example.com".into();
+        e.clone_dir = "code".into();
+        assert!(e.apply(&mut cfg).is_err(), "relative clone dir rejected");
+        assert!(cfg.spaces.is_empty());
     }
 
     #[test]
