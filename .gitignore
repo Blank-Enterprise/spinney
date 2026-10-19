@@ -1,4 +1,5 @@
 /target
+/dist
 .DS_Store
 # local-only design notes and brainstorm files
 docs/superpowers/
