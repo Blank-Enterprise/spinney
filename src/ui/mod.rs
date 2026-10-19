@@ -928,7 +928,7 @@ mod tests {
         }
     }
 
-    fn cfg() -> Config {
+    pub(super) fn cfg() -> Config {
         Config {
             spaces: vec![
                 space("a", &["/tmp/p1", "/tmp/p2"]),
@@ -1063,7 +1063,7 @@ mod tests {
         );
     }
 
-    fn test_app(config: Config, cfg_path: &Path) -> SpinneyApp {
+    pub(super) fn test_app(config: Config, cfg_path: &Path) -> SpinneyApp {
         let ctx = egui::Context::default();
         SpinneyApp {
             config,

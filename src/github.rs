@@ -28,17 +28,34 @@ fn login<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Owner::deserialize(d)?.login)
 }
 
-/// Every repo the token can see (owned, collaborator, org member), most recently pushed first.
-pub fn list_repos(api_base: &str, token: &str) -> Result<Vec<Repo>> {
-    let agent = ureq::Agent::config_builder()
+/// The repos a token can see; `truncated` when listing stopped before the last page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepoList {
+    pub repos: Vec<Repo>,
+    pub truncated: bool,
+}
+
+/// HTTP agent for GitHub calls: system trust store (corporate CAs, TLS-inspecting proxies)
+/// and a timeout so a hung host cannot spin forever.
+pub fn agent() -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    ureq::Agent::config_builder()
+        .tls_config(tls)
         .timeout_global(Some(Duration::from_secs(30)))
         .build()
-        .new_agent();
+        .new_agent()
+}
+
+/// Every repo the token can see (owned, collaborator, org member), most recently pushed first.
+pub fn list_repos(api_base: &str, token: &str) -> Result<RepoList> {
+    let agent = agent();
     let mut url = Some(format!(
         "{api_base}/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=pushed"
     ));
-    let mut repos = vec![];
-    // ponytail: stops after 5000 repos; nobody browses more than that in a list.
+    let (mut repos, mut truncated) = (vec![], false);
+    // ponytail: stops after 5000 repos (flagged as truncated); nobody browses more in a list.
     for _ in 0..MAX_PAGES {
         let Some(u) = url.take() else { break };
         let mut resp = match agent
@@ -56,17 +73,25 @@ pub fn list_repos(api_base: &str, token: &str) -> Result<Vec<Repo>> {
             Err(ureq::Error::StatusCode(code)) => bail!("GitHub answered HTTP {code}"),
             Err(e) => bail!("Could not reach GitHub: {e}"),
         };
-        // Only follow links on the space's API host: the token must not go anywhere else.
-        url = resp
+        let link = resp
             .headers()
             .get("link")
             .and_then(|v| v.to_str().ok())
-            .and_then(parse_next_link)
-            .filter(|next| next.starts_with(&format!("{api_base}/")));
+            .unwrap_or_default();
+        url = next_page(link, api_base);
+        truncated = url.is_none() && parse_next_link(link).is_some();
         let page: Vec<Repo> = resp.body_mut().read_json()?;
         repos.extend(page);
     }
-    Ok(repos)
+    Ok(RepoList {
+        truncated: truncated || url.is_some(),
+        repos,
+    })
+}
+
+/// The next page to fetch, only if it is on the space's API: the token must go nowhere else.
+pub fn next_page(link_header: &str, api_base: &str) -> Option<String> {
+    parse_next_link(link_header).filter(|next| next.starts_with(&format!("{api_base}/")))
 }
 
 /// The `rel="next"` URL of a `Link` header.
@@ -122,6 +147,30 @@ mod tests {
         let last = format!(r#"<{base}&page=4>; rel="prev", <{base}&page=1>; rel="first""#);
         assert_eq!(parse_next_link(&last), None);
         assert_eq!(parse_next_link(""), None);
+    }
+
+    #[test]
+    fn next_page_stays_on_the_api_host() {
+        let gh = "https://api.github.com";
+        let link = |url: &str| format!(r#"<{url}>; rel="next""#);
+        let ok = "https://api.github.com/user/repos?page=2";
+        assert_eq!(next_page(&link(ok), gh), Some(ok.to_string()));
+        for evil in [
+            "https://api.github.com.evil.com/user/repos?page=2",
+            "https://evil.com/?u=https://api.github.com/",
+            "https://api.github.com@evil.com/user/repos",
+            "http://api.github.com/user/repos?page=2",
+        ] {
+            assert_eq!(next_page(&link(evil), gh), None, "{evil}");
+        }
+        let ghe = "https://ghe.example.com/api/v3";
+        let ghe_next = "https://ghe.example.com/api/v3/user/repos?page=2";
+        assert_eq!(next_page(&link(ghe_next), ghe), Some(ghe_next.to_string()));
+        let outside = "https://ghe.example.com/other/user/repos?page=2";
+        assert_eq!(next_page(&link(outside), ghe), None);
+        let last = r#"<https://api.github.com/user/repos?page=1>; rel="prev""#;
+        assert_eq!(next_page(last, gh), None);
+        assert_eq!(next_page("", gh), None);
     }
 
     #[test]

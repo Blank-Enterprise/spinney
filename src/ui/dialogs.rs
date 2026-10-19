@@ -20,7 +20,7 @@ pub(super) enum Source {
 pub(super) enum Listing {
     NoToken,
     Failed(String),
-    Repos(Vec<github::Repo>),
+    Repos(github::RepoList),
 }
 
 /// Repository list for the dialog session; fetched once, refetched on ↻.
@@ -121,7 +121,7 @@ impl CloneDialog {
             let listing = match creds::get_token(&id) {
                 Ok(Some(token)) if !token.trim().is_empty() => {
                     match github::list_repos(&base, &token) {
-                        Ok(repos) => Listing::Repos(repos),
+                        Ok(list) => Listing::Repos(list),
                         Err(e) => Listing::Failed(format!("{e:#}")),
                     }
                 }
@@ -344,6 +344,11 @@ impl SpinneyApp {
 
     fn start_clone(&mut self, d: CloneDialog) {
         let Some(space) = self.space() else { return };
+        if space.id != d.space_id {
+            self.errors
+                .push("The space changed since this dialog opened; open Clone again".into());
+            return;
+        }
         let (parent, name) = match d.target(paths::home().as_deref()) {
             Ok(t) => t,
             Err(e) => {
@@ -536,7 +541,8 @@ fn repo_browser(ui: &mut egui::Ui, d: &mut CloneDialog) -> bool {
             ui.colored_label(ui.visuals().error_fg_color, e);
             refresh = ui.button("↻ Retry").clicked();
         }
-        Browse::Done(Listing::Repos(repos)) => {
+        Browse::Done(Listing::Repos(list)) => {
+            let repos = &list.repos;
             ui.horizontal(|ui| {
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut d.query)
@@ -557,6 +563,9 @@ fn repo_browser(ui: &mut egui::Ui, d: &mut CloneDialog) -> bool {
                 });
             } else {
                 picked = repo_list(ui, &shown, &d.url);
+            }
+            if list.truncated {
+                ui.weak(format!("Showing the first {} repositories", repos.len()));
             }
         }
     }
@@ -817,15 +826,40 @@ mod tests {
         d.browse = Browse::Loading(rx);
         d.poll();
         assert!(matches!(d.browse, Browse::Loading(_)));
-        tx.send(Listing::Repos(vec![repo("widget")])).unwrap();
+        let list = github::RepoList {
+            repos: vec![repo("widget")],
+            truncated: false,
+        };
+        tx.send(Listing::Repos(list)).unwrap();
         d.poll();
-        assert!(matches!(&d.browse, Browse::Done(Listing::Repos(r)) if r.len() == 1));
+        assert!(matches!(&d.browse, Browse::Done(Listing::Repos(l)) if l.repos.len() == 1));
         assert!(d.focus_search);
         let (tx, rx) = std::sync::mpsc::channel::<Listing>();
         d.browse = Browse::Loading(rx);
         drop(tx);
         d.poll();
         assert!(matches!(d.browse, Browse::Done(Listing::Failed(_))));
+    }
+
+    #[test]
+    fn clone_refuses_a_dialog_from_another_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = super::super::tests::cfg();
+        let mut app = super::super::tests::test_app(cfg, &tmp.path().join("config.toml"));
+        let other = app.config.spaces[1].clone();
+        assert_ne!(app.space().unwrap().id, other.id);
+        let mut d = CloneDialog::new(&other);
+        d.where_dir = tmp.path().display().to_string();
+        d.url = "https://example.com/octo-org/widget.git".into();
+        d.name = "widget".into();
+        app.start_clone(d);
+        assert!(!app.jobs.any(JobKind::Clone), "no clone started");
+        assert!(
+            app.errors.iter().any(|e| e.contains("space")),
+            "{:?}",
+            app.errors
+        );
+        assert!(app.dialogs.clone.is_none());
     }
 
     #[test]
