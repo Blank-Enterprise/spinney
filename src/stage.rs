@@ -2,9 +2,9 @@
 
 use crate::diff::{FileDiff, Line, LineKind};
 use crate::git;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -144,6 +144,25 @@ pub fn apply(worktree: &Path, patch: &str, dir: Direction) -> Result<()> {
     Ok(())
 }
 
+/// Patch that throws away the selected lines of an unstaged (index→worktree) `fd`. Built
+/// like Unstage so its new side is the worktree, for `discard_patch_apply` to reverse.
+pub fn discard_patch(fd: &FileDiff, selected: &HashSet<(usize, usize)>) -> Option<String> {
+    build_patch(fd, selected, Direction::Unstage)
+}
+
+/// Reverse-apply a `discard_patch` to the worktree; the index is left alone.
+pub fn discard_patch_apply(worktree: &Path, patch: &str) -> Result<()> {
+    let args = [
+        "apply",
+        "--reverse",
+        "--recount",
+        "--whitespace=nowarn",
+        "-",
+    ];
+    git::run_stdin(worktree, &args, patch.as_bytes())?;
+    Ok(())
+}
+
 pub fn stage_file(worktree: &Path, path: &str) -> Result<()> {
     git::run(worktree, &["--literal-pathspecs", "add", "--", path])?;
     Ok(())
@@ -200,6 +219,22 @@ pub fn discard_files(worktree: &Path, tracked: &[&str], untracked: &[&str]) -> R
         git::run(worktree, &args)?;
     }
     Ok(())
+}
+
+/// Throw away one file's unstaged change: back to the index, or deleted when `untracked`.
+/// An untracked path must name a file (or link) inside the worktree: `clean` given a
+/// directory would empty it.
+pub fn discard_file(worktree: &Path, path: &str, untracked: bool) -> Result<()> {
+    if !untracked {
+        return discard_files(worktree, &[path], &[]);
+    }
+    let rel = Path::new(path);
+    let inside = rel.components().all(|c| matches!(c, Component::Normal(_)));
+    let file = std::fs::symlink_metadata(worktree.join(rel)).is_ok_and(|m| !m.is_dir());
+    if !inside || !file {
+        bail!("not an untracked file: {path}");
+    }
+    discard_files(worktree, &[], &[path])
 }
 
 #[cfg(test)]
@@ -597,6 +632,115 @@ mod tests {
         assert_eq!(fs::read_to_string(d.join("kept.txt")).unwrap(), "k\n");
         discard_files(d, &[], &[]).unwrap();
         assert!(d.join("new.txt").exists(), "no paths: no-op");
+    }
+
+    fn discard(d: &Path, path: &str, sel: &HashSet<(usize, usize)>) {
+        let fd = file_diff(d, path, false).unwrap();
+        let patch = discard_patch(&fd, sel).expect("patch");
+        discard_patch_apply(d, &patch).unwrap();
+    }
+
+    #[test]
+    fn discard_one_line_keeps_index() {
+        let tmp = repo("f.txt", BASE, WORK);
+        let d = tmp.path();
+        let fd = file_diff(d, "f.txt", false).unwrap();
+        stage(
+            d,
+            "f.txt",
+            &pick(&fd, &[(Del, "b"), (Add, "B")]),
+            Direction::Stage,
+        );
+        let staged = index(d, "f.txt");
+        assert_eq!(staged, "a\nB\nc\nd\ne");
+        // Unselected `+e +f` and the marked `-e` stay in the same hunk.
+        let fd = file_diff(d, "f.txt", false).unwrap();
+        discard(d, "f.txt", &pick(&fd, &[(Add, "D")]));
+        assert_eq!(
+            fs::read_to_string(d.join("f.txt")).unwrap(),
+            "a\nB\nc\ne\nf"
+        );
+        assert_eq!(index(d, "f.txt"), staged, "index untouched");
+        assert!(g(d, &["diff", "--cached"]).contains("+B\n"));
+    }
+
+    #[test]
+    fn discard_pair_restores_old_line() {
+        let tmp = repo("f.txt", BASE, WORK);
+        let d = tmp.path();
+        let fd = file_diff(d, "f.txt", false).unwrap();
+        discard(d, "f.txt", &pick(&fd, &[(Del, "d"), (Add, "D")]));
+        assert_eq!(
+            fs::read_to_string(d.join("f.txt")).unwrap(),
+            "a\nB\nc\nd\ne\nf"
+        );
+        assert_eq!(index(d, "f.txt"), BASE);
+    }
+
+    #[test]
+    fn discard_hunk_leaves_other_hunks() {
+        let tmp = repo("g.txt", LONG_BASE, LONG_WORK);
+        let d = tmp.path();
+        let fd = file_diff(d, "g.txt", false).unwrap();
+        assert_eq!(fd.hunks.len(), 2);
+        discard(d, "g.txt", &whole_hunk(&fd, 0));
+        assert_eq!(
+            fs::read_to_string(d.join("g.txt")).unwrap(),
+            LONG_BASE.replace("18\n", "EIGHTEEN\n")
+        );
+        assert_eq!(index(d, "g.txt"), LONG_BASE);
+    }
+
+    #[test]
+    fn discard_one_tracked_or_untracked_file() {
+        let tmp = repo("f.txt", BASE, BASE);
+        let d = tmp.path();
+        fs::write(d.join("other.txt"), "o\n").unwrap();
+        g(d, &["add", "other.txt"]);
+        commit(d, "other");
+        fs::write(d.join("f.txt"), WORK).unwrap();
+        fs::write(d.join("other.txt"), "edited\n").unwrap();
+        discard_file(d, "f.txt", false).unwrap();
+        assert_eq!(fs::read_to_string(d.join("f.txt")).unwrap(), BASE);
+        assert_eq!(fs::read_to_string(d.join("other.txt")).unwrap(), "edited\n");
+
+        fs::create_dir(d.join("sub")).unwrap();
+        fs::write(d.join("sub/new.txt"), "n\n").unwrap();
+        fs::write(d.join("sub/keep.txt"), "k\n").unwrap();
+        discard_file(d, "sub/new.txt", true).unwrap();
+        assert!(!d.join("sub/new.txt").exists());
+        assert!(d.join("sub/keep.txt").exists());
+        // `clean` only deletes untracked files: a tracked one is left alone.
+        discard_file(d, "other.txt", true).unwrap();
+        assert_eq!(fs::read_to_string(d.join("other.txt")).unwrap(), "edited\n");
+    }
+
+    #[test]
+    fn discard_untracked_only_deletes_a_file_inside() {
+        let outer = tempfile::tempdir().unwrap();
+        fs::write(outer.path().join("outside.txt"), "x\n").unwrap();
+        let d = outer.path().join("repo");
+        fs::create_dir(&d).unwrap();
+        g(&d, &["init", "-q"]);
+        fs::create_dir(d.join("dir")).unwrap();
+        fs::write(d.join("dir/in.txt"), "i\n").unwrap();
+        let abs = outer.path().join("outside.txt");
+        for p in [
+            "../outside.txt",
+            "dir/../../outside.txt",
+            abs.to_str().unwrap(),
+        ] {
+            assert!(discard_file(&d, p, true).is_err(), "{p}");
+        }
+        assert!(
+            discard_files(&d, &[], &["../outside.txt"]).is_err(),
+            "git refuses too"
+        );
+        assert!(outer.path().join("outside.txt").exists());
+        for p in ["dir", "", ".", "missing.txt"] {
+            assert!(discard_file(&d, p, true).is_err(), "{p:?}");
+        }
+        assert!(d.join("dir/in.txt").exists());
     }
 
     #[test]

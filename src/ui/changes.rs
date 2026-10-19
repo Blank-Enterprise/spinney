@@ -2,12 +2,43 @@
 //! Also the ProjectTab handlers behind those controls.
 
 use super::diff_view::{Selection, WorkDiff};
-use super::{theme, Action, Center, ProjectTab};
+use super::{theme, Action, Center, Discard, ProjectTab};
 use crate::actions;
 use crate::diff::{commit_diff, file_diff};
 use crate::stage::{self, Direction};
 use crate::status::{self, Change, FileStatus, Status};
+use anyhow::anyhow;
 use eframe::egui::{self, Align, Color32, Key, KeyboardShortcut, Modifiers, RichText};
+
+/// Why the unstaged file `f` can't be discarded on its own: a file new in the index would
+/// only go back to its staged content, not away.
+pub fn discard_blocked(status: &Status, f: &FileStatus) -> Option<&'static str> {
+    let new = |s: &FileStatus| s.path == f.path && s.change == Change::Added;
+    status.staged.iter().any(new).then_some("Unstage it first")
+}
+
+/// The confirmation bar's question, or None once there is nothing left to discard: the
+/// file left the unstaged list, or the lines' unstaged diff is no longer open.
+pub fn discard_question(what: &Discard, status: &Status, center: &Center) -> Option<String> {
+    let unstaged = |path: &str| status.unstaged.iter().any(|f| f.path == path);
+    match what {
+        Discard::All => {
+            let n = status.unstaged.len();
+            let noun = if n == 1 { "change" } else { "changes" };
+            (n > 0).then(|| format!("Discard all {n} unstaged {noun}?"))
+        }
+        Discard::File(f) if !unstaged(&f.path) => None,
+        Discard::File(f) if f.change == Change::Untracked => {
+            Some(format!("Delete untracked {}?", f.path))
+        }
+        Discard::File(f) => Some(format!("Discard changes to {}?", f.path)),
+        Discard::Lines { path, n, .. } => {
+            let open = matches!(center, Center::Diff(w) if !w.staged && w.fd.path == *path);
+            let noun = if *n == 1 { "line" } else { "lines" };
+            (open && unstaged(path)).then(|| format!("Discard {n} {noun} in {path}?"))
+        }
+    }
+}
 
 /// Commit needs a non-blank summary and something staged; an amend may stage nothing.
 pub fn commit_enabled(summary: &str, status: &Status, amend: bool) -> bool {
@@ -95,11 +126,27 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &
         .show(ui, |ui| {
             let st = &tab.status;
             if !st.conflicted.is_empty() {
-                file_list(ui, List::Conflicted, &st.conflicted, &open, false, actions);
+                file_list(
+                    ui,
+                    List::Conflicted,
+                    &st.conflicted,
+                    st,
+                    &open,
+                    false,
+                    actions,
+                );
             }
             let conflicts = !st.conflicted.is_empty();
-            file_list(ui, List::Unstaged, &st.unstaged, &open, conflicts, actions);
-            file_list(ui, List::Staged, &st.staged, &open, false, actions);
+            file_list(
+                ui,
+                List::Unstaged,
+                &st.unstaged,
+                st,
+                &open,
+                conflicts,
+                actions,
+            );
+            file_list(ui, List::Staged, &st.staged, st, &open, false, actions);
         });
 }
 
@@ -142,6 +189,7 @@ fn file_list(
     ui: &mut egui::Ui,
     list: List,
     files: &[FileStatus],
+    status: &Status,
     open: &Option<(String, bool)>,
     conflicts: bool,
     actions: &mut Vec<Action>,
@@ -182,7 +230,7 @@ fn file_list(
                         .on_hover_text("Discard all changes")
                         .on_disabled_hover_text(why);
                     if r.clicked() {
-                        actions.push(Action::AskDiscardAll);
+                        actions.push(Action::AskDiscard(Discard::All));
                     }
                 }
             });
@@ -221,6 +269,18 @@ fn file_list(
                 // Conflicted files have a combined diff the parser does not read.
                 if r.clicked() && list != List::Conflicted {
                     actions.push(Action::OpenDiff(f.clone(), staged));
+                }
+                if list == List::Unstaged {
+                    r.context_menu(|ui| {
+                        let why = discard_blocked(status, f);
+                        let r = ui
+                            .add_enabled(why.is_none(), egui::Button::new("Discard changes…"))
+                            .on_disabled_hover_text(why.unwrap_or_default());
+                        if r.clicked() {
+                            actions.push(Action::AskDiscard(Discard::File(f.clone())));
+                            ui.close();
+                        }
+                    });
                 }
             })
         });
@@ -375,6 +435,24 @@ impl ProjectTab {
         self.after_stage(errors);
     }
 
+    /// Throw away what the confirmation bar named; the index is never touched.
+    pub(super) fn discard(&mut self, what: &Discard, errors: &mut Vec<String>) {
+        let wt = &self.active_worktree;
+        let res = match what {
+            Discard::All => return self.discard_all(errors),
+            // Checked again here: the menu item is only disabled.
+            Discard::File(f) => match discard_blocked(&self.status, f) {
+                Some(why) => Err(anyhow!("{}: {why}", f.path)),
+                None => stage::discard_file(wt, &f.path, f.change == Change::Untracked),
+            },
+            Discard::Lines { patch, .. } => stage::discard_patch_apply(wt, patch),
+        };
+        if let Err(e) = res {
+            errors.push(format!("discard: {e:#}"));
+        }
+        self.after_stage(errors);
+    }
+
     /// Tick or untick "Amend previous commit". Ticking loads HEAD's message into empty
     /// fields; without a HEAD it stays unticked. Unticking clears that message again if it
     /// is unedited, so a plain Commit never reuses it by accident.
@@ -484,5 +562,73 @@ mod tests {
             },
         ];
         assert_eq!(change_paths(&staged), ["a", "new", "old"]);
+    }
+
+    fn fs_(path: &str, change: Change) -> FileStatus {
+        FileStatus {
+            path: path.into(),
+            change,
+        }
+    }
+
+    #[test]
+    fn only_files_new_in_the_index_are_blocked() {
+        let st = Status {
+            staged: vec![fs_("new", Change::Added), fs_("mod", Change::Modified)],
+            unstaged: vec![fs_("new", Change::Modified), fs_("mod", Change::Modified)],
+            ..Default::default()
+        };
+        assert_eq!(
+            discard_blocked(&st, &st.unstaged[0]),
+            Some("Unstage it first")
+        );
+        assert_eq!(discard_blocked(&st, &st.unstaged[1]), None);
+        assert_eq!(discard_blocked(&st, &fs_("x", Change::Untracked)), None);
+    }
+
+    #[test]
+    fn discard_question_names_what_goes_and_drops_when_stale() {
+        let mut st = Status {
+            unstaged: vec![fs_("f", Change::Modified), fs_("u", Change::Untracked)],
+            ..Default::default()
+        };
+        let q = discard_question;
+        let g = Center::Graph;
+        assert_eq!(
+            q(&Discard::All, &st, &g).as_deref(),
+            Some("Discard all 2 unstaged changes?")
+        );
+        let f = Discard::File(st.unstaged[0].clone());
+        assert_eq!(q(&f, &st, &g).as_deref(), Some("Discard changes to f?"));
+        let u = Discard::File(st.unstaged[1].clone());
+        assert_eq!(q(&u, &st, &g).as_deref(), Some("Delete untracked u?"));
+        let lines = Discard::Lines {
+            path: "f".into(),
+            patch: String::new(),
+            n: 3,
+        };
+        assert_eq!(q(&lines, &st, &g), None, "its diff is not open");
+        let diff = |staged| {
+            Center::Diff(Box::new(WorkDiff {
+                staged,
+                change: Change::Modified,
+                fd: crate::diff::FileDiff {
+                    path: "f".into(),
+                    binary: false,
+                    lossy: false,
+                    hunks: vec![],
+                },
+                sel: Selection::default(),
+            }))
+        };
+        assert_eq!(
+            q(&lines, &st, &diff(false)).as_deref(),
+            Some("Discard 3 lines in f?")
+        );
+        assert_eq!(q(&lines, &st, &diff(true)), None, "staged side");
+        st.unstaged.clear();
+        for what in [Discard::All, f, u, lines] {
+            assert_eq!(q(&what, &st, &diff(false)), None, "{what:?}");
+        }
     }
 }
