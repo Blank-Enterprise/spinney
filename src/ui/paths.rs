@@ -37,6 +37,15 @@ pub fn absolute(input: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     }
 }
 
+/// Display only: `path` with the `home` prefix shown as `~`.
+pub fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// A typed folder that must exist: `~`-expanded, absolute, canonicalized.
 pub fn existing_dir(input: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     if input.trim().is_empty() {
@@ -77,6 +86,19 @@ mod tests {
         assert_eq!(expand_tilde("~other/x", h), PathBuf::from("~other/x"));
         assert_eq!(expand_tilde("/abs/~", h), PathBuf::from("/abs/~"));
         assert_eq!(expand_tilde("~/x", None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn home_is_abbreviated_for_display() {
+        let h = Some(Path::new(HOME));
+        let p = Path::new("/tmp/fakehome/code/proj");
+        assert_eq!(abbreviate_home(p, h), "~/code/proj");
+        assert_eq!(abbreviate_home(Path::new(HOME), h), "~");
+        assert_eq!(
+            abbreviate_home(Path::new("/tmp/fakehomeX/a"), h),
+            "/tmp/fakehomeX/a"
+        );
+        assert_eq!(abbreviate_home(p, None), "/tmp/fakehome/code/proj");
     }
 
     #[test]

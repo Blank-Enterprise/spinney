@@ -2,6 +2,7 @@ mod changes;
 mod dialogs;
 mod diff_view;
 mod graph_view;
+mod new_tab;
 mod paths;
 mod sidebar;
 mod spaces;
@@ -15,7 +16,7 @@ use crate::refs::{self, Branch};
 use crate::stage::Direction;
 use crate::status::{FileStatus, Status};
 use crate::{creds, git};
-use dialogs::{CloneDialog, Dialogs, NewWorktreeDialog};
+use dialogs::{CloneDialog, CreateDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -310,8 +311,15 @@ pub enum Action {
     EditSpace,
     SelectTab(usize),
     CloseTab(usize),
+    /// Show the New Tab page; `CloseNewTab` hides it again.
+    NewTab,
+    CloseNewTab,
+    /// Pick a project folder with the native picker and open it.
     OpenFolder,
     CloneUrl,
+    CreateRepo,
+    /// Open a known project, or focus its tab.
+    OpenProject(PathBuf),
     Fetch,
     Pull,
     Push,
@@ -340,6 +348,10 @@ pub struct SpinneyApp {
     jobs: Jobs,
     errors: Vec<String>,
     dialogs: Dialogs,
+    /// The New Tab page is showing over the open tabs (it always shows when there are none).
+    new_tab: bool,
+    /// New Tab page search text.
+    recent_search: String,
     ctx: egui::Context,
     /// Window focus last frame; status reloads when it is regained.
     focused: bool,
@@ -364,6 +376,8 @@ impl SpinneyApp {
             jobs: Jobs::new(ctx.clone()),
             errors,
             dialogs: Dialogs::default(),
+            new_tab: false,
+            recent_search: String::new(),
             ctx,
             focused: true,
         };
@@ -397,6 +411,7 @@ impl SpinneyApp {
             Ok(tab) => {
                 self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
+                self.new_tab = false;
             }
             Err(e) => self.errors.push(format!("{e:#}")),
         }
@@ -489,6 +504,7 @@ impl SpinneyApp {
             }
             Action::SelectTab(i) => {
                 self.active_tab = i;
+                self.new_tab = false;
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
                 }
@@ -504,8 +520,23 @@ impl SpinneyApp {
                     self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
                 }
             }
-            Action::OpenFolder => self.dialogs.open_folder = Some(String::new()),
+            Action::NewTab => {
+                self.new_tab = true;
+                self.recent_search.clear();
+            }
+            Action::CloseNewTab => self.new_tab = false,
+            Action::OpenFolder => {
+                let start = self.space().and_then(|s| s.default_clone_dir);
+                if let Some(root) = paths::pick_folder("Open a project folder", start.as_deref()) {
+                    self.open_folder(root);
+                    ctx.request_repaint(); // show the opened tab now, not on the next input
+                }
+            }
+            Action::OpenProject(root) => self.open_folder(root),
             Action::CloneUrl => self.dialogs.clone = self.space().as_ref().map(CloneDialog::new),
+            Action::CreateRepo => {
+                self.dialogs.create = self.space().as_ref().map(CreateDialog::new)
+            }
             Action::Fetch => self.network(JobKind::Fetch),
             Action::Pull => self.network(JobKind::Pull),
             Action::Push => self.network(JobKind::Push),
@@ -603,7 +634,7 @@ impl SpinneyApp {
             ui.separator();
             for (i, tab) in self.tabs.iter().enumerate() {
                 if ui
-                    .selectable_label(i == self.active_tab, tab.name())
+                    .selectable_label(i == self.active_tab && !self.new_tab, tab.name())
                     .clicked()
                 {
                     actions.push(Action::SelectTab(i));
@@ -612,21 +643,19 @@ impl SpinneyApp {
                     actions.push(Action::CloseTab(i));
                 }
             }
+            if self.new_tab {
+                let _ = ui.selectable_label(true, "New Tab");
+                if ui.small_button("×").on_hover_text("Close tab").clicked() {
+                    actions.push(Action::CloseNewTab);
+                }
+            }
             let has_space = active_space(&self.config).is_some();
-            ui.add_enabled_ui(has_space, |ui| {
-                ui.menu_button("+", |ui| {
-                    if ui.button("Open folder…").clicked() {
-                        actions.push(Action::OpenFolder);
-                        ui.close();
-                    }
-                    if ui.button("Clone URL…").clicked() {
-                        actions.push(Action::CloneUrl);
-                        ui.close();
-                    }
-                });
-            });
+            let plus = ui.add_enabled(has_space, egui::Button::new("+"));
+            if plus.on_hover_text("New tab").clicked() {
+                actions.push(Action::NewTab);
+            }
             ui.separator();
-            ui.add_enabled_ui(!self.tabs.is_empty(), |ui| {
+            ui.add_enabled_ui(!self.showing_new_tab(), |ui| {
                 for (label, action) in [
                     ("Fetch", Action::Fetch),
                     ("Pull", Action::Pull),
@@ -641,6 +670,11 @@ impl SpinneyApp {
                 ui.add(egui::Spinner::new());
             }
         });
+    }
+
+    /// Whether the centre shows the New Tab page instead of the active project.
+    fn showing_new_tab(&self) -> bool {
+        self.new_tab || self.tabs.is_empty()
     }
 
     fn error_banner(&mut self, ui: &mut egui::Ui) {
@@ -714,7 +748,12 @@ impl eframe::App for SpinneyApp {
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        let tab = if self.showing_new_tab() {
+            None
+        } else {
+            self.tabs.get_mut(self.active_tab)
+        };
+        if let Some(tab) = tab {
             egui::Panel::left("sidebar")
                 .resizable(true)
                 .default_size(220.0)
@@ -737,14 +776,13 @@ impl eframe::App for SpinneyApp {
                 }
             });
         } else {
-            egui::CentralPanel::default().show(ui, |ui| {
-                if active_space(&self.config).is_none() {
+            egui::CentralPanel::default().show(ui, |ui| match active_space(&self.config) {
+                Some(space) => new_tab::show(ui, space, &mut self.recent_search, &mut actions),
+                None => {
                     ui.label("Create a space to get started.");
                     if ui.button("New space…").clicked() {
                         actions.push(Action::NewSpace);
                     }
-                } else {
-                    ui.label("Open a folder or clone a URL with the + menu.");
                 }
             });
         }
@@ -977,6 +1015,8 @@ mod tests {
             jobs: Jobs::new(ctx.clone()),
             errors: vec![],
             dialogs: Dialogs::default(),
+            new_tab: false,
+            recent_search: String::new(),
             ctx,
             focused: true,
         };

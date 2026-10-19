@@ -1,4 +1,4 @@
-//! Modal dialogs: open folder, clone, new worktree, confirm worktree removal.
+//! Modal dialogs: clone, create, new worktree, confirm worktree removal.
 
 use super::{add_project, paths, project, repo_name_from_url, spaces, JobKind, SpinneyApp};
 use eframe::egui;
@@ -49,6 +49,59 @@ impl CloneDialog {
     }
 }
 
+pub(super) struct CreateDialog {
+    name: String,
+    /// "Initialize in", as typed or picked.
+    dir: String,
+    branch: String,
+    default_dir: Option<PathBuf>,
+    /// Last branch name checked with git, and whether it was valid (git runs once per edit).
+    checked: Option<(String, bool)>,
+}
+
+impl CreateDialog {
+    pub(super) fn new(space: &crate::config::Space) -> Self {
+        let default_dir = space.default_clone_dir.clone();
+        CreateDialog {
+            name: String::new(),
+            dir: default_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            branch: "main".into(),
+            default_dir,
+            checked: None,
+        }
+    }
+
+    /// Canonical parent, trimmed name and branch, or why the repo cannot be created yet.
+    fn target(&mut self, home: Option<&Path>) -> Result<(PathBuf, String, String), String> {
+        let parent = paths::existing_dir(&self.dir, home)?;
+        paths::check_name(&self.name)?;
+        let branch = self.branch.trim().to_string();
+        if branch.is_empty() {
+            return Err("Enter a default branch".into());
+        }
+        let valid = match &self.checked {
+            Some((b, ok)) if *b == branch => *ok,
+            _ => {
+                let ok = project::check_branch_name(&branch).is_ok();
+                self.checked = Some((branch.clone(), ok));
+                ok
+            }
+        };
+        if !valid {
+            return Err(format!("{branch} is not a valid branch name"));
+        }
+        let name = self.name.trim().to_string();
+        let root = parent.join(&name);
+        if root.exists() {
+            return Err(format!("{} already exists", root.display()));
+        }
+        Ok((parent, name, branch))
+    }
+}
+
 /// Sidebar label for a space's GitHub host.
 fn github_label(host: &str) -> String {
     if host == "github.com" {
@@ -66,8 +119,8 @@ pub(super) struct NewWorktreeDialog {
 #[derive(Default)]
 pub(super) struct Dialogs {
     pub(super) space: Option<spaces::SpaceEdit>,
-    pub(super) open_folder: Option<String>,
     pub(super) clone: Option<CloneDialog>,
+    pub(super) create: Option<CreateDialog>,
     pub(super) new_worktree: Option<NewWorktreeDialog>,
     /// Dirty worktree awaiting a forced-removal confirmation.
     pub(super) confirm_remove: Option<PathBuf>,
@@ -82,34 +135,18 @@ impl SpinneyApp {
                 None => self.dialogs.space = Some(edit),
             }
         }
-        if let Some(mut path) = self.dialogs.open_folder.take() {
-            let mut result = None;
-            egui::Window::new("Open folder")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Project folder path:");
-                    ui.add(egui::TextEdit::singleline(&mut path).desired_width(360.0));
-                    ui.horizontal(|ui| {
-                        if ui.button("Open").clicked() {
-                            result = Some(true);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            result = Some(false);
-                        }
-                    });
-                });
-            match result {
-                Some(true) => self.open_folder(PathBuf::from(path.trim())),
-                Some(false) => {}
-                None => self.dialogs.open_folder = Some(path),
-            }
-        }
         if let Some(mut d) = self.dialogs.clone.take() {
             match clone_dialog(ctx, &mut d) {
                 Some(true) => self.start_clone(d),
                 Some(false) => {}
                 None => self.dialogs.clone = Some(d),
+            }
+        }
+        if let Some(mut d) = self.dialogs.create.take() {
+            match create_dialog(ctx, &mut d) {
+                Some(true) => self.create_repo(d),
+                Some(false) => {}
+                None => self.dialogs.create = Some(d),
             }
         }
         if let Some(mut d) = self.dialogs.new_worktree.take() {
@@ -163,10 +200,12 @@ impl SpinneyApp {
         }
     }
 
-    fn open_folder(&mut self, root: PathBuf) {
+    /// Open `root` as a tab (or focus its tab) and add it to the active space.
+    pub(super) fn open_folder(&mut self, root: PathBuf) {
         let Some(space) = self.space() else { return };
         if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
             self.active_tab = i;
+            self.new_tab = false;
             return;
         }
         let before = self.tabs.len();
@@ -192,6 +231,22 @@ impl SpinneyApp {
             .spawn(JobKind::Clone, parent.join(&name), id, move || {
                 project::clone_into(&url, &parent, &name, &space).map(|_| ())
             });
+    }
+
+    fn create_repo(&mut self, mut d: CreateDialog) {
+        let Some(space) = self.space() else { return };
+        let created = d
+            .target(paths::home().as_deref())
+            .and_then(|(parent, name, branch)| {
+                project::create_new(&parent, &name, &branch, &space).map_err(|e| format!("{e:#}"))
+            });
+        match created {
+            Ok(root) => self.open_folder(root),
+            Err(e) => {
+                self.errors.push(e);
+                self.dialogs.create = Some(d);
+            }
+        }
     }
 
     fn new_worktree(&mut self, d: NewWorktreeDialog) {
@@ -276,6 +331,58 @@ fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
     result
 }
 
+/// GitKraken-style "Create a Repository" modal; `Some(true)` = create, `Some(false)` = cancel,
+/// `None` = still open.
+fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
+    let (mut result, mut browse) = (None, false);
+    let target = d.target(paths::home().as_deref());
+    let modal = egui::Modal::new(egui::Id::unique("create_dialog")).show(ctx, |ui| {
+        ui.heading("Create a Repository");
+        ui.add_space(6.0);
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(390.0));
+        ui.label("Initialize in");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut d.dir).desired_width(320.0));
+            browse = ui.button("Browse").clicked();
+        });
+        ui.label("Default branch");
+        ui.add(egui::TextEdit::singleline(&mut d.branch).desired_width(390.0));
+        ui.add_space(6.0);
+        ui.label("Full path");
+        let home = paths::home();
+        let root = paths::expand_tilde(&d.dir, home.as_deref()).join(d.name.trim());
+        ui.monospace(format!("{}/", root.display()));
+        let wt = project::worktree_dir_name(d.branch.trim());
+        ui.monospace(format!("{}/", root.join(wt).display()));
+        ui.add_space(6.0);
+        if let Err(reason) = &target {
+            ui.colored_label(ui.visuals().error_fg_color, reason);
+        }
+        ui.horizontal(|ui| {
+            let create = egui::Button::new("Create Repository");
+            if ui.add_enabled(target.is_ok(), create).clicked() {
+                result = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                result = Some(false);
+            }
+        });
+    });
+    if result.is_none() && modal.should_close() {
+        result = Some(false);
+    }
+    if browse {
+        let typed = paths::expand_tilde(&d.dir, paths::home().as_deref());
+        let start = Some(typed).filter(|p| p.is_dir()).or(d.default_dir.clone());
+        if let Some(dir) = paths::pick_folder("Initialize in", start.as_deref()) {
+            d.dir = dir.display().to_string();
+            ctx.request_repaint(); // show the pick now, not on the next input
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +424,28 @@ mod tests {
         assert_eq!(d.where_dir, "/tmp/code");
         assert_eq!(d.github, "GitHub Enterprise (ghe.example.com)");
         assert_eq!(github_label("github.com"), "GitHub.com");
+    }
+
+    #[test]
+    fn create_target_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canon = tmp.path().canonicalize().unwrap();
+        let mut d = CreateDialog::new(&Space::default());
+        assert_eq!(d.branch, "main");
+        d.dir = tmp.path().display().to_string();
+        d.name = " fresh ".into();
+        let want = (canon, "fresh".to_string(), "main".to_string());
+        assert_eq!(d.target(None).unwrap(), want);
+        for bad in ["", "a..b", "-x"] {
+            d.branch = bad.into();
+            assert!(d.target(None).is_err(), "{bad:?}");
+        }
+        d.branch = " feature/x ".into();
+        assert_eq!(d.target(None).unwrap().2, "feature/x");
+        d.name = "a/b".into();
+        assert!(d.target(None).is_err());
+        d.name = "fresh".into();
+        std::fs::create_dir(tmp.path().join("fresh")).unwrap();
+        assert!(d.target(None).unwrap_err().contains("already exists"));
     }
 }
