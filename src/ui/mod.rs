@@ -17,7 +17,7 @@ use crate::project::{self, Layout, Worktree};
 use crate::refs::{self, Branch};
 use crate::stage::Direction;
 use crate::stash::{self, Stash};
-use crate::status::{FileStatus, Status};
+use crate::status::{self, FileStatus, Status};
 use crate::{creds, git};
 use dialogs::{CloneDialog, CreateDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui::{self, Margin};
@@ -239,37 +239,57 @@ impl ProjectTab {
         }
     }
 
-    /// Run a stash action, refresh, and return a notice to show (if any).
+    /// Run a stash action in `wt`, refresh, and return a notice to show (if any).
+    /// Apply/Pop/DropConfirmed name the stash by hash and re-resolve its current index.
     fn stash_action(
         &mut self,
         action: Action,
+        wt: &Path,
         ctx: &egui::Context,
         errors: &mut Vec<String>,
     ) -> Option<String> {
-        let wt = self.active_worktree.clone();
+        let conflicted = |wt: &Path| -> Vec<String> {
+            status::status(wt)
+                .map(|s| s.conflicted.into_iter().map(|f| f.path).collect())
+                .unwrap_or_default()
+        };
+        let before = conflicted(wt);
         let mut notice = None;
         let mut applies = false;
+        let (pop, drop) = (
+            matches!(action, Action::PopStash(_)),
+            matches!(action, Action::DropStashConfirmed(_)),
+        );
         let res = match action {
-            Action::Stash => stash::save(&wt, None).map(|saved| {
+            Action::Stash => stash::save(wt, None).map(|saved| {
                 if !saved {
                     notice = Some("Nothing to stash".to_string());
                 }
             }),
-            Action::ApplyStash(i) => {
-                applies = true;
-                stash::apply(&wt, i)
+            Action::ApplyStash(h) | Action::PopStash(h) | Action::DropStashConfirmed(h) => {
+                applies = !drop;
+                match stash::index_of(wt, &h) {
+                    Ok(Some(i)) if drop => stash::drop(wt, i),
+                    Ok(Some(i)) if pop => stash::pop(wt, i),
+                    Ok(Some(i)) => stash::apply(wt, i),
+                    Ok(None) => {
+                        self.refresh(ctx, errors);
+                        return Some("Stash list changed — refreshed".to_string());
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            Action::PopStash(i) => {
-                applies = true;
-                stash::pop(&wt, i)
-            }
-            Action::DropStash(i) => stash::drop(&wt, i),
             _ => return None,
         };
         self.refresh(ctx, errors);
         if let Err(e) = res {
             // A conflicted apply/pop exits non-zero; the Conflicted list shows the files.
-            if applies && !self.status.conflicted.is_empty() {
+            let new_conflicts = self
+                .status
+                .conflicted
+                .iter()
+                .any(|f| !before.contains(&f.path));
+            if applies && new_conflicts {
                 notice = Some("Stash applied with conflicts".to_string());
             } else {
                 errors.push(format!("{e:#}"));
@@ -407,10 +427,13 @@ pub enum Action {
     Push,
     /// Stash all changes (untracked included).
     Stash,
-    ApplyStash(usize),
-    PopStash(usize),
-    /// Ask to drop the stash (confirm dialog).
-    DropStash(usize),
+    /// Stash commit hashes, so a stale list can never hit another stash.
+    ApplyStash(String),
+    PopStash(String),
+    /// Ask to drop a stash (hash, label): opens the confirm dialog.
+    RequestDropStash(String, String),
+    /// Drop after confirmation; only the dialog sends this.
+    DropStashConfirmed(String),
     Checkout(String),
     NewWorktreeFrom(String),
     /// New branch from the given base: a worktree in the worktree layout, else a switch.
@@ -648,11 +671,22 @@ impl SpinneyApp {
             Action::Push => self.network(JobKind::Push),
             Action::Stash | Action::ApplyStash(_) | Action::PopStash(_) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let notice = tab.stash_action(action, &ctx, &mut errors);
+                    let wt = tab.active_worktree.clone();
+                    let notice = tab.stash_action(action, &wt, &ctx, &mut errors);
                     self.notices.extend(notice);
                 }
             }
-            Action::DropStash(i) => self.dialogs.confirm_drop_stash = Some(i),
+            Action::DropStashConfirmed(_) => {} // sent by the confirm dialog only
+            Action::RequestDropStash(hash, label) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    self.dialogs.confirm_drop_stash = Some(dialogs::DropStash {
+                        root: tab.root.clone(),
+                        worktree: tab.active_worktree.clone(),
+                        hash,
+                        label,
+                    });
+                }
+            }
             Action::ToggleInline => {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
@@ -909,6 +943,7 @@ impl eframe::App for SpinneyApp {
         if focused && !self.focused {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.reload_changes(&mut self.errors);
+                tab.load_stashes(&mut self.errors);
             }
         }
         self.focused = focused;

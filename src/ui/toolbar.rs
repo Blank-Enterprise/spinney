@@ -184,16 +184,16 @@ pub(super) fn toolbar(
             if tool_button(ui, "⎇", "Branch", true, false, "New branch") {
                 actions.push(Action::NewBranch(base));
             }
-            let none = tab.stashes.is_empty();
+            let top = tab.stashes.first();
             if tool_button(
                 ui,
                 "⤓",
                 "Pop",
-                !none,
+                top.is_some(),
                 false,
                 "Apply and remove the top stash",
             ) {
-                actions.push(Action::PopStash(0));
+                actions.extend(top.map(|s| Action::PopStash(s.hash.clone())));
             }
             if tool_button(ui, "⤒", "Stash", true, false, "Stash all changes") {
                 actions.push(Action::Stash);

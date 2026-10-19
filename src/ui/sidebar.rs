@@ -228,15 +228,19 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 );
                 r.context_menu(|ui| {
                     if ui.button("Apply").clicked() {
-                        actions.push(Action::ApplyStash(st.index));
+                        actions.push(Action::ApplyStash(st.hash.clone()));
                         ui.close();
                     }
                     if ui.button("Pop").clicked() {
-                        actions.push(Action::PopStash(st.index));
+                        actions.push(Action::PopStash(st.hash.clone()));
                         ui.close();
                     }
                     if ui.button("Drop").clicked() {
-                        actions.push(Action::DropStash(st.index));
+                        let label = match &st.branch {
+                            Some(b) => format!("\"{}\" (on {b})", st.message),
+                            None => format!("\"{}\"", st.message),
+                        };
+                        actions.push(Action::RequestDropStash(st.hash.clone(), label));
                         ui.close();
                     }
                 });
