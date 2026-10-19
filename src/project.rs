@@ -78,6 +78,16 @@ fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<(
     let default = git::run(&bare, &["symbolic-ref", "--short", "HEAD"])?
         .trim()
         .to_string();
+    // `clone --bare` copied every remote head into refs/heads/*: untracked branches that go
+    // stale. Keep only the default; git's DWIM later creates tracking branches on demand.
+    let keep = format!("refs/heads/{default}");
+    let heads = git::run(
+        &bare,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    )?;
+    for r in heads.lines().filter(|r| *r != keep) {
+        git::run(&bare, &["update-ref", "-d", r])?;
+    }
     let dir = format!("./{}", worktree_dir_name(&default));
     git::run(root, &["worktree", "add", &dir, &default])?;
     git::run(
@@ -223,6 +233,11 @@ mod tests {
         assert_eq!(detect(&root).unwrap(), Layout::WorktreeRoot);
         let email = git::run(&main, &["config", "user.email"]).unwrap();
         assert_eq!(email.trim(), space().author_email);
+        let heads = git::run(
+            &root,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        );
+        assert_eq!(heads.unwrap(), "refs/heads/main\n");
     }
 
     #[test]
@@ -254,9 +269,21 @@ mod tests {
 
     #[test]
     fn add_existing_tracks_origin_only_branch() {
-        let (_tmp, root) = cloned();
+        let (tmp, root) = cloned();
+        let remote = tmp.path().join("remote");
+        let g = |args: &[&str]| git::run(&remote, args).unwrap();
+        g(&["checkout", "-q", "feature/x"]);
+        std::fs::write(remote.join("c.txt"), "c\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "advance"]);
+        let tip = g(&["rev-parse", "HEAD"]);
+        git::run(&root, &["fetch", "-q", "--all", "--prune"]).unwrap();
+
         let p = add_worktree_existing(&root, "feature/x").unwrap();
-        assert!(p.join("b.txt").exists());
+        let up = git::run(&p, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
+        assert_eq!(up.trim(), "origin/feature/x");
+        assert_eq!(git::run(&p, &["rev-parse", "HEAD"]).unwrap(), tip);
+        assert!(p.join("c.txt").exists());
     }
 
     #[test]
