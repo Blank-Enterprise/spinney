@@ -19,7 +19,7 @@ use crate::stage::Direction;
 use crate::stash::{self, Stash};
 use crate::status::{self, FileStatus, Status};
 use crate::{creds, git};
-use dialogs::{CloneDialog, CreateDialog, Dialogs, NewWorktreeDialog};
+use dialogs::{CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui::{self, Margin};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -123,6 +123,8 @@ pub struct ProjectTab {
     status: Status,
     commit_summary: String,
     commit_desc: String,
+    /// "Amend previous commit" is ticked: Commit replaces HEAD instead.
+    amend: bool,
     /// Sidebar filter text.
     filter: String,
 }
@@ -184,6 +186,7 @@ impl ProjectTab {
             status: Status::default(),
             commit_summary: String::new(),
             commit_desc: String::new(),
+            amend: false,
             filter: String::new(),
         };
         tab.log.request(PAGE);
@@ -316,6 +319,8 @@ enum JobKind {
     Fetch,
     Pull,
     Push,
+    /// `git push <remote> --delete`, run like a push.
+    DeleteRemote,
     CommitGraph,
     /// Normal clone to worktree layout; the project's tab is closed while it runs.
     Convert,
@@ -326,7 +331,7 @@ struct JobDone {
     /// The project the job is about (for a clone, the folder being created).
     root: PathBuf,
     space_id: String,
-    result: Result<(), String>,
+    result: anyhow::Result<()>,
 }
 
 /// Background git work (network, clone, commit-graph). Workers wake the UI when done, so
@@ -360,7 +365,7 @@ impl Jobs {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.active.push((kind, root.clone()));
         std::thread::spawn(move || {
-            let result = work().map_err(|e| format!("{e:#}"));
+            let result = work();
             let _ = tx.send(JobDone {
                 kind,
                 root,
@@ -403,12 +408,32 @@ impl Jobs {
         self.active.iter().any(|(_, r)| r == root)
     }
 
-    /// A fetch, pull or push is in flight for `root`.
+    /// A fetch, pull, push or remote branch delete is in flight for `root`.
     fn network_busy(&self, root: &Path) -> bool {
-        [JobKind::Fetch, JobKind::Pull, JobKind::Push]
-            .into_iter()
-            .any(|k| self.running(k, root))
+        [
+            JobKind::Fetch,
+            JobKind::Pull,
+            JobKind::Push,
+            JobKind::DeleteRemote,
+        ]
+        .into_iter()
+        .any(|k| self.running(k, root))
     }
+}
+
+/// What the red confirmation bar asks to throw away. Staged changes always stay.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Discard {
+    /// Every unstaged change.
+    All,
+    /// One unstaged file: back to the index, or deleted when untracked.
+    File(FileStatus),
+    /// `n` selected lines (or a hunk) of `path`'s unstaged diff, as a `stage::discard_patch`.
+    Lines {
+        path: String,
+        patch: String,
+        n: usize,
+    },
 }
 
 /// Deferred UI intents, applied after rendering so closures need not borrow `self`.
@@ -443,6 +468,10 @@ pub enum Action {
     DropStashConfirmed(String),
     Checkout(String),
     NewWorktreeFrom(String),
+    /// Ask before deleting a local branch (refused when a worktree has it checked out).
+    AskDeleteBranch(String),
+    /// Ask before deleting `remote/branch` on its remote.
+    AskDeleteRemote(String),
     /// New branch from the given base: a worktree in the worktree layout, else a switch.
     NewBranch(String),
     /// Open Terminal.app at the active worktree.
@@ -462,11 +491,21 @@ pub enum Action {
     ApplyPatch(String, Direction),
     StageAll,
     UnstageAll,
-    /// Show the confirmation bar; `DiscardAll` (from that bar) does it, `CancelDiscard` hides it.
-    AskDiscardAll,
-    DiscardAll,
+    /// Show the confirmation bar; `ConfirmDiscard` (from that bar) does it, `CancelDiscard` hides it.
+    AskDiscard(Discard),
+    ConfirmDiscard,
     CancelDiscard,
+    /// From the rejected-push bar: `AskForcePush` asks to confirm, `ForcePush` does it
+    /// (with lease), `DismissPush` hides the bar.
+    AskForcePush,
+    ForcePush,
+    DismissPush,
+    /// Tick or untick "Amend previous commit".
+    SetAmend(bool),
+    /// Commit or amend; amending a pushed HEAD asks first (`ConfirmAmend` / `CancelAmend`).
     Commit,
+    ConfirmAmend,
+    CancelAmend,
     ToggleInline,
     CloseDiff,
 }
@@ -489,10 +528,21 @@ pub struct SpinneyApp {
     ctx: egui::Context,
     /// Window focus last frame; status reloads when it is regained.
     focused: bool,
-    /// Root of the tab whose "Discard all" is awaiting confirmation in the top bar.
-    confirm_discard: Option<PathBuf>,
+    /// Root of the tab whose discard is awaiting confirmation in the top bar, and what it drops.
+    confirm_discard: Option<(PathBuf, Discard)>,
+    /// Root of the tab whose amend of a pushed HEAD is awaiting confirmation.
+    confirm_amend: Option<PathBuf>,
+    /// The last push rejected as non-fast-forward, offering Pull or Force push… in the top bar.
+    rejected_push: Option<RejectedPush>,
     /// Conversions in flight: (project root, worktree to activate afterwards).
     converting: Vec<(PathBuf, PathBuf)>,
+}
+
+struct RejectedPush {
+    root: PathBuf,
+    rejected: actions::PushRejected,
+    /// Set by Force push…: the lease to confirm, snapshotted from the tracking ref then.
+    lease: Option<actions::Lease>,
 }
 
 impl SpinneyApp {
@@ -522,6 +572,8 @@ impl SpinneyApp {
             focused: true,
             confirm_discard: None,
             converting: vec![],
+            confirm_amend: None,
+            rejected_push: None,
         };
         app.open_visible_tabs();
         app
@@ -593,7 +645,16 @@ impl SpinneyApp {
             return self.convert_done(root, result);
         }
         if let Err(e) = result {
-            self.errors.push(format!("{kind:?} failed: {e}"));
+            match e.downcast::<actions::PushRejected>() {
+                Ok(rejected) => {
+                    self.rejected_push = Some(RejectedPush {
+                        root,
+                        rejected,
+                        lease: None,
+                    })
+                }
+                Err(e) => self.errors.push(format!("{kind:?} failed: {e:#}")),
+            }
             return;
         }
         match kind {
@@ -608,7 +669,7 @@ impl SpinneyApp {
                     self.open_tab(&root, &space);
                 }
             }
-            JobKind::Fetch | JobKind::Pull | JobKind::Push => {
+            JobKind::Fetch | JobKind::Pull | JobKind::Push | JobKind::DeleteRemote => {
                 if kind == JobKind::Fetch {
                     if let Ok(common) = common_dir(&root) {
                         self.jobs.commit_graph(root.clone(), common);
@@ -658,6 +719,7 @@ impl SpinneyApp {
             Action::SelectTab(i) => {
                 self.active_tab = i;
                 self.confirm_discard = None;
+                self.confirm_amend = None;
                 self.new_tab = false;
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
@@ -692,8 +754,39 @@ impl SpinneyApp {
                 self.dialogs.create = self.space().as_ref().map(CreateDialog::new)
             }
             Action::Fetch => self.network(JobKind::Fetch),
-            Action::Pull => self.network(JobKind::Pull),
-            Action::Push => self.network(JobKind::Push),
+            Action::Pull => {
+                self.rejected_push = None;
+                self.network(JobKind::Pull)
+            }
+            Action::Push => {
+                self.rejected_push = None;
+                self.network(JobKind::Push)
+            }
+            Action::AskForcePush => {
+                if let Some(r) = &mut self.rejected_push {
+                    match actions::lease(&r.rejected.worktree) {
+                        Ok(lease) if lease.branch == r.rejected.branch => r.lease = Some(lease),
+                        // Switched branch since the push: never force push a different one.
+                        Ok(_) => {
+                            self.rejected_push = None;
+                            errors.push("force push: the branch changed since the push".into());
+                        }
+                        Err(e) => errors.push(format!("force push: {e:#}")),
+                    }
+                }
+            }
+            Action::ForcePush => {
+                if let Some(RejectedPush {
+                    root,
+                    lease: Some(lease),
+                    ..
+                }) = self.rejected_push.take()
+                {
+                    let work = move || actions::force_push(&lease);
+                    self.jobs.spawn(JobKind::Push, root, String::new(), work);
+                }
+            }
+            Action::DismissPush => self.rejected_push = None,
             Action::Stash | Action::ApplyStash(_) | Action::PopStash(_) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let wt = tab.active_worktree.clone();
@@ -716,16 +809,42 @@ impl SpinneyApp {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
             }
-            Action::AskDiscardAll => {
-                self.confirm_discard = self.tabs.get(self.active_tab).map(|t| t.root.clone())
+            Action::AskDiscard(what) => {
+                self.confirm_discard = self
+                    .tabs
+                    .get(self.active_tab)
+                    .map(|t| (t.root.clone(), what))
             }
             Action::CancelDiscard => self.confirm_discard = None,
-            Action::DiscardAll => {
+            Action::ConfirmDiscard => {
                 // Only for the tab that asked; the bar is hidden on other tabs anyway.
-                if let Some(tab) = self.discard_tab() {
-                    tab.discard_all(&mut errors);
+                let what = self.confirm_discard.as_ref().map(|(_, w)| w.clone());
+                if let (Some(what), Some(tab)) = (what, self.discard_tab()) {
+                    tab.discard(&what, &mut errors);
                 }
                 self.confirm_discard = None;
+            }
+            Action::Commit => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    // Amending pushed history asks first; so does a failed check.
+                    let pushed = tab.amend
+                        && actions::head_pushed(&tab.active_worktree).unwrap_or_else(|e| {
+                            errors.push(format!("upstream: {e:#}"));
+                            true
+                        });
+                    if pushed {
+                        self.confirm_amend = Some(tab.root.clone());
+                    } else {
+                        tab.commit(&ctx, &mut errors);
+                    }
+                }
+            }
+            Action::CancelAmend => self.confirm_amend = None,
+            Action::ConfirmAmend => {
+                if let Some(tab) = self.asking_tab(self.confirm_amend.clone()) {
+                    tab.commit(&ctx, &mut errors);
+                }
+                self.confirm_amend = None;
             }
             Action::SelectCommit(_)
             | Action::DeselectCommit
@@ -735,10 +854,10 @@ impl SpinneyApp {
             | Action::ApplyPatch(..)
             | Action::StageAll
             | Action::UnstageAll
-            | Action::Commit
+            | Action::SetAmend(_)
             | Action::CloseDiff => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    tab_action(tab, action, &ctx, &mut errors);
+                    tab_action(tab, action, &mut errors);
                 }
             }
             Action::NewWorktreeFrom(base) => {
@@ -748,6 +867,26 @@ impl SpinneyApp {
                     worktree: true,
                 });
             }
+            Action::AskDeleteBranch(branch) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    // Refuse now rather than after the confirmation.
+                    match actions::ensure_not_checked_out(&tab.active_worktree, &branch) {
+                        Ok(()) => {
+                            let remote = format!("origin/{branch}");
+                            let has_remote =
+                                tab.branches.iter().any(|b| b.remote && b.name == remote);
+                            self.dialogs.delete_branch = Some(DeleteBranchDialog {
+                                branch,
+                                remote: has_remote.then_some(remote),
+                                also_remote: false,
+                                not_merged: false,
+                            });
+                        }
+                        Err(e) => errors.push(format!("{e:#}")),
+                    }
+                }
+            }
+            Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
             Action::NewBranch(base) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     self.dialogs.new_worktree = Some(NewWorktreeDialog {
@@ -781,6 +920,7 @@ impl SpinneyApp {
                 }
             }
             Action::ActivateWorktree(path) => {
+                self.confirm_discard = None; // it was asked about the other worktree's files
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.active_worktree = path;
                     tab.refresh(&ctx, &mut errors);
@@ -866,27 +1006,57 @@ impl SpinneyApp {
         self.new_tab || self.tabs.is_empty()
     }
 
-    /// The active tab, when it is the one with a pending "Discard all".
+    /// The active tab, when it is the one with a pending discard.
     fn discard_tab(&mut self) -> Option<&mut ProjectTab> {
-        let root = self.confirm_discard.as_ref()?;
+        let root = self.confirm_discard.as_ref().map(|(root, _)| root.clone());
+        self.asking_tab(root)
+    }
+
+    /// The active tab, when it is `asking` (the root of a pending confirmation).
+    fn asking_tab(&mut self, asking: Option<PathBuf>) -> Option<&mut ProjectTab> {
+        let root = asking?;
         if self.showing_new_tab() {
             return None;
         }
         self.tabs
             .get_mut(self.active_tab)
-            .filter(|t| &t.root == root)
+            .filter(|t| t.root == root)
     }
 
-    /// "Discard all N changes?" with Discard / Cancel.
-    fn discard_bar(ui: &mut egui::Ui, n: usize, actions: &mut Vec<Action>) {
+    /// "The last commit is already pushed" with Amend / Cancel.
+    fn amend_bar(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            let noun = if n == 1 { "change" } else { "changes" };
+            ui.label(egui::RichText::new("⚠").color(theme::WARN));
+            ui.label(
+                egui::RichText::new(
+                    "The last commit is already pushed. Amending rewrites history.",
+                )
+                .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() {
+                    actions.push(Action::CancelAmend);
+                }
+                let amend = egui::Button::new(
+                    egui::RichText::new("Amend")
+                        .color(theme::ON_ACCENT)
+                        .strong(),
+                )
+                .fill(theme::WARN)
+                .small();
+                if ui.add(amend).clicked() {
+                    actions.push(Action::ConfirmAmend);
+                }
+            });
+        });
+    }
+
+    /// The discard question (e.g. "Discard all N changes?") with Discard / Cancel.
+    fn discard_bar(ui: &mut egui::Ui, question: &str, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
             ui.label(egui::RichText::new("🗑").color(theme::DELETED));
             ui.label(
-                egui::RichText::new(format!(
-                    "Discard all {n} unstaged {noun}? This can't be undone."
-                ))
-                .color(theme::TEXT),
+                egui::RichText::new(format!("{question} This can't be undone.")).color(theme::TEXT),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Cancel").clicked() {
@@ -900,8 +1070,73 @@ impl SpinneyApp {
                 .fill(theme::DELETED)
                 .small();
                 if ui.add(discard).clicked() {
-                    actions.push(Action::DiscardAll);
+                    actions.push(Action::ConfirmDiscard);
                 }
+            });
+        });
+    }
+
+    /// The rejected push, when it was for the active tab's active worktree.
+    fn push_tab(&self) -> Option<&RejectedPush> {
+        let r = self.rejected_push.as_ref()?;
+        if self.showing_new_tab() {
+            return None;
+        }
+        let tab = self.tabs.get(self.active_tab)?;
+        (tab.root == r.root && tab.active_worktree == r.rejected.worktree).then_some(r)
+    }
+
+    /// "Push rejected" with Pull / Force push…, then the force push confirmation.
+    fn push_bar(ui: &mut egui::Ui, r: &RejectedPush, busy: bool, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            let branch = &r.rejected.branch;
+            let text = match &r.lease {
+                None => format!(
+                    "Push of {branch} was rejected: the remote has commits this branch doesn't."
+                ),
+                Some(l) => {
+                    let lost = match l.lost {
+                        0 => "Commits on the remote that aren't on this branch".to_string(),
+                        1 => format!("1 commit on {} that isn't on this branch", l.tracking),
+                        n => format!("{n} commits on {} that aren't on this branch", l.tracking),
+                    };
+                    format!(
+                        "Force push {}? {lost} will be lost. If someone pushed since your \
+                         last fetch, the push is refused.",
+                        l.branch
+                    )
+                }
+            };
+            let icon = if r.lease.is_some() { "⚠" } else { "↑" };
+            ui.label(egui::RichText::new(icon).color(theme::WARN));
+            ui.label(egui::RichText::new(text).color(theme::TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() {
+                    actions.push(Action::DismissPush);
+                }
+                ui.add_enabled_ui(!busy, |ui| {
+                    if r.lease.is_some() {
+                        let force = egui::Button::new(
+                            egui::RichText::new("Force push")
+                                .color(theme::ON_ACCENT)
+                                .strong(),
+                        )
+                        .fill(theme::DELETED)
+                        .small();
+                        if ui.add(force).clicked() {
+                            actions.push(Action::ForcePush);
+                        }
+                    } else {
+                        if ui.small_button("Force push…").clicked() {
+                            actions.push(Action::AskForcePush);
+                        }
+                        if ui.small_button("Pull").clicked() {
+                            actions.push(Action::Pull);
+                        }
+                    }
+                })
+                .response
+                .on_disabled_hover_text("Waiting for the running job");
             });
         });
     }
@@ -935,7 +1170,7 @@ impl SpinneyApp {
 }
 
 /// Changes-panel and diff-view actions on the active tab.
-fn tab_action(tab: &mut ProjectTab, action: Action, ctx: &egui::Context, errors: &mut Vec<String>) {
+fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
     match action {
         Action::SelectCommit(i) => tab.select_commit(i, errors),
         Action::DeselectCommit => {
@@ -948,7 +1183,7 @@ fn tab_action(tab: &mut ProjectTab, action: Action, ctx: &egui::Context, errors:
         Action::ApplyPatch(p, dir) => tab.apply_patch(&p, dir, errors),
         Action::StageAll => tab.stage_all(false, errors),
         Action::UnstageAll => tab.stage_all(true, errors),
-        Action::Commit => tab.commit(ctx, errors),
+        Action::SetAmend(on) => tab.set_amend(on, errors),
         Action::CloseDiff => tab.center = Center::Graph,
         _ => {}
     }
@@ -1030,17 +1265,49 @@ impl eframe::App for SpinneyApp {
                 }
             }
         }
-        if let Some(n) = self.discard_tab().map(|t| t.status.unstaged.len()) {
-            if n == 0 {
-                self.confirm_discard = None; // nothing left to discard (e.g. cleaned outside)
-            } else {
+        let question = self.confirm_discard.clone().and_then(|(_, what)| {
+            let tab = self.discard_tab()?;
+            Some(changes::discard_question(&what, &tab.status, &tab.center))
+        });
+        match question {
+            // Nothing left to discard (e.g. cleaned outside, or the diff was closed).
+            Some(None) => self.confirm_discard = None,
+            Some(Some(q)) => {
                 let bar = egui::Frame::new()
                     .fill(theme::DIFF_DEL)
                     .inner_margin(Margin::symmetric(14, 6));
                 egui::Panel::top("discard_confirm")
                     .frame(bar)
-                    .show(ui, |ui| Self::discard_bar(ui, n, &mut actions));
+                    .show(ui, |ui| Self::discard_bar(ui, &q, &mut actions));
             }
+            None => {}
+        }
+        let amend = self.confirm_amend.clone();
+        if let Some(on) = self.asking_tab(amend).map(|t| t.amend) {
+            if !on {
+                self.confirm_amend = None; // unticked while asking
+            } else {
+                let bar = egui::Frame::new()
+                    .fill(theme::WARN.gamma_multiply(0.12))
+                    .inner_margin(Margin::symmetric(14, 6));
+                egui::Panel::top("amend_confirm")
+                    .frame(bar)
+                    .show(ui, |ui| Self::amend_bar(ui, &mut actions));
+            }
+        }
+        if let Some(r) = self.push_tab() {
+            let busy = self.jobs.network_busy(&r.root);
+            let fill = if r.lease.is_some() {
+                theme::DIFF_DEL
+            } else {
+                theme::PANEL
+            };
+            let bar = egui::Frame::new()
+                .fill(fill)
+                .inner_margin(Margin::symmetric(14, 6));
+            egui::Panel::top("push_rejected")
+                .frame(bar)
+                .show(ui, |ui| Self::push_bar(ui, r, busy, &mut actions));
         }
         if !self.errors.is_empty() || !self.notices.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
@@ -1333,6 +1600,8 @@ mod tests {
             focused: true,
             confirm_discard: None,
             converting: vec![],
+            confirm_amend: None,
+            rejected_push: None,
         }
     }
 
@@ -1405,6 +1674,37 @@ mod tests {
     }
 
     #[test]
+    fn rejected_push_shows_bar_instead_of_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let proj = repo(1);
+        let rejected = actions::PushRejected {
+            worktree: proj.path().to_path_buf(),
+            branch: "main".into(),
+        };
+        app.job_done(JobDone {
+            kind: JobKind::Push,
+            root: proj.path().to_path_buf(),
+            space_id: String::new(),
+            result: Err(rejected.clone().into()),
+        });
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.rejected_push.as_ref().unwrap().rejected, rejected);
+
+        // No remote-tracking ref to lease against: say so, and do not ask to confirm.
+        app.apply(Action::AskForcePush);
+        assert!(app.errors[0].contains("fetch first"), "{:?}", app.errors);
+        assert!(app.rejected_push.as_ref().unwrap().lease.is_none());
+        app.apply(Action::ForcePush);
+        assert!(
+            app.jobs.active.is_empty(),
+            "nothing confirmed, nothing pushed"
+        );
+        app.apply(Action::DismissPush);
+        assert!(app.rejected_push.is_none());
+    }
+
+    #[test]
     fn jobs_track_what_is_running() {
         let mut jobs = Jobs::new(egui::Context::default());
         let (a, b) = (Path::new("/tmp/a"), Path::new("/tmp/b"));
@@ -1434,5 +1734,66 @@ mod tests {
         assert_eq!(local_branch_name("origin/feature/x"), "feature/x");
         assert_eq!(local_branch_name("origin/main"), "main");
         assert_eq!(local_branch_name("main"), "main");
+    }
+
+    #[test]
+    fn discard_asks_first_and_keeps_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let proj = repo(0);
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap();
+        let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        std::fs::write(d.join("f.txt"), "a\nB\nc\n").unwrap();
+        g(&["add", "f.txt"]);
+        std::fs::write(d.join("f.txt"), "a\nB\nc\nd\n").unwrap();
+        std::fs::write(d.join("added.txt"), "x\n").unwrap();
+        g(&["add", "added.txt"]);
+        std::fs::write(d.join("added.txt"), "x\ny\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n\n").unwrap();
+
+        let mut app = test_app(cfg(), &cfg_path);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+        let file = |app: &SpinneyApp, path: &str| {
+            let st = &app.tabs[0].status;
+            st.unstaged.iter().find(|f| f.path == path).unwrap().clone()
+        };
+        let question = |app: &SpinneyApp| {
+            let (_, what) = app.confirm_discard.as_ref()?;
+            changes::discard_question(what, &app.tabs[0].status, &app.tabs[0].center)
+        };
+
+        // One unstaged line of a file that also has a staged change.
+        app.apply(Action::OpenDiff(file(&app, "f.txt"), false));
+        let Center::Diff(w) = &app.tabs[0].center else {
+            panic!("diff open: {:?}", app.errors);
+        };
+        let ask = diff_view::ask_discard(&w.fd, &diff_view::hunk_lines(&w.fd, 0)).unwrap();
+        app.apply(ask);
+        assert_eq!(question(&app).as_deref(), Some("Discard 1 line in f.txt?"));
+        assert_eq!(read("f.txt"), "a\nB\nc\nd\n", "nothing until confirmed");
+        app.apply(Action::ConfirmDiscard);
+        assert!(app.confirm_discard.is_none() && app.errors.is_empty());
+        assert_eq!(read("f.txt"), "a\nB\nc\n");
+        assert_eq!(g(&["show", ":f.txt"]), "a\nB\nc\n", "index untouched");
+
+        // New in the index: refused, even past the disabled menu item.
+        app.apply(Action::AskDiscard(Discard::File(file(&app, "added.txt"))));
+        app.apply(Action::ConfirmDiscard);
+        assert!(app.errors.iter().any(|e| e.contains("Unstage it first")));
+        assert_eq!(read("added.txt"), "x\ny\n");
+
+        let untracked = Discard::File(file(&app, "new.txt"));
+        app.apply(Action::AskDiscard(untracked.clone()));
+        assert_eq!(question(&app).as_deref(), Some("Delete untracked new.txt?"));
+        app.apply(Action::CancelDiscard);
+        assert!(d.join("new.txt").exists(), "cancelled");
+        app.apply(Action::AskDiscard(untracked));
+        app.apply(Action::ConfirmDiscard);
+        assert!(!d.join("new.txt").exists());
     }
 }

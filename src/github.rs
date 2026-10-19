@@ -122,7 +122,8 @@ pub fn filter<'a>(repos: &'a [Repo], query: &str) -> Vec<&'a Repo> {
 /// Spinney's OAuth App (public; the device flow needs no client secret).
 pub const GITHUB_CLIENT_ID: &str = "Ov23liCPm15HJJ4KHBlA";
 /// `write:public_key` lets sign-in add the space's SSH key to the account.
-const DEVICE_SCOPE: &str = "repo read:org write:public_key";
+/// `workflow` lets pushes change `.github/workflows/` files.
+const DEVICE_SCOPE: &str = "repo read:org write:public_key workflow";
 /// The device flow only ever talks to github.com.
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -237,8 +238,9 @@ fn post_form<T: serde::de::DeserializeOwned>(url: &str, form: &[(&str, &str)]) -
     }
 }
 
-/// Classic-token scopes Spinney asks for: repos, org membership (org repos), adding SSH keys.
-pub const TOKEN_SCOPES: &str = "repo,read:org,write:public_key";
+/// Classic-token scopes Spinney asks for: repos, org membership (org repos), adding SSH keys,
+/// pushing workflow files.
+pub const TOKEN_SCOPES: &str = "repo,read:org,write:public_key,workflow";
 
 /// The "new personal access token" page on `host`, with Spinney's description and scopes
 /// filled in. `None` unless `host` is a bare host name (it ends up in a URL the browser opens).
@@ -305,6 +307,39 @@ pub fn add_ssh_key(api_base: &str, token: &str, title: &str, key: &str) -> Resul
     }
 }
 
+/// Whether `token` lacks the `workflow` scope, so GitHub refuses pushes that change
+/// `.github/workflows/`. `false` when unknown: fine-grained tokens report no scopes.
+pub fn lacks_workflow_scope(api_base: &str, token: &str) -> Result<bool> {
+    if token.starts_with("github_pat_") {
+        return Ok(false); // fine-grained: permissions, not scopes
+    }
+    let resp = match agent()
+        .get(format!("{api_base}/user"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "spinney")
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(code)) => bail!("GitHub answered HTTP {code}"),
+        Err(e) => bail!("Could not reach GitHub: {e}"),
+    };
+    let scopes = resp
+        .headers()
+        .get("x-oauth-scopes")
+        .and_then(|v| v.to_str().ok());
+    Ok(scopes_lack_workflow(scopes))
+}
+
+/// An `X-OAuth-Scopes` value (`repo, read:org`) without `workflow`; absent or blank → `false`.
+pub fn scopes_lack_workflow(header: Option<&str>) -> bool {
+    match header.map(str::trim) {
+        None | Some("") => false,
+        Some(h) => !h.split(',').any(|s| s.trim() == "workflow"),
+    }
+}
+
 pub fn key_upload_outcome(status: u16) -> Result<KeyUpload> {
     match status {
         200..=299 => Ok(KeyUpload::Added),
@@ -368,10 +403,23 @@ mod tests {
     }
 
     #[test]
+    fn workflow_scope_from_header() {
+        assert!(scopes_lack_workflow(Some(
+            "repo, read:org, write:public_key"
+        )));
+        assert!(scopes_lack_workflow(Some("repo,read:org")));
+        assert!(!scopes_lack_workflow(Some("repo, workflow")));
+        assert!(!scopes_lack_workflow(Some("workflow")));
+        // Unknown (fine-grained tokens, no header) is not reported as missing.
+        assert!(!scopes_lack_workflow(None));
+        assert!(!scopes_lack_workflow(Some("  ")));
+    }
+
+    #[test]
     fn token_page_only_for_bare_hosts() {
         assert_eq!(
             new_token_url("github.mit.edu").as_deref(),
-            Some("https://github.mit.edu/settings/tokens/new?description=Spinney&scopes=repo,read:org,write:public_key")
+            Some("https://github.mit.edu/settings/tokens/new?description=Spinney&scopes=repo,read:org,write:public_key,workflow")
         );
         assert!(new_token_url("ghe.example.com:8443").is_some());
         for bad in [

@@ -1,4 +1,5 @@
-//! Modal dialogs: clone, create, new worktree, confirm worktree removal, convert.
+//! Modal dialogs: clone, create, new worktree, confirm worktree removal and branch deletion,
+//! convert.
 
 use super::{
     actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
@@ -219,6 +220,16 @@ pub(super) struct NewWorktreeDialog {
     pub(super) worktree: bool,
 }
 
+/// Confirm deleting a local branch; asked again with `not_merged` when `-d` refuses.
+pub(super) struct DeleteBranchDialog {
+    pub(super) branch: String,
+    /// `origin/<branch>`, when it exists.
+    pub(super) remote: Option<String>,
+    /// Also delete `remote` once the local branch is gone.
+    pub(super) also_remote: bool,
+    pub(super) not_merged: bool,
+}
+
 #[derive(Default)]
 pub(super) struct Dialogs {
     pub(super) space: Option<spaces::SpaceEdit>,
@@ -227,6 +238,9 @@ pub(super) struct Dialogs {
     pub(super) new_worktree: Option<NewWorktreeDialog>,
     /// Dirty worktree awaiting a forced-removal confirmation.
     pub(super) confirm_remove: Option<PathBuf>,
+    pub(super) delete_branch: Option<DeleteBranchDialog>,
+    /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
+    pub(super) delete_remote: Option<String>,
     pub(super) confirm_drop_stash: Option<DropStash>,
     pub(super) convert: Option<ConvertDialog>,
 }
@@ -255,7 +269,15 @@ impl Dialogs {
             || self.confirm_remove.is_some()
             || self.confirm_drop_stash.is_some()
             || self.convert.is_some()
+            || self.delete_branch.is_some()
+            || self.delete_remote.is_some()
     }
+}
+
+/// Red, bold button for a destructive confirmation.
+fn danger(label: &str) -> egui::Button<'_> {
+    egui::Button::new(egui::RichText::new(label).color(theme::ON_ACCENT).strong())
+        .fill(theme::DELETED)
 }
 
 impl SpinneyApp {
@@ -320,13 +342,7 @@ impl SpinneyApp {
                     path.display()
                 ));
                 ui.horizontal(|ui| {
-                    let remove = egui::Button::new(
-                        egui::RichText::new("Remove")
-                            .color(theme::ON_ACCENT)
-                            .strong(),
-                    )
-                    .fill(theme::DELETED);
-                    if ui.add(remove).clicked() {
+                    if ui.add(danger("Remove")).clicked() {
                         result = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -386,6 +402,59 @@ impl SpinneyApp {
                 _ => {}
             }
         }
+        if let Some(mut d) = self.dialogs.delete_branch.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("delete_branch")).show(ctx, |ui| {
+                if d.not_merged {
+                    ui.label(format!(
+                        "{} is not fully merged. Delete it anyway?",
+                        d.branch
+                    ));
+                } else {
+                    ui.label(format!("Delete branch {}?", d.branch));
+                }
+                if let Some(remote) = &d.remote {
+                    ui.checkbox(&mut d.also_remote, format!("Also delete {remote}"));
+                }
+                ui.horizontal(|ui| {
+                    let label = if d.not_merged {
+                        "Delete anyway"
+                    } else {
+                        "Delete"
+                    };
+                    if ui.add(danger(label)).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.delete_branch(d),
+                Some(false) => {}
+                None => self.dialogs.delete_branch = Some(d),
+            }
+        }
+        if let Some(name) = self.dialogs.delete_remote.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("delete_remote")).show(ctx, |ui| {
+                ui.label(format!("Delete {name} on the remote?"));
+                ui.horizontal(|ui| {
+                    if ui.add(danger("Delete")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.delete_remote(name),
+                Some(false) => {}
+                None => self.dialogs.delete_remote = Some(name),
+            }
+        }
     }
 
     /// Close the project's tab (so nothing runs git in it while files move) and convert on
@@ -411,7 +480,7 @@ impl SpinneyApp {
     }
 
     /// Reopen the project after a conversion (converted, or rolled back on failure).
-    pub(super) fn convert_done(&mut self, root: PathBuf, result: Result<(), String>) {
+    pub(super) fn convert_done(&mut self, root: PathBuf, result: anyhow::Result<()>) {
         let target = self
             .converting
             .iter()
@@ -425,7 +494,7 @@ impl SpinneyApp {
                 }
                 self.notices.push(notice);
             }
-            Err(e) => self.errors.push(format!("Convert failed: {e}")),
+            Err(e) => self.errors.push(format!("Convert failed: {e:#}")),
         }
         let Some(space) = self.space() else { return };
         if !visible_projects(&self.config).contains(&root) {
@@ -444,6 +513,41 @@ impl SpinneyApp {
         if !self.jobs.running(JobKind::CommitGraph, &root) {
             self.jobs.commit_graph(root.clone(), root.join(".bare"));
         }
+    }
+
+    /// `-d` (or `-D` once confirmed unmerged); then the remote branch as a background job.
+    fn delete_branch(&mut self, mut d: DeleteBranchDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        match actions::delete_branch(&tab.active_worktree, &d.branch, d.not_merged) {
+            Ok(actions::DeleteOutcome::Deleted) => {
+                tab.refresh(&ctx, &mut errors);
+                if let Some(remote) = d.remote.filter(|_| d.also_remote) {
+                    self.delete_remote(remote);
+                }
+            }
+            Ok(actions::DeleteOutcome::NotMerged) => {
+                d.not_merged = true;
+                self.dialogs.delete_branch = Some(d);
+            }
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        self.errors.extend(errors);
+    }
+
+    /// `git push <remote> --delete` on a worker, like a push.
+    fn delete_remote(&mut self, name: String) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+        self.jobs
+            .spawn(JobKind::DeleteRemote, root, String::new(), move || {
+                actions::delete_remote_branch(&wt, &name)
+            });
     }
 
     /// Open `root` as a tab (or focus its tab) and add it to the active space.
@@ -1051,6 +1155,17 @@ mod tests {
             root: PathBuf::from("/tmp/r"),
             plan: Err("no".into()),
         });
+        assert!(d.any_open());
+        d.convert = None;
+        d.delete_branch = Some(DeleteBranchDialog {
+            branch: "topic".into(),
+            remote: None,
+            also_remote: false,
+            not_merged: false,
+        });
+        assert!(d.any_open());
+        d.delete_branch = None;
+        d.delete_remote = Some("origin/topic".into());
         assert!(d.any_open());
     }
 

@@ -12,22 +12,48 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: macos-14
     timeout-minutes: 45
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      ASSET: Spinney-macos-arm64.zip
     steps:
       # Validate before the value reaches checkout or any command.
       - name: Refuse anything that isn't a version tag
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+      - name: Tag is on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main || { echo "$TAG is not on main"; exit 1; }
+      - name: Tag matches the Cargo.toml version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          [ "$version" = "${TAG#v}" ] || { echo "Cargo.toml is $version but the tag is $TAG"; exit 1; }
+      # Before the fixture identity is set, or the script flags that email in this file.
+      - run: bash scripts/leak-check.sh
       - run: rustup update stable && rustup component add clippy rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Builds on the declared rust-version
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          rustup toolchain install "$msrv" --profile minimal
+          cargo +"$msrv" check --locked --all-targets
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: No known vulnerabilities in dependencies
+        run: cargo audit
       - name: Git identity for test fixtures
         run: |
           git config --global user.name "CI"
@@ -35,14 +61,27 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - run: bash scripts/leak-check.sh
       - run: bash scripts/bundle.sh "${TAG#v}"
+      - name: Installer installs the bundle
+        run: |
+          plutil -lint dist/Spinney.app/Contents/Info.plist
+          apps="$RUNNER_TEMP/apps" && mkdir -p "$apps"
+          out=$(SPINNEY_ZIP="dist/$ASSET" SPINNEY_APP_DIR="$apps" bash install.sh </dev/null)
+          echo "$out"
+          [ "$out" = "Installed Spinney ${TAG#v} to $apps/Spinney.app" ] || { echo "unexpected install result"; exit 1; }
+          lipo -archs "$apps/Spinney.app/Contents/MacOS/spinney" | grep -qw arm64
+      - name: Checksum
+        run: cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256" && cat "$ASSET.sha256"
+      # A prerelease (v1.2.0-rc.1) is never "latest", which install.sh downloads.
       - name: Publish release
         run: |
+          files=("dist/$ASSET" "dist/$ASSET.sha256")
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/Spinney-macos-arm64.zip --clobber
+            gh release upload "$TAG" "${files[@]}" --clobber
           else
-            gh release create "$TAG" dist/Spinney-macos-arm64.zip --generate-notes --verify-tag
+            pre=()
+            [[ "$TAG" == *-* ]] && pre=(--prerelease)
+            gh release create "$TAG" "${files[@]}" --generate-notes --verify-tag "${pre[@]}"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
