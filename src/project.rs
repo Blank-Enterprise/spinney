@@ -101,6 +101,43 @@ fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<(
     creds::configure_repo(&bare, space)
 }
 
+/// Check `branch` with `git check-ref-format --branch`.
+pub fn check_branch_name(branch: &str) -> Result<()> {
+    // Outside any repo, so `@{-1}`-style shorthands cannot resolve to a real branch.
+    git::run(
+        &std::env::temp_dir(),
+        &["check-ref-format", "--branch", branch],
+    )
+    .map(|_| ())
+}
+
+/// New empty project at `<parent>/<name>`: `.bare` plus an orphan worktree for `branch`.
+/// No remote and no commit.
+pub fn create_new(parent: &Path, name: &str, branch: &str, space: &Space) -> Result<PathBuf> {
+    let root = parent.join(name);
+    if root.exists() {
+        bail!("{} already exists", root.display());
+    }
+    let result = create_steps(parent, &root, branch, space);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&root); // we created it, so clean it up
+    }
+    result.map(|()| root)
+}
+
+fn create_steps(parent: &Path, root: &Path, branch: &str, space: &Space) -> Result<()> {
+    let bare = root.join(".bare");
+    let bare_str = bare.to_str().context("non-UTF-8 path")?;
+    git::run(parent, &["init", "-q", "--bare", "-b", branch, bare_str])?;
+    std::fs::write(root.join(".git"), "gitdir: ./.bare\n")?;
+    let dir = format!("./{}", worktree_dir_name(branch));
+    git::run(
+        root,
+        &["worktree", "add", "-q", "--orphan", "-b", branch, &dir],
+    )?;
+    creds::configure_repo(&bare, space)
+}
+
 pub fn list_worktrees(root: &Path) -> Result<Vec<Worktree>> {
     let out = git::run(root, &["worktree", "list", "--porcelain"])?;
     Ok(out
@@ -310,5 +347,67 @@ mod tests {
         assert!(p.exists());
         remove_worktree(&root, &p, true).unwrap();
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn create_new_makes_empty_worktree_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = create_new(tmp.path(), "fresh", "feature/x", &space()).unwrap();
+        assert_eq!(root, tmp.path().join("fresh"));
+        assert!(root.join(".bare").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git")).unwrap(),
+            "gitdir: ./.bare\n"
+        );
+        let wt = root.join("feature-x");
+        assert!(wt.is_dir());
+        let head = git::run(&wt, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(head.trim(), "feature/x");
+        assert_eq!(detect(&root).unwrap(), Layout::WorktreeRoot);
+        let st = crate::status::status(&wt).unwrap();
+        assert_eq!(st, crate::status::Status::default());
+        let email = git::run(&wt, &["config", "user.email"]).unwrap();
+        assert_eq!(email.trim(), space().author_email);
+        assert!(
+            git::run(&root, &["remote"]).unwrap().is_empty(),
+            "no remote"
+        );
+        // What opening the tab runs next must cope with an unborn branch.
+        git::run(
+            &root.join(".bare"),
+            &["commit-graph", "write", "--reachable"],
+        )
+        .unwrap();
+        let mut log = crate::graph::LogStream::open(&wt).unwrap();
+        assert!(log.next_page(10).unwrap().is_empty());
+        crate::refs::branches(&wt).unwrap();
+    }
+
+    #[test]
+    fn create_new_refuses_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("fresh")).unwrap();
+        std::fs::write(tmp.path().join("fresh/keep.txt"), "keep").unwrap();
+        assert!(create_new(tmp.path(), "fresh", "main", &space()).is_err());
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("fresh")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn create_new_bad_branch_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(create_new(tmp.path(), "fresh", "a..b", &space()).is_err());
+        assert!(!tmp.path().join("fresh").exists());
+    }
+
+    #[test]
+    fn branch_names_checked_by_git() {
+        assert!(check_branch_name("main").is_ok());
+        assert!(check_branch_name("feature/x").is_ok());
+        for bad in ["", "a..b", "-x", "a b", "x.lock"] {
+            assert!(check_branch_name(bad).is_err(), "{bad:?}");
+        }
     }
 }
