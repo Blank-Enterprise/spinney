@@ -262,7 +262,8 @@ fn branch_menu(r: &egui::Response, layout: Layout, name: &str, actions: &mut Vec
                 egui::Button::new("New worktree from here"),
             )
             .on_disabled_hover_text(
-                "Converting normal clones to the worktree layout comes in a later version",
+                "This project is a normal clone: right-click its tab and choose Convert to \
+                 worktree layout",
             );
         if r.clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));

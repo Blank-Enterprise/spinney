@@ -317,6 +317,8 @@ enum JobKind {
     Pull,
     Push,
     CommitGraph,
+    /// Normal clone to worktree layout; the project's tab is closed while it runs.
+    Convert,
 }
 
 struct JobDone {
@@ -396,6 +398,11 @@ impl Jobs {
         self.active.iter().any(|(k, r)| *k == kind && r == root)
     }
 
+    /// Any job is in flight for `root`.
+    fn busy(&self, root: &Path) -> bool {
+        self.active.iter().any(|(_, r)| r == root)
+    }
+
     /// A fetch, pull or push is in flight for `root`.
     fn network_busy(&self, root: &Path) -> bool {
         [JobKind::Fetch, JobKind::Pull, JobKind::Push]
@@ -440,6 +447,10 @@ pub enum Action {
     NewBranch(String),
     /// Open Terminal.app at the active worktree.
     OpenTerminal,
+    /// Show the convert-to-worktree-layout confirm screen for a project.
+    RequestConvert(PathBuf),
+    /// "Not now" on the convert banner: hide it for that project for good.
+    DismissConvert(PathBuf),
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
     SelectCommit(usize),
@@ -480,6 +491,8 @@ pub struct SpinneyApp {
     focused: bool,
     /// Root of the tab whose "Discard all" is awaiting confirmation in the top bar.
     confirm_discard: Option<PathBuf>,
+    /// Conversions in flight: (project root, worktree to activate afterwards).
+    converting: Vec<(PathBuf, PathBuf)>,
 }
 
 impl SpinneyApp {
@@ -508,6 +521,7 @@ impl SpinneyApp {
             ctx,
             focused: true,
             confirm_discard: None,
+            converting: vec![],
         };
         app.open_visible_tabs();
         app
@@ -535,6 +549,14 @@ impl SpinneyApp {
     }
 
     fn open_tab(&mut self, root: &Path, space: &Space) {
+        if self.jobs.running(JobKind::Convert, root) {
+            // Its files are moving; git must not run on it until the job is done.
+            self.notices.push(format!(
+                "{} is being converted; it reopens when done",
+                root.display()
+            ));
+            return;
+        }
         match ProjectTab::open(root, space, &self.ctx, &mut self.jobs, &mut self.errors) {
             Ok(tab) => {
                 self.tabs.push(tab);
@@ -567,6 +589,9 @@ impl SpinneyApp {
             space_id,
             result,
         } = done;
+        if kind == JobKind::Convert {
+            return self.convert_done(root, result);
+        }
         if let Err(e) = result {
             self.errors.push(format!("{kind:?} failed: {e}"));
             return;
@@ -595,7 +620,7 @@ impl SpinneyApp {
                 }
                 self.errors.extend(errors);
             }
-            JobKind::CommitGraph => {}
+            JobKind::CommitGraph | JobKind::Convert => {}
         }
     }
 
@@ -739,6 +764,16 @@ impl SpinneyApp {
                     }
                 }
             }
+            Action::RequestConvert(root) => {
+                let plan = crate::convert::plan(&root).map_err(|e| format!("{e:#}"));
+                self.dialogs.convert = Some(dialogs::ConvertDialog { root, plan });
+            }
+            Action::DismissConvert(root) => {
+                if !self.config.convert_dismissed.contains(&root) {
+                    self.config.convert_dismissed.push(root);
+                    self.save_config();
+                }
+            }
             Action::Checkout(name) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     checkout(tab, &name, &mut errors);
@@ -819,6 +854,11 @@ impl SpinneyApp {
         if edit.id.is_none() {
             self.open_visible_tabs(); // the new space is now active
         }
+    }
+
+    /// Whether to show the "normal clone" banner for `tab`.
+    fn offer_convert(&self, tab: &ProjectTab) -> bool {
+        tab.layout == Layout::NormalClone && !self.config.convert_dismissed.contains(&tab.root)
     }
 
     /// Whether the centre shows the New Tab page instead of the active project.
@@ -970,6 +1010,24 @@ impl eframe::App for SpinneyApp {
                     let running = |k| jobs.running(k, &tab.root);
                     toolbar::toolbar(ui, tab, projects, busy, running, &mut actions)
                 });
+                if self.offer_convert(tab) {
+                    let root = tab.root.clone();
+                    egui::Panel::top("convert_offer").frame(bar).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("This project uses a normal clone");
+                            ui.label(theme::caption(
+                                "Convert it to the worktree layout to work on several \
+                                 branches side by side.",
+                            ));
+                            if ui.add(theme::primary("Convert…")).clicked() {
+                                actions.push(Action::RequestConvert(root.clone()));
+                            }
+                            if ui.button("Not now").clicked() {
+                                actions.push(Action::DismissConvert(root));
+                            }
+                        });
+                    });
+                }
             }
         }
         if let Some(n) = self.discard_tab().map(|t| t.status.unstaged.len()) {
@@ -1130,6 +1188,7 @@ mod tests {
             ],
             active_space: Some("a".into()),
             diff_inline: false,
+            convert_dismissed: vec![],
         }
     }
 
@@ -1273,6 +1332,7 @@ mod tests {
             ctx,
             focused: true,
             confirm_discard: None,
+            converting: vec![],
         }
     }
 

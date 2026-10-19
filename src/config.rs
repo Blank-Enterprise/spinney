@@ -24,6 +24,8 @@ pub struct Config {
     pub spaces: Vec<Space>,
     pub active_space: Option<String>,
     pub diff_inline: bool,
+    /// Normal clones whose "convert to the worktree layout" banner was dismissed.
+    pub convert_dismissed: Vec<PathBuf>,
 }
 
 impl Space {
@@ -101,6 +103,7 @@ mod tests {
             }],
             active_space: Some("work-abc123".into()),
             diff_inline: true,
+            convert_dismissed: vec![PathBuf::from("/tmp/code/p")],
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), cfg);
