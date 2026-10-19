@@ -3,6 +3,11 @@ name: release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release (e.g. v1.0.0)
+        required: true
 
 permissions:
   contents: write
@@ -10,12 +15,34 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      # Validate before the value reaches checkout or any command.
+      - name: Refuse anything that isn't a version tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
       - uses: actions/checkout@v4
-      - run: rustup update stable
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - run: rustup update stable && rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Git identity for test fixtures
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: bash scripts/leak-check.sh
-      - run: bash scripts/bundle.sh "${GITHUB_REF_NAME#v}"
-      - run: gh release create "$GITHUB_REF_NAME" dist/Spinney-macos-arm64.zip --generate-notes
+      - run: bash scripts/bundle.sh "${TAG#v}"
+      - name: Publish release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/Spinney-macos-arm64.zip --clobber
+          else
+            gh release create "$TAG" dist/Spinney-macos-arm64.zip --generate-notes --verify-tag
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
