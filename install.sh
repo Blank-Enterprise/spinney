@@ -1,31 +1,49 @@
 #!/usr/bin/env bash
-# Install the latest Spinney release into /Applications.
+# Install the latest Spinney release (or SPINNEY_VERSION, e.g. v1.1.0) into /Applications.
+#   curl -fsSL https://raw.githubusercontent.com/SameetKeshav/spinney/main/install.sh | bash
 set -euo pipefail
 
 main() {
   local REPO="${SPINNEY_REPO:-SameetKeshav/spinney}"
   local APP_DIR="${SPINNEY_APP_DIR:-/Applications}"
+  local VERSION="${SPINNEY_VERSION:-}"
   local ASSET="Spinney-macos-arm64.zip"
-  local dest version
+  local dest version base
 
   if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
     echo "Spinney supports macOS on Apple Silicon only." >&2
     return 1
   fi
+  if [ -n "$VERSION" ] && [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+    echo "SPINNEY_VERSION must be a release tag like v1.1.0." >&2
+    return 1
+  fi
+  if [ -n "$VERSION" ]; then
+    base="https://github.com/$REPO/releases/download/$VERSION"
+  else
+    base="https://github.com/$REPO/releases/latest/download"
+  fi
 
   tmp="$(mktemp -d)" # global: the EXIT trap runs after main returns
   trap 'rm -rf "$tmp"' EXIT
 
+  # The zip and its checksum; gh first (works while the repo is private), then plain curl.
   if [ -n "${SPINNEY_ZIP:-}" ]; then
     cp "$SPINNEY_ZIP" "$tmp/$ASSET"
   elif command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1 \
-    && gh release download --repo "$REPO" --pattern "$ASSET" --dir "$tmp" </dev/null; then
+    && gh release download ${VERSION:+"$VERSION"} --repo "$REPO" --dir "$tmp" \
+      --pattern "$ASSET" --pattern "$ASSET.sha256" </dev/null; then
     :
-  elif curl -fsSL -o "$tmp/$ASSET" "https://github.com/$REPO/releases/latest/download/$ASSET"; then
+  elif curl -fsSL -o "$tmp/$ASSET" "$base/$ASSET" \
+    && curl -fsSL -o "$tmp/$ASSET.sha256" "$base/$ASSET.sha256"; then
     :
   else
-    echo "Could not download $ASSET from $REPO." >&2
+    echo "Could not download ${VERSION:-the latest} $ASSET from $REPO." >&2
     echo "If the repo is private, install the GitHub CLI and run 'gh auth login'." >&2
+    return 1
+  fi
+  if [ -z "${SPINNEY_ZIP:-}" ] && ! (cd "$tmp" && shasum -a 256 -c -s "$ASSET.sha256"); then
+    echo "$ASSET does not match its published checksum; not installing." >&2
     return 1
   fi
 
