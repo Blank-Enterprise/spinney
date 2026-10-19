@@ -1,5 +1,6 @@
 mod actions;
 mod config;
+mod convert;
 mod creds;
 mod diff;
 mod git;
