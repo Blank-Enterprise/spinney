@@ -2,6 +2,7 @@
 
 use crate::git;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, ChildStdout};
@@ -39,27 +40,48 @@ pub fn parse_record(rec: &str) -> Option<Commit> {
 pub struct Row {
     /// Slot of the commit dot; its first-parent line continues in the same slot of `lanes_out`.
     pub lane: usize,
-    pub lanes_in: Vec<Option<String>>,
-    pub lanes_out: Vec<Option<String>>,
+    /// Compact id of `commit.sha`; lane slots hold the id of the commit they lead to.
+    pub id: u32,
+    /// Ids of `commit.parents`, in order.
+    pub parent_ids: Vec<u32>,
+    pub lanes_in: Vec<Option<u32>>,
+    pub lanes_out: Vec<Option<u32>>,
     pub commit: Commit,
 }
 
+/// Lane state across rows. Shas are interned to `u32` ids so each row's lane snapshots stay
+/// small; an id leaves the map once its commit is pushed (topo order shows children first).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Lanes {
-    active: Vec<Option<String>>,
+    active: Vec<Option<u32>>,
+    ids: HashMap<String, u32>,
+    next: u32,
 }
 
-fn first_free(active: &mut Vec<Option<String>>, sha: String) {
+fn first_free(active: &mut Vec<Option<u32>>, id: u32) {
     match active.iter().position(Option::is_none) {
-        Some(i) => active[i] = Some(sha),
-        None => active.push(Some(sha)),
+        Some(i) => active[i] = Some(id),
+        None => active.push(Some(id)),
     }
 }
 
 impl Lanes {
+    fn intern(&mut self, sha: &str) -> u32 {
+        if let Some(&id) = self.ids.get(sha) {
+            return id;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.ids.insert(sha.to_string(), id);
+        id
+    }
+
     pub fn push(&mut self, c: Commit) -> Row {
+        let id = self.intern(&c.sha);
+        self.ids.remove(&c.sha);
+        let parent_ids: Vec<u32> = c.parents.iter().map(|p| self.intern(p)).collect();
         let lanes_in = self.active.clone();
-        let want = Some(c.sha.clone());
+        let want = Some(id);
         let lane = match self.active.iter().position(|l| *l == want) {
             Some(i) => i,
             None => match self.active.iter().position(Option::is_none) {
@@ -75,10 +97,10 @@ impl Lanes {
                 *slot = None; // branch lines merging into this commit
             }
         }
-        self.active[lane] = c.parents.first().cloned();
-        for p in c.parents.iter().skip(1) {
-            if !self.active.contains(&Some(p.clone())) {
-                first_free(&mut self.active, p.clone());
+        self.active[lane] = parent_ids.first().copied();
+        for &p in parent_ids.iter().skip(1) {
+            if !self.active.contains(&Some(p)) {
+                first_free(&mut self.active, p);
             }
         }
         while self.active.last().is_some_and(Option::is_none) {
@@ -86,6 +108,8 @@ impl Lanes {
         }
         Row {
             lane,
+            id,
+            parent_ids,
             lanes_in,
             lanes_out: self.active.clone(),
             commit: c,
@@ -164,10 +188,6 @@ mod tests {
         }
     }
 
-    fn some(s: &str) -> Option<String> {
-        Some(s.to_string())
-    }
-
     #[test]
     fn lanes_linear() {
         let mut l = Lanes::default();
@@ -186,13 +206,19 @@ mod tests {
         let m = l.push(commit("m", &["a", "f"]));
         let f = l.push(commit("f", &["a"]));
         let a = l.push(commit("a", &[]));
+        assert_eq!(m.parent_ids, vec![a.id, f.id]);
+        assert_eq!(f.parent_ids, vec![a.id]);
+        assert_ne!(a.id, f.id);
+        let (a_, f_) = (Some(a.id), Some(f.id));
         assert_eq!(m.lane, 0);
-        assert_eq!(m.lanes_out, vec![some("a"), some("f")]);
+        assert_eq!(m.lanes_out, vec![a_, f_]);
         assert_eq!(f.lane, 1);
-        assert_eq!(f.lanes_out, vec![some("a"), some("a")]);
+        assert_eq!(f.lanes_in, vec![a_, f_]);
+        assert_eq!(f.lanes_out, vec![a_, a_]);
         assert_eq!(a.lane, 0);
-        assert_eq!(a.lanes_in, vec![some("a"), some("a")]);
+        assert_eq!(a.lanes_in, vec![a_, a_]);
         assert!(a.lanes_out.is_empty());
+        assert!(l.ids.is_empty(), "pushed commits leave the intern map");
     }
 
     #[test]

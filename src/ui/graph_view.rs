@@ -75,10 +75,9 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, text_x: f32, now: i64) {
     let x = |lane: usize| rect.left() + LANE_W * lane as f32 + LANE_W / 2.0;
     let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
     let stroke = |lane: usize| Stroke::new(1.5, color(lane));
-    let sha = &row.commit.sha;
     for (i, slot) in row.lanes_in.iter().enumerate() {
-        let Some(s) = slot else { continue };
-        if s == sha {
+        let Some(s) = *slot else { continue };
+        if s == row.id {
             painter.line_segment(
                 [Pos2::new(x(i), top), Pos2::new(x(row.lane), mid)],
                 stroke(i),
@@ -87,7 +86,7 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, text_x: f32, now: i64) {
             painter.line_segment([Pos2::new(x(i), top), Pos2::new(x(j), bottom)], stroke(j));
         }
     }
-    for p in &row.commit.parents {
+    for &p in &row.parent_ids {
         if let Some(j) = find_lane(&row.lanes_out, p, row.lane) {
             painter.line_segment(
                 [Pos2::new(x(row.lane), mid), Pos2::new(x(j), bottom)],
@@ -139,12 +138,12 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, text_x: f32, now: i64) {
     );
 }
 
-/// Slot in `lanes` holding `sha`, preferring `prefer` when several do.
-fn find_lane(lanes: &[Option<String>], sha: &str, prefer: usize) -> Option<usize> {
-    if lanes.get(prefer).and_then(Option::as_deref) == Some(sha) {
+/// Slot in `lanes` holding commit `id`, preferring `prefer` when several do.
+fn find_lane(lanes: &[Option<u32>], id: u32, prefer: usize) -> Option<usize> {
+    if lanes.get(prefer) == Some(&Some(id)) {
         return Some(prefer);
     }
-    lanes.iter().position(|l| l.as_deref() == Some(sha))
+    lanes.iter().position(|&l| l == Some(id))
 }
 
 pub fn lane_color_index(lane: usize) -> usize {
