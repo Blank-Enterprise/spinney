@@ -1,8 +1,8 @@
 //! Centre-panel diff: side-by-side or inline, with line/hunk selection for staging.
 
-use super::{theme, Action, Center};
+use super::{theme, Action, Center, Discard};
 use crate::diff::{side_by_side, FileDiff, LineKind};
-use crate::stage::{build_patch, Direction};
+use crate::stage::{build_patch, discard_patch, Direction};
 use crate::status::{Change, FileStatus};
 use eframe::egui::{self, Align, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Vec2};
 use std::collections::HashSet;
@@ -65,6 +65,16 @@ pub fn hunk_lines(fd: &FileDiff, hi: usize) -> HashSet<(usize, usize)> {
         .map(|li| (hi, li))
         .filter(|&p| selectable(fd, p))
         .collect()
+}
+
+/// Ask to discard the `lines` of an unstaged `fd`; None when there is no patch to apply.
+pub fn ask_discard(fd: &FileDiff, lines: &HashSet<(usize, usize)>) -> Option<Action> {
+    let patch = discard_patch(fd, lines)?;
+    Some(Action::AskDiscard(Discard::Lines {
+        path: fd.path.clone(),
+        patch,
+        n: lines.len(),
+    }))
 }
 
 /// A working-copy diff of one side of a file: unstaged (index→worktree) or staged.
@@ -166,6 +176,9 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
                     actions.push(Action::ApplyPatch(p, *dir));
                 }
             }
+            if !*staged && ui.button(format!("Discard {n} {noun}")).clicked() {
+                actions.extend(ask_discard(fd, &sel.lines));
+            }
         }
     });
     ui.add_space(2.0);
@@ -202,7 +215,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
             let longest = rows[range.clone()]
                 .iter()
                 .map(|r| match *r {
-                    Row::Hunk(hi) => fd.hunks[hi].header.chars().count() + 16,
+                    Row::Hunk(hi) => fd.hunks[hi].header.chars().count() + 30,
                     Row::Line(hi, li) => text_len(hi, Some(li)),
                     Row::Pair(hi, l, r) => text_len(hi, l).max(text_len(hi, r)),
                 })
@@ -307,6 +320,14 @@ fn hunk_header(
             }
         }
         x = b.right() + 8.0;
+        if !staged {
+            let b = Rect::from_min_size(Pos2::new(x - 4.0, b.top()), b.size());
+            let button = egui::Button::new(RichText::new("Discard hunk").size(11.0)).small();
+            if ui.put(b, button).clicked() {
+                actions.extend(ask_discard(fd, &hunk_lines(fd, hi)));
+            }
+            x = b.right() + 8.0;
+        }
     }
     ui.painter().text(
         Pos2::new(x, rect.center().y),

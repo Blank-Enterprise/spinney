@@ -343,6 +343,21 @@ impl Jobs {
     }
 }
 
+/// What the red confirmation bar asks to throw away. Staged changes always stay.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Discard {
+    /// Every unstaged change.
+    All,
+    /// One unstaged file: back to the index, or deleted when untracked.
+    File(FileStatus),
+    /// `n` selected lines (or a hunk) of `path`'s unstaged diff, as a `stage::discard_patch`.
+    Lines {
+        path: String,
+        patch: String,
+        n: usize,
+    },
+}
+
 /// Deferred UI intents, applied after rendering so closures need not borrow `self`.
 pub enum Action {
     SwitchSpace(String),
@@ -385,9 +400,9 @@ pub enum Action {
     ApplyPatch(String, Direction),
     StageAll,
     UnstageAll,
-    /// Show the confirmation bar; `DiscardAll` (from that bar) does it, `CancelDiscard` hides it.
-    AskDiscardAll,
-    DiscardAll,
+    /// Show the confirmation bar; `ConfirmDiscard` (from that bar) does it, `CancelDiscard` hides it.
+    AskDiscard(Discard),
+    ConfirmDiscard,
     CancelDiscard,
     /// From the rejected-push bar: `AskForcePush` asks to confirm, `ForcePush` does it
     /// (with lease), `DismissPush` hides the bar.
@@ -420,8 +435,8 @@ pub struct SpinneyApp {
     ctx: egui::Context,
     /// Window focus last frame; status reloads when it is regained.
     focused: bool,
-    /// Root of the tab whose "Discard all" is awaiting confirmation in the top bar.
-    confirm_discard: Option<PathBuf>,
+    /// Root of the tab whose discard is awaiting confirmation in the top bar, and what it drops.
+    confirm_discard: Option<(PathBuf, Discard)>,
     /// Root of the tab whose amend of a pushed HEAD is awaiting confirmation.
     confirm_amend: Option<PathBuf>,
     /// The last push rejected as non-fast-forward, offering Pull or Force push… in the top bar.
@@ -668,14 +683,18 @@ impl SpinneyApp {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
             }
-            Action::AskDiscardAll => {
-                self.confirm_discard = self.tabs.get(self.active_tab).map(|t| t.root.clone())
+            Action::AskDiscard(what) => {
+                self.confirm_discard = self
+                    .tabs
+                    .get(self.active_tab)
+                    .map(|t| (t.root.clone(), what))
             }
             Action::CancelDiscard => self.confirm_discard = None,
-            Action::DiscardAll => {
+            Action::ConfirmDiscard => {
                 // Only for the tab that asked; the bar is hidden on other tabs anyway.
-                if let Some(tab) = self.asking_tab(self.confirm_discard.clone()) {
-                    tab.discard_all(&mut errors);
+                let what = self.confirm_discard.as_ref().map(|(_, w)| w.clone());
+                if let (Some(what), Some(tab)) = (what, self.discard_tab()) {
+                    tab.discard(&what, &mut errors);
                 }
                 self.confirm_discard = None;
             }
@@ -765,6 +784,7 @@ impl SpinneyApp {
                 }
             }
             Action::ActivateWorktree(path) => {
+                self.confirm_discard = None; // it was asked about the other worktree's files
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.active_worktree = path;
                     tab.refresh(&ctx, &mut errors);
@@ -845,6 +865,12 @@ impl SpinneyApp {
         self.new_tab || self.tabs.is_empty()
     }
 
+    /// The active tab, when it is the one with a pending discard.
+    fn discard_tab(&mut self) -> Option<&mut ProjectTab> {
+        let root = self.confirm_discard.as_ref().map(|(root, _)| root.clone());
+        self.asking_tab(root)
+    }
+
     /// The active tab, when it is `asking` (the root of a pending confirmation).
     fn asking_tab(&mut self, asking: Option<PathBuf>) -> Option<&mut ProjectTab> {
         let root = asking?;
@@ -884,16 +910,12 @@ impl SpinneyApp {
         });
     }
 
-    /// "Discard all N changes?" with Discard / Cancel.
-    fn discard_bar(ui: &mut egui::Ui, n: usize, actions: &mut Vec<Action>) {
+    /// The discard question (e.g. "Discard all N changes?") with Discard / Cancel.
+    fn discard_bar(ui: &mut egui::Ui, question: &str, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            let noun = if n == 1 { "change" } else { "changes" };
             ui.label(egui::RichText::new("🗑").color(theme::DELETED));
             ui.label(
-                egui::RichText::new(format!(
-                    "Discard all {n} unstaged {noun}? This can't be undone."
-                ))
-                .color(theme::TEXT),
+                egui::RichText::new(format!("{question} This can't be undone.")).color(theme::TEXT),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Cancel").clicked() {
@@ -907,7 +929,7 @@ impl SpinneyApp {
                 .fill(theme::DELETED)
                 .small();
                 if ui.add(discard).clicked() {
-                    actions.push(Action::DiscardAll);
+                    actions.push(Action::ConfirmDiscard);
                 }
             });
         });
@@ -1071,18 +1093,22 @@ impl eframe::App for SpinneyApp {
                 });
             }
         }
-        let discard = self.confirm_discard.clone();
-        if let Some(n) = self.asking_tab(discard).map(|t| t.status.unstaged.len()) {
-            if n == 0 {
-                self.confirm_discard = None; // nothing left to discard (e.g. cleaned outside)
-            } else {
+        let question = self.confirm_discard.clone().and_then(|(_, what)| {
+            let tab = self.discard_tab()?;
+            Some(changes::discard_question(&what, &tab.status, &tab.center))
+        });
+        match question {
+            // Nothing left to discard (e.g. cleaned outside, or the diff was closed).
+            Some(None) => self.confirm_discard = None,
+            Some(Some(q)) => {
                 let bar = egui::Frame::new()
                     .fill(theme::DIFF_DEL)
                     .inner_margin(Margin::symmetric(14, 6));
                 egui::Panel::top("discard_confirm")
                     .frame(bar)
-                    .show(ui, |ui| Self::discard_bar(ui, n, &mut actions));
+                    .show(ui, |ui| Self::discard_bar(ui, &q, &mut actions));
             }
+            None => {}
         }
         let amend = self.confirm_amend.clone();
         if let Some(on) = self.asking_tab(amend).map(|t| t.amend) {
@@ -1533,5 +1559,66 @@ mod tests {
         assert_eq!(local_branch_name("origin/feature/x"), "feature/x");
         assert_eq!(local_branch_name("origin/main"), "main");
         assert_eq!(local_branch_name("main"), "main");
+    }
+
+    #[test]
+    fn discard_asks_first_and_keeps_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let proj = repo(0);
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap();
+        let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        std::fs::write(d.join("f.txt"), "a\nB\nc\n").unwrap();
+        g(&["add", "f.txt"]);
+        std::fs::write(d.join("f.txt"), "a\nB\nc\nd\n").unwrap();
+        std::fs::write(d.join("added.txt"), "x\n").unwrap();
+        g(&["add", "added.txt"]);
+        std::fs::write(d.join("added.txt"), "x\ny\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n\n").unwrap();
+
+        let mut app = test_app(cfg(), &cfg_path);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+        let file = |app: &SpinneyApp, path: &str| {
+            let st = &app.tabs[0].status;
+            st.unstaged.iter().find(|f| f.path == path).unwrap().clone()
+        };
+        let question = |app: &SpinneyApp| {
+            let (_, what) = app.confirm_discard.as_ref()?;
+            changes::discard_question(what, &app.tabs[0].status, &app.tabs[0].center)
+        };
+
+        // One unstaged line of a file that also has a staged change.
+        app.apply(Action::OpenDiff(file(&app, "f.txt"), false));
+        let Center::Diff(w) = &app.tabs[0].center else {
+            panic!("diff open: {:?}", app.errors);
+        };
+        let ask = diff_view::ask_discard(&w.fd, &diff_view::hunk_lines(&w.fd, 0)).unwrap();
+        app.apply(ask);
+        assert_eq!(question(&app).as_deref(), Some("Discard 1 line in f.txt?"));
+        assert_eq!(read("f.txt"), "a\nB\nc\nd\n", "nothing until confirmed");
+        app.apply(Action::ConfirmDiscard);
+        assert!(app.confirm_discard.is_none() && app.errors.is_empty());
+        assert_eq!(read("f.txt"), "a\nB\nc\n");
+        assert_eq!(g(&["show", ":f.txt"]), "a\nB\nc\n", "index untouched");
+
+        // New in the index: refused, even past the disabled menu item.
+        app.apply(Action::AskDiscard(Discard::File(file(&app, "added.txt"))));
+        app.apply(Action::ConfirmDiscard);
+        assert!(app.errors.iter().any(|e| e.contains("Unstage it first")));
+        assert_eq!(read("added.txt"), "x\ny\n");
+
+        let untracked = Discard::File(file(&app, "new.txt"));
+        app.apply(Action::AskDiscard(untracked.clone()));
+        assert_eq!(question(&app).as_deref(), Some("Delete untracked new.txt?"));
+        app.apply(Action::CancelDiscard);
+        assert!(d.join("new.txt").exists(), "cancelled");
+        app.apply(Action::AskDiscard(untracked));
+        app.apply(Action::ConfirmDiscard);
+        assert!(!d.join("new.txt").exists());
     }
 }
