@@ -252,7 +252,7 @@ impl SpinneyApp {
             match clone_dialog(ctx, &mut d) {
                 Some(true) => self.start_clone(d),
                 Some(false) if d.edit_space => {
-                    self.dialogs.space = self.space().as_ref().map(spaces::SpaceEdit::from_space)
+                    self.dialogs.space = self.space().as_ref().map(spaces::SpaceEdit::open)
                 }
                 Some(false) => {}
                 None => self.dialogs.clone = Some(d),

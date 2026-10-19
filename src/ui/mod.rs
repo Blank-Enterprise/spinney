@@ -538,7 +538,7 @@ impl SpinneyApp {
             }
             Action::NewSpace => self.dialogs.space = Some(spaces::SpaceEdit::new_space()),
             Action::EditSpace => {
-                self.dialogs.space = self.space().as_ref().map(spaces::SpaceEdit::from_space)
+                self.dialogs.space = self.space().as_ref().map(spaces::SpaceEdit::open)
             }
             Action::SelectTab(i) => {
                 self.active_tab = i;

@@ -1,7 +1,5 @@
 //! GitHub: list the repositories a space's token can see; sign in with the OAuth device flow.
 
-#![allow(dead_code)] // the device flow is wired into the space editor in the next commit
-
 use anyhow::{bail, Result};
 use serde::{Deserialize, Deserializer};
 use std::time::Duration;
