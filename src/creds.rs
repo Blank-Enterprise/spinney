@@ -21,9 +21,12 @@ pub fn get_token(space_id: &str) -> Result<Option<String>> {
     }
 }
 
+/// Remove the space's token; already absent is fine.
 pub fn delete_token(space_id: &str) -> Result<()> {
-    keyring::Entry::new(SERVICE, space_id)?.delete_credential()?;
-    Ok(())
+    match keyring::Entry::new(SERVICE, space_id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Pure core of the `get` operation. Answers only for https requests to exactly the space's

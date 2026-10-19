@@ -672,9 +672,18 @@ impl SpinneyApp {
                 return;
             }
         };
-        if let Some(token) = edit.token() {
-            if let Err(e) = creds::set_token(&id, token) {
-                self.errors.push(format!("saving token: {e}"));
+        match edit.token_save() {
+            spaces::TokenSave::Keep => {}
+            spaces::TokenSave::Store(token) => {
+                if let Err(e) = creds::set_token(&id, token) {
+                    self.errors.push(format!("saving token: {e}"));
+                }
+            }
+            spaces::TokenSave::Delete => {
+                if let Err(e) = creds::delete_token(&id) {
+                    self.errors
+                        .push(format!("removing the old host's token: {e}"));
+                }
             }
         }
         self.save_config();

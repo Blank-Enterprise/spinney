@@ -104,7 +104,7 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
 }
 
 fn pat_field(ui: &mut egui::Ui, e: &mut SpaceEdit) {
-    let hint = if e.id.is_some() {
+    let hint = if e.id.is_some() && normalize_host(&e.host) == e.saved_host {
         "unchanged"
     } else {
         "required for private repos"
@@ -119,7 +119,7 @@ fn pat_field(ui: &mut egui::Ui, e: &mut SpaceEdit) {
 /// "GitHub account" section of a github.com space: device-flow sign-in, or a pasted PAT.
 fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
     ui.label(theme::section("GitHub account"));
-    let (mut next, mut sign_out) = (None, false);
+    let (mut next, mut sign_out, mut show_pat) = (None, false, false);
     match &mut e.auth {
         Auth::SignedOut | Auth::Failed(_) => {
             if let Auth::Failed(why) = &e.auth {
@@ -134,8 +134,7 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
                 next = Some(start(ui.ctx()));
             }
             ui.label(theme::caption("or paste a personal access token"));
-            pat_field(ui, e);
-            ui.label(theme::caption(SCOPE_HINT));
+            show_pat = true;
         }
         Auth::Starting(_) => {
             ui.horizontal(|ui| {
@@ -177,7 +176,11 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
                 });
             });
         }
-        Auth::SignedIn { held, confirm } => {
+        Auth::SignedIn {
+            held,
+            confirm,
+            replace,
+        } => {
             ui.label(egui::RichText::new("Signed in to GitHub ✓").color(theme::ADDED));
             if held.is_some() {
                 ui.label(theme::caption(
@@ -197,7 +200,19 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
             } else if ui.button("Sign out").clicked() {
                 *confirm = true;
             }
+            if *replace {
+                show_pat = true;
+            } else {
+                let link =
+                    egui::Button::new(theme::caption("Replace with a personal access token"))
+                        .frame(false);
+                *replace = ui.add(link).clicked();
+            }
         }
+    }
+    if show_pat {
+        pat_field(ui, e); // a non-blank value replaces any token on Save
+        ui.label(theme::caption(SCOPE_HINT));
     }
     if let Some(a) = next {
         e.auth = a; // dropping a Starting/Waiting state stops its thread
@@ -297,6 +312,8 @@ enum Auth {
     SignedIn {
         held: Option<String>,
         confirm: bool,
+        /// The PAT field is shown to replace the token.
+        replace: bool,
     },
 }
 
@@ -312,7 +329,23 @@ pub struct SpaceEdit {
     pub pat: String,
     /// Host of the space as saved (normalized); empty for a new space.
     saved_host: String,
+    /// A Keychain token existed when the editor opened.
+    stored: bool,
     auth: Auth,
+}
+
+/// What saving a space does with its Keychain token.
+#[derive(Debug, PartialEq)]
+pub enum TokenSave<'a> {
+    Keep,
+    /// The host changed and no new token came with it: the old one was issued for elsewhere.
+    Delete,
+    Store(&'a str),
+}
+
+/// A stored token counts as a GitHub sign-in only when the space was saved for github.com.
+fn keychain_signed_in(stored: bool, saved_host: &str) -> bool {
+    stored && saved_host == "github.com"
 }
 
 impl SpaceEdit {
@@ -344,14 +377,38 @@ impl SpaceEdit {
                 .unwrap_or_default(),
             pat: String::new(),
             saved_host: normalize_host(&s.host),
-            auth: if stored {
-                Auth::SignedIn {
-                    held: None,
-                    confirm: false,
-                }
-            } else {
-                Auth::SignedOut
-            },
+            stored,
+            auth: Auth::SignedOut,
+        }
+        .resting()
+    }
+
+    /// The sign-in state with no flow running: signed in only if the Keychain token was
+    /// issued for github.com.
+    fn resting(mut self) -> Self {
+        self.auth = self.resting_auth();
+        self
+    }
+
+    fn resting_auth(&self) -> Auth {
+        if keychain_signed_in(self.stored, &self.saved_host) {
+            Auth::SignedIn {
+                held: None,
+                confirm: false,
+                replace: false,
+            }
+        } else {
+            Auth::SignedOut
+        }
+    }
+
+    /// What `save_space` does with the Keychain token.
+    pub fn token_save(&self) -> TokenSave<'_> {
+        let rehosted = self.id.is_some() && normalize_host(&self.host) != self.saved_host;
+        match self.token() {
+            Some(t) => TokenSave::Store(t),
+            None if rehosted => TokenSave::Delete,
+            None => TokenSave::Keep,
         }
     }
 
@@ -360,12 +417,13 @@ impl SpaceEdit {
         normalize_host(&self.host) == "github.com"
     }
 
-    /// The token to save with the space: a held sign-in token (github.com only), else the
-    /// entered PAT trimmed (pasted tokens often carry a newline); `None` if blank.
+    /// The token to save with the space: the entered PAT trimmed (pasted tokens often carry
+    /// a newline), else a held sign-in token (github.com only); `None` if neither.
     pub fn token(&self) -> Option<&str> {
+        let pat = Some(self.pat.trim()).filter(|t| !t.is_empty());
         match &self.auth {
-            Auth::SignedIn { held: Some(t), .. } if self.github_com() => Some(t),
-            _ => Some(self.pat.trim()).filter(|t| !t.is_empty()),
+            Auth::SignedIn { held: Some(t), .. } if pat.is_none() && self.github_com() => Some(t),
+            _ => pat,
         }
     }
 
@@ -376,7 +434,7 @@ impl SpaceEdit {
             Auth::SignedOut | Auth::SignedIn { held: None, .. }
         );
         if !keep {
-            self.auth = Auth::SignedOut;
+            self.auth = self.resting_auth();
         }
     }
 
@@ -389,9 +447,11 @@ impl SpaceEdit {
             Some(id) if store_now => (None, Some((id.clone(), token))),
             _ => (Some(token), None),
         };
+        self.stored |= store.is_some();
         self.auth = Auth::SignedIn {
             held,
             confirm: false,
+            replace: false,
         };
         store
     }
@@ -400,6 +460,7 @@ impl SpaceEdit {
     fn sign_out(&mut self) -> Option<String> {
         let stored = matches!(self.auth, Auth::SignedIn { held: None, .. });
         self.auth = Auth::SignedOut;
+        self.stored &= !stored;
         stored.then(|| self.id.clone()).flatten()
     }
 
@@ -442,7 +503,10 @@ impl SpaceEdit {
                 Ok(Ok(Poll::Denied)) => {
                     self.auth = Auth::Failed("Sign-in was cancelled on GitHub".into())
                 }
-                Ok(Ok(_)) => self.auth = Auth::Failed("The code expired".into()),
+                Ok(Ok(Poll::Expired)) => self.auth = Auth::Failed("The code expired".into()),
+                Ok(Ok(Poll::Pending | Poll::SlowDown(_))) => {
+                    self.auth = Auth::Failed("Unexpected response from GitHub".into())
+                }
             },
             _ => {}
         }
@@ -725,5 +789,75 @@ mod tests {
         new.accept_token("tok".into());
         assert_eq!(new.sign_out(), None, "held token just dropped");
         assert_eq!(new.token(), None);
+    }
+
+    fn edited(saved_host: &str, stored: bool, host: &str) -> SpaceEdit {
+        let (mut cfg, _) = saved_github_space();
+        cfg.spaces[0].host = saved_host.into();
+        let mut e = SpaceEdit::from_space(&cfg.spaces[0], stored);
+        e.host = host.into();
+        e
+    }
+
+    #[test]
+    fn only_a_github_com_keychain_token_counts_as_signed_in() {
+        assert!(keychain_signed_in(true, "github.com"));
+        assert!(!keychain_signed_in(false, "github.com"));
+        assert!(!keychain_signed_in(true, "ghe.example.com"));
+        // An Enterprise PAT, host field now github.com: offer sign-in and the PAT field.
+        let mut e = edited("ghe.example.com", true, "github.com");
+        assert!(matches!(e.auth, Auth::SignedOut));
+        e.auth = Auth::Failed("x".into());
+        e.drop_flow();
+        assert!(
+            matches!(e.auth, Auth::SignedOut),
+            "recomputed, still not signed in"
+        );
+        let mut e = edited("github.com", true, "github.com");
+        assert!(matches!(e.auth, Auth::SignedIn { held: None, .. }));
+        e.auth = Auth::Failed("x".into());
+        e.drop_flow();
+        assert!(matches!(e.auth, Auth::SignedIn { held: None, .. }));
+    }
+
+    #[test]
+    fn saving_never_offers_a_token_to_another_host() {
+        assert_eq!(
+            edited("github.com", true, "github.com").token_save(),
+            TokenSave::Keep
+        );
+        let mut e = edited("github.com", true, " https://GitHub.com/ ");
+        assert_eq!(e.token_save(), TokenSave::Keep, "normalized host unchanged");
+        e.host = "ghe.example.com".into();
+        assert_eq!(e.token_save(), TokenSave::Delete);
+        e.pat = " pat\n".into();
+        assert_eq!(e.token_save(), TokenSave::Store("pat"));
+        let mut e = edited("ghe.example.com", true, "github.com");
+        assert_eq!(e.token_save(), TokenSave::Delete);
+        e.accept_token("tok".into());
+        assert_eq!(e.token_save(), TokenSave::Store("tok"));
+
+        let mut new = SpaceEdit::new_space();
+        assert_eq!(new.token_save(), TokenSave::Keep);
+        new.pat = "pat".into();
+        assert_eq!(new.token_save(), TokenSave::Store("pat"));
+    }
+
+    #[test]
+    fn a_pasted_pat_replaces_the_sign_in_token() {
+        let mut e = SpaceEdit::new_space();
+        e.accept_token("tok".into());
+        e.pat = "  ".into();
+        assert_eq!(e.token(), Some("tok"));
+        e.pat = "pat".into();
+        assert_eq!(e.token(), Some("pat"));
+        let mut e = edited("github.com", true, "github.com");
+        assert_eq!(
+            e.token_save(),
+            TokenSave::Keep,
+            "revealing the field keeps the token"
+        );
+        e.pat = "pat".into();
+        assert_eq!(e.token_save(), TokenSave::Store("pat"));
     }
 }
