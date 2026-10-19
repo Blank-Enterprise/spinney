@@ -182,6 +182,26 @@ pub fn unstage_files(worktree: &Path, paths: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Throw away unstaged work: `tracked` paths go back to their index content and `untracked`
+/// files are deleted. Staged changes stay; nothing happens for an empty slice.
+pub fn discard_files(worktree: &Path, tracked: &[&str], untracked: &[&str]) -> Result<()> {
+    // Restores from the index, so it also works before the first commit.
+    for (cmd, paths) in [
+        (["restore", "--worktree"], tracked),
+        (["clean", "-fq"], untracked),
+    ] {
+        if paths.is_empty() {
+            continue;
+        }
+        let mut args = vec!["--literal-pathspecs"];
+        args.extend_from_slice(&cmd);
+        args.push("--");
+        args.extend_from_slice(paths);
+        git::run(worktree, &args)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,6 +571,32 @@ mod tests {
         unstage_files(d, &["x.txt", "y.txt"]).unwrap();
         assert!(g(d, &["ls-files"]).is_empty(), "unborn HEAD");
         unstage_files(d, &[]).unwrap();
+    }
+
+    #[test]
+    fn discard_files_reverts_unstaged_and_keeps_staged() {
+        let tmp = repo("f.txt", BASE, WORK);
+        let d = tmp.path();
+        fs::write(d.join("gone.txt"), "g\n").unwrap();
+        fs::write(d.join("kept.txt"), "k\n").unwrap();
+        g(d, &["add", "gone.txt", "kept.txt"]);
+        commit(d, "more");
+        fs::write(d.join("f.txt"), "staged\n").unwrap();
+        stage_file(d, "f.txt").unwrap();
+        fs::write(d.join("f.txt"), "staged\nthen edited\n").unwrap();
+        fs::remove_file(d.join("gone.txt")).unwrap();
+        fs::write(d.join("new.txt"), "n\n").unwrap();
+        fs::write(d.join("*.txt"), "glob\n").unwrap();
+
+        discard_files(d, &["f.txt", "gone.txt"], &["*.txt"]).unwrap();
+        assert_eq!(fs::read_to_string(d.join("f.txt")).unwrap(), "staged\n");
+        assert_eq!(index(d, "f.txt"), "staged\n", "staged change kept");
+        assert_eq!(fs::read_to_string(d.join("gone.txt")).unwrap(), "g\n");
+        assert!(!d.join("*.txt").exists());
+        assert!(d.join("new.txt").exists(), "literal name, not a glob");
+        assert_eq!(fs::read_to_string(d.join("kept.txt")).unwrap(), "k\n");
+        discard_files(d, &[], &[]).unwrap();
+        assert!(d.join("new.txt").exists(), "no paths: no-op");
     }
 
     #[test]

@@ -371,6 +371,10 @@ pub enum Action {
     ApplyPatch(String, Direction),
     StageAll,
     UnstageAll,
+    /// Show the confirmation bar; `DiscardAll` (from that bar) does it, `CancelDiscard` hides it.
+    AskDiscardAll,
+    DiscardAll,
+    CancelDiscard,
     Commit,
     ToggleInline,
     CloseDiff,
@@ -392,6 +396,8 @@ pub struct SpinneyApp {
     ctx: egui::Context,
     /// Window focus last frame; status reloads when it is regained.
     focused: bool,
+    /// Root of the tab whose "Discard all" is awaiting confirmation in the top bar.
+    confirm_discard: Option<PathBuf>,
 }
 
 impl SpinneyApp {
@@ -418,6 +424,7 @@ impl SpinneyApp {
             recent_search: String::new(),
             ctx,
             focused: true,
+            confirm_discard: None,
         };
         app.open_visible_tabs();
         app
@@ -542,6 +549,7 @@ impl SpinneyApp {
             }
             Action::SelectTab(i) => {
                 self.active_tab = i;
+                self.confirm_discard = None;
                 self.new_tab = false;
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
@@ -581,6 +589,17 @@ impl SpinneyApp {
             Action::ToggleInline => {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
+            }
+            Action::AskDiscardAll => {
+                self.confirm_discard = self.tabs.get(self.active_tab).map(|t| t.root.clone())
+            }
+            Action::CancelDiscard => self.confirm_discard = None,
+            Action::DiscardAll => {
+                // Only for the tab that asked; the bar is hidden on other tabs anyway.
+                if let Some(tab) = self.discard_tab() {
+                    tab.discard_all(&mut errors);
+                }
+                self.confirm_discard = None;
             }
             Action::SelectCommit(_)
             | Action::DeselectCommit
@@ -706,6 +725,46 @@ impl SpinneyApp {
         self.new_tab || self.tabs.is_empty()
     }
 
+    /// The active tab, when it is the one with a pending "Discard all".
+    fn discard_tab(&mut self) -> Option<&mut ProjectTab> {
+        let root = self.confirm_discard.as_ref()?;
+        if self.showing_new_tab() {
+            return None;
+        }
+        self.tabs
+            .get_mut(self.active_tab)
+            .filter(|t| &t.root == root)
+    }
+
+    /// "Discard all N changes?" with Discard / Cancel.
+    fn discard_bar(ui: &mut egui::Ui, n: usize, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            let noun = if n == 1 { "change" } else { "changes" };
+            ui.label(egui::RichText::new("🗑").color(theme::DELETED));
+            ui.label(
+                egui::RichText::new(format!(
+                    "Discard all {n} unstaged {noun}? This can't be undone."
+                ))
+                .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() {
+                    actions.push(Action::CancelDiscard);
+                }
+                let discard = egui::Button::new(
+                    egui::RichText::new("Discard")
+                        .color(theme::ON_ACCENT)
+                        .strong(),
+                )
+                .fill(theme::DELETED)
+                .small();
+                if ui.add(discard).clicked() {
+                    actions.push(Action::DiscardAll);
+                }
+            });
+        });
+    }
+
     fn error_banner(&mut self, ui: &mut egui::Ui) {
         let mut dismiss = None;
         for (i, e) in self.errors.iter().enumerate() {
@@ -797,6 +856,18 @@ impl eframe::App for SpinneyApp {
                     let running = |k| jobs.running(k, &tab.root);
                     toolbar::toolbar(ui, tab, projects, busy, running, &mut actions)
                 });
+            }
+        }
+        if let Some(n) = self.discard_tab().map(|t| t.status.unstaged.len()) {
+            if n == 0 {
+                self.confirm_discard = None; // nothing left to discard (e.g. cleaned outside)
+            } else {
+                let bar = egui::Frame::new()
+                    .fill(theme::DIFF_DEL)
+                    .inner_margin(Margin::symmetric(14, 6));
+                egui::Panel::top("discard_confirm")
+                    .frame(bar)
+                    .show(ui, |ui| Self::discard_bar(ui, n, &mut actions));
             }
         }
         if !self.errors.is_empty() {
@@ -1086,6 +1157,7 @@ mod tests {
             recent_search: String::new(),
             ctx,
             focused: true,
+            confirm_discard: None,
         }
     }
 
