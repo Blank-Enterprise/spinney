@@ -10,6 +10,8 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     cmd.args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // No terminal to edit in: a merge or rebase must never sit waiting on an editor.
+        .env("GIT_EDITOR", "true")
         .env("LC_ALL", "C");
     cmd
 }

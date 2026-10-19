@@ -1,12 +1,13 @@
 //! Modal dialogs: clone, create, new worktree, confirm worktree removal and branch deletion,
-//! convert.
+//! convert, merge and rebase.
 
 use super::{
     actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
-    toolbar::folder_name, visible_projects, JobKind, SpinneyApp,
+    toolbar::folder_name, visible_projects, JobKind, ProjectTab, SpinneyApp,
 };
+use crate::actions::{MergeMode, MergeOutcome};
 use crate::convert::{self, Plan};
-use crate::{creds, github};
+use crate::{creds, github, refs};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -230,6 +231,25 @@ pub(super) struct DeleteBranchDialog {
     pub(super) not_merged: bool,
 }
 
+/// Merge `branch` into `into` (checked out in `worktree`), in the chosen mode.
+pub(super) struct MergeDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) branch: String,
+    pub(super) into: String,
+    pub(super) mode: MergeMode,
+}
+
+/// Rebase `current` (checked out in `worktree`) onto `onto`; `pushed` commits it rewrites
+/// are already on the upstream.
+pub(super) struct RebaseDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) current: String,
+    pub(super) onto: String,
+    pub(super) pushed: usize,
+}
+
 #[derive(Default)]
 pub(super) struct Dialogs {
     pub(super) space: Option<spaces::SpaceEdit>,
@@ -243,6 +263,8 @@ pub(super) struct Dialogs {
     pub(super) delete_remote: Option<String>,
     pub(super) confirm_drop_stash: Option<DropStash>,
     pub(super) convert: Option<ConvertDialog>,
+    pub(super) merge: Option<MergeDialog>,
+    pub(super) rebase: Option<RebaseDialog>,
 }
 
 /// Convert-to-worktree-layout confirm screen; `plan` holds the refusal when it cannot run.
@@ -271,6 +293,8 @@ impl Dialogs {
             || self.convert.is_some()
             || self.delete_branch.is_some()
             || self.delete_remote.is_some()
+            || self.merge.is_some()
+            || self.rebase.is_some()
     }
 }
 
@@ -278,6 +302,31 @@ impl Dialogs {
 fn danger(label: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(label).color(theme::ON_ACCENT).strong())
         .fill(theme::DELETED)
+}
+
+/// Conflicted files named in a stopped merge or rebase's message; the rest are counted.
+const CONFLICTS_SHOWN: usize = 5;
+
+/// "Merge stopped: conflicts in a.txt, b.txt. Nothing was changed."
+fn conflict_message(op: &str, files: &[String]) -> String {
+    let mut list = files[..files.len().min(CONFLICTS_SHOWN)].join(", ");
+    if files.len() > CONFLICTS_SHOWN {
+        list += &format!(" and {} more", files.len() - CONFLICTS_SHOWN);
+    }
+    format!("{op} stopped: conflicts in {list}. Nothing was changed.")
+}
+
+/// The rebase confirmation's warning when it rewrites `pushed` commits of `current`.
+fn rebase_warning(pushed: usize, current: &str) -> Option<String> {
+    let commits = match pushed {
+        0 => return None,
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
+    };
+    Some(format!(
+        "{commits} of {current} already pushed will be rewritten. Pushing afterwards needs a \
+         force push."
+    ))
 }
 
 impl SpinneyApp {
@@ -451,6 +500,190 @@ impl SpinneyApp {
                 None => self.dialogs.delete_remote = Some(name),
             }
         }
+        if let Some(mut d) = self.dialogs.merge.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("merge")).show(ctx, |ui| {
+                ui.label(format!("Merge {} into {}", d.branch, d.into));
+                ui.add_space(4.0);
+                let modes = [
+                    (MergeMode::FastForward, "Fast-forward if possible"),
+                    (MergeMode::NoFf, "Always create a merge commit"),
+                    (MergeMode::Squash, "Squash"),
+                ];
+                for (mode, label) in modes {
+                    ui.radio_value(&mut d.mode, mode, label);
+                }
+                if d.mode == MergeMode::Squash {
+                    ui.label(theme::caption(
+                        "The changes are staged for you to review and commit.",
+                    ));
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary("Merge")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.merge(d),
+                Some(false) => {}
+                None => self.dialogs.merge = Some(d),
+            }
+        }
+        if let Some(d) = self.dialogs.rebase.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("rebase")).show(ctx, |ui| {
+                ui.label(format!("Rebase {} onto {}?", d.current, d.onto));
+                ui.label(theme::caption(&format!(
+                    "Commits on {} that aren't on {} are replayed on top of it.",
+                    d.current, d.onto
+                )));
+                let warning = rebase_warning(d.pushed, &d.current);
+                if let Some(w) = &warning {
+                    ui.colored_label(theme::WARN, format!("⚠ {w}"));
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let rebase = if warning.is_some() {
+                        danger("Rebase")
+                    } else {
+                        theme::primary("Rebase")
+                    };
+                    if ui.add(rebase).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.rebase(d),
+                Some(false) => {}
+                None => self.dialogs.rebase = Some(d),
+            }
+        }
+    }
+
+    /// Open the merge or (with `rebase`) rebase confirmation for `branch`, refusing now
+    /// rather than after the confirmation what would fail anyway.
+    pub(super) fn ask_merge(&mut self, branch: String, rebase: bool, errors: &mut Vec<String>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        // A pull or push may be moving the same branch (the toolbar disables it too).
+        if self.jobs.network_busy(&tab.root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let (root, worktree) = (tab.root.clone(), tab.active_worktree.clone());
+        let current = match refs::current_branch(&worktree) {
+            Ok(Some(c)) => c,
+            Ok(None) => return errors.push("Check out a branch first".into()),
+            Err(e) => return errors.push(format!("{e:#}")),
+        };
+        if let Err(e) = actions::ensure_clean(&worktree) {
+            return errors.push(format!("{e:#}"));
+        }
+        if !rebase {
+            self.dialogs.merge = Some(MergeDialog {
+                root,
+                worktree,
+                branch,
+                into: current,
+                mode: MergeMode::FastForward,
+            });
+            return;
+        }
+        match actions::rebase_rewrites_pushed(&worktree, &branch) {
+            Ok(pushed) => {
+                self.dialogs.rebase = Some(RebaseDialog {
+                    root,
+                    worktree,
+                    current,
+                    onto: branch,
+                    pushed,
+                })
+            }
+            Err(e) => errors.push(format!("upstream: {e:#}")),
+        }
+    }
+
+    /// The tab a merge or rebase was asked in, unless its branch changed since.
+    fn merge_tab(
+        &mut self,
+        root: &Path,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<&mut ProjectTab, String> {
+        let tab = self.tabs.iter_mut().find(|t| t.root == root);
+        let tab = tab.ok_or_else(|| "The project was closed".to_string())?;
+        match refs::current_branch(worktree) {
+            Ok(Some(c)) if c == branch => Ok(tab),
+            Ok(_) => Err(format!("{branch} is no longer checked out; try again")),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    /// Merge synchronously, like checkout; a squash prefills the commit card.
+    fn merge(&mut self, d: MergeDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let tab = match self.merge_tab(&d.root, &d.worktree, &d.into) {
+            Ok(tab) => tab,
+            Err(e) => return self.errors.push(e),
+        };
+        let res = actions::merge(&d.worktree, &d.branch, d.mode);
+        tab.refresh(&ctx, &mut errors);
+        let mut notice = None;
+        match res {
+            Ok(MergeOutcome::Done) if d.mode == MergeMode::Squash => {
+                // Committed through the normal card, never as an amend of HEAD.
+                if tab.amend {
+                    tab.set_amend(false, &mut errors);
+                }
+                if tab.commit_summary.is_empty() && tab.commit_desc.is_empty() {
+                    tab.commit_summary = format!("Squash {} into {}", d.branch, d.into);
+                }
+                notice = Some(format!("Squashed {}: review and commit", d.branch));
+            }
+            Ok(MergeOutcome::Done) => {}
+            Ok(MergeOutcome::UpToDate) => {
+                notice = Some(format!(
+                    "{} is already up to date with {}",
+                    d.into, d.branch
+                ))
+            }
+            Ok(MergeOutcome::Conflicts(files)) => errors.push(conflict_message("Merge", &files)),
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        self.notices.extend(notice);
+        self.errors.extend(errors);
+    }
+
+    /// Rebase synchronously, like checkout.
+    fn rebase(&mut self, d: RebaseDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let tab = match self.merge_tab(&d.root, &d.worktree, &d.current) {
+            Ok(tab) => tab,
+            Err(e) => return self.errors.push(e),
+        };
+        let res = actions::rebase(&d.worktree, &d.onto);
+        tab.refresh(&ctx, &mut errors);
+        match res {
+            Ok(MergeOutcome::Done) => {}
+            Ok(MergeOutcome::UpToDate) => self.notices.push(format!(
+                "{} is already up to date with {}",
+                d.current, d.onto
+            )),
+            Ok(MergeOutcome::Conflicts(files)) => errors.push(conflict_message("Rebase", &files)),
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        self.errors.extend(errors);
     }
 
     /// Close the project's tab (so nothing runs git in it while files move) and convert on
@@ -1165,6 +1398,99 @@ mod tests {
         d.delete_branch = None;
         d.delete_remote = Some("origin/topic".into());
         assert!(d.any_open());
+        d.delete_remote = None;
+        d.merge = Some(MergeDialog {
+            root: PathBuf::from("/tmp/r"),
+            worktree: PathBuf::from("/tmp/r"),
+            branch: "topic".into(),
+            into: "main".into(),
+            mode: MergeMode::FastForward,
+        });
+        assert!(d.any_open());
+        d.merge = None;
+        d.rebase = Some(RebaseDialog {
+            root: PathBuf::from("/tmp/r"),
+            worktree: PathBuf::from("/tmp/r"),
+            current: "main".into(),
+            onto: "topic".into(),
+            pushed: 0,
+        });
+        assert!(d.any_open());
+    }
+
+    #[test]
+    fn conflict_message_names_a_few_files() {
+        let files = |n: usize| (0..n).map(|i| format!("f{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            conflict_message("Merge", &files(2)),
+            "Merge stopped: conflicts in f0, f1. Nothing was changed."
+        );
+        assert_eq!(
+            conflict_message("Rebase", &files(7)),
+            "Rebase stopped: conflicts in f0, f1, f2, f3, f4 and 2 more. Nothing was changed."
+        );
+    }
+
+    #[test]
+    fn rebase_warns_only_when_rewriting_pushed_commits() {
+        assert_eq!(rebase_warning(0, "main"), None);
+        let one = rebase_warning(1, "main").unwrap();
+        assert!(one.starts_with("1 commit of main already pushed"), "{one}");
+        let two = rebase_warning(2, "main").unwrap();
+        assert!(two.starts_with("2 commits of main"), "{two}");
+    }
+
+    #[test]
+    fn merge_is_refused_up_front_and_squash_prefills_the_commit_card() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        g(&["switch", "-q", "-c", "topic"]);
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "b"]);
+        g(&["switch", "-q", "main"]);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        std::fs::write(d.join("a.txt"), "changed\n").unwrap();
+        app.apply(Action::AskMerge("topic".into()));
+        assert!(app.errors.iter().any(|e| e.contains("Commit or stash")));
+        assert!(app.dialogs.merge.is_none(), "refused before asking");
+        g(&["checkout", "--", "a.txt"]);
+        app.errors.clear();
+
+        app.apply(Action::AskMerge("topic".into()));
+        let mut m = app.dialogs.merge.take().expect("dialog open");
+        assert_eq!((m.into.as_str(), m.mode), ("main", MergeMode::FastForward));
+        m.mode = MergeMode::Squash;
+        app.merge(m);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let tab = &app.tabs[0];
+        assert_eq!(tab.commit_summary, "Squash topic into main");
+        assert_eq!(tab.status.staged.len(), 1);
+        assert_eq!(tab.status.staged[0].path, "b.txt");
+        assert!(app
+            .notices
+            .contains(&"Squashed topic: review and commit".into()));
+
+        g(&["reset", "-q", "--hard"]);
+        g(&["checkout", "-q", "--detach"]);
+        app.apply(Action::AskRebase("topic".into()));
+        assert!(app.errors.iter().any(|e| e == "Check out a branch first"));
+        assert!(app.dialogs.rebase.is_none());
     }
 
     #[test]

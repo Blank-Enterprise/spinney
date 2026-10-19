@@ -43,14 +43,219 @@ pub fn head_message(worktree: &Path) -> Result<String> {
     Ok(out.trim_end().to_string())
 }
 
+/// The current branch tracks an upstream.
+fn has_upstream(worktree: &Path) -> bool {
+    git::run(worktree, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok()
+}
+
 /// Whether HEAD is already on its upstream, so amending it rewrites pushed history.
 /// No upstream means nothing was pushed.
 pub fn head_pushed(worktree: &Path) -> Result<bool> {
-    if git::run(worktree, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err() {
+    if !has_upstream(worktree) {
         return Ok(false);
     }
     let ahead = git::run(worktree, &["rev-list", "--count", "@{u}..HEAD"])?;
     Ok(ahead.trim() == "0")
+}
+
+/// Commits that rebasing HEAD onto `onto` rewrites although they are already on the
+/// upstream: reachable from HEAD and `@{u}` but not from `onto`. No upstream means none.
+pub fn rebase_rewrites_pushed(worktree: &Path, onto: &str) -> Result<usize> {
+    if !has_upstream(worktree) {
+        return Ok(0);
+    }
+    // Exit 1: no common history, so nothing pushed is rewritten.
+    let base = git::run_ok_codes(worktree, &["merge-base", "HEAD", "@{u}"], &[0, 1])?;
+    let base = base.trim();
+    if base.is_empty() {
+        return Ok(0);
+    }
+    let range = format!("{onto}..{base}");
+    let n = git::run(worktree, &["rev-list", "--count", &range])?;
+    Ok(n.trim().parse()?)
+}
+
+/// How `merge` brings the branch in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MergeMode {
+    /// `--ff`: move the branch when possible, else create a merge commit.
+    FastForward,
+    /// `--no-ff`: always create a merge commit.
+    NoFf,
+    /// `--squash`: stage the combined changes for the user to commit.
+    Squash,
+}
+
+/// How a merge or rebase ended.
+#[derive(Debug, PartialEq)]
+pub enum MergeOutcome {
+    /// Merged, rebased, or (squash) staged without committing.
+    Done,
+    /// Nothing to bring in: HEAD and the index are unchanged.
+    UpToDate,
+    /// Stopped on conflicts in these paths and was aborted, so nothing changed.
+    Conflicts(Vec<String>),
+}
+
+/// The merge, rebase, cherry-pick or revert already under way in `worktree`, if any.
+pub fn in_progress(worktree: &Path) -> Result<Option<&'static str>> {
+    let states = [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ];
+    let mut args = vec!["rev-parse"];
+    for (file, _) in &states {
+        args.extend(["--git-path", file]);
+    }
+    // Per-worktree paths: in the worktree layout they live under `.bare/worktrees/<name>`.
+    let out = git::run(worktree, &args)?;
+    Ok(out
+        .lines()
+        .zip(states)
+        .find(|(path, _)| worktree.join(path).exists())
+        .map(|(_, (_, what))| what))
+}
+
+/// Refuse to merge or rebase on top of another operation or uncommitted changes to
+/// tracked files. Untracked files are left to git, which refuses to overwrite them.
+pub fn ensure_clean(worktree: &Path) -> Result<()> {
+    if let Some(what) = in_progress(worktree)? {
+        bail!("A {what} is already in progress; finish or abort it first");
+    }
+    if is_dirty(worktree)? {
+        bail!("Commit or stash your changes first");
+    }
+    Ok(())
+}
+
+/// Staged or unstaged changes to tracked files (conflicts included).
+fn is_dirty(worktree: &Path) -> Result<bool> {
+    let out = git::run(worktree, &["status", "--porcelain", "--untracked-files=no"])?;
+    Ok(!out.trim().is_empty())
+}
+
+/// The checked-out branch, refusing a detached HEAD or `branch` itself.
+fn current_for(worktree: &Path, branch: &str) -> Result<String> {
+    let Some(current) = refs::current_branch(worktree)? else {
+        bail!("Check out a branch first");
+    };
+    if current == branch {
+        bail!("{branch} is the checked-out branch");
+    }
+    Ok(current)
+}
+
+fn rev_parse(worktree: &Path, rev: &str) -> Result<String> {
+    Ok(git::run(worktree, &["rev-parse", rev])?.trim().to_string())
+}
+
+/// Merge `branch` (local or remote-tracking) into the current branch. A squash stages the
+/// result without committing. Conflicts abort the merge: see `MergeOutcome::Conflicts`.
+pub fn merge(worktree: &Path, branch: &str, mode: MergeMode) -> Result<MergeOutcome> {
+    current_for(worktree, branch)?;
+    ensure_clean(worktree)?;
+    let before = rev_parse(worktree, "HEAD")?;
+    // `--ff` explicitly, so a `merge.ff` setting cannot change the chosen mode.
+    let flag = match mode {
+        MergeMode::FastForward => "--ff",
+        MergeMode::NoFf => "--no-ff",
+        MergeMode::Squash => "--squash",
+    };
+    if let Err(e) = git::run(worktree, &["merge", flag, "--no-edit", branch]) {
+        // A squash records no MERGE_HEAD, so there is no merge for `--abort` to find.
+        let abort: &[&str] = match mode {
+            MergeMode::Squash => &["reset", "--merge"],
+            _ => &["merge", "--abort"],
+        };
+        return stopped(worktree, e, abort, &before, None);
+    }
+    let unchanged = match mode {
+        MergeMode::Squash => !has_staged(worktree)?,
+        _ => rev_parse(worktree, "HEAD")? == before,
+    };
+    Ok(if unchanged {
+        MergeOutcome::UpToDate
+    } else {
+        MergeOutcome::Done
+    })
+}
+
+/// Replay the current branch's commits on top of `onto` (local or remote-tracking).
+/// Conflicts abort the rebase: see `MergeOutcome::Conflicts`.
+pub fn rebase(worktree: &Path, onto: &str) -> Result<MergeOutcome> {
+    let current = current_for(worktree, onto)?;
+    ensure_clean(worktree)?;
+    let before = rev_parse(worktree, "HEAD")?;
+    if let Err(e) = git::run(worktree, &["rebase", onto]) {
+        let abort = &["rebase", "--abort"];
+        return stopped(worktree, e, abort, &before, Some(&current));
+    }
+    Ok(if rev_parse(worktree, "HEAD")? == before {
+        MergeOutcome::UpToDate
+    } else {
+        MergeOutcome::Done
+    })
+}
+
+/// Anything staged (`diff --cached --quiet` exits 1 when there is).
+fn has_staged(worktree: &Path) -> Result<bool> {
+    let out = git::output(worktree, &["diff", "--cached", "--quiet"])?;
+    match out.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => bail!("git diff failed: {}", stderr(&out)),
+    }
+}
+
+/// After a failed merge or rebase: without conflicts, git's own error. With conflicts, run
+/// `abort` and make sure HEAD (on `branch` again, for a rebase) and the tracked files are
+/// back where they started.
+fn stopped(
+    worktree: &Path,
+    err: anyhow::Error,
+    abort: &[&str],
+    before: &str,
+    branch: Option<&str>,
+) -> Result<MergeOutcome> {
+    let args = [
+        "-c",
+        "core.quotepath=off",
+        "diff",
+        "--name-only",
+        "--diff-filter=U",
+    ];
+    let conflicts: Vec<String> = git::run(worktree, &args)?
+        .lines()
+        .map(str::to_string)
+        .collect();
+    if conflicts.is_empty() {
+        // E.g. an untracked file in the way; a rebase can stop on it partway through.
+        if in_progress(worktree)?.is_some() {
+            git::run(worktree, abort)?;
+        }
+        return Err(err);
+    }
+    // Until #53/#58: nothing can resolve conflicts and continue yet, so never leave the
+    // operation half done; abort it and report the conflicted files instead.
+    git::run(worktree, abort)?;
+    let on_branch = match branch {
+        Some(b) => refs::current_branch(worktree)?.as_deref() == Some(b),
+        None => true,
+    };
+    let restored = on_branch
+        && rev_parse(worktree, "HEAD")? == before
+        && !is_dirty(worktree)?
+        && in_progress(worktree)?.is_none();
+    if !restored {
+        bail!(
+            "conflicts in {}, and aborting did not restore {before}; check the repository",
+            conflicts.join(", ")
+        );
+    }
+    Ok(MergeOutcome::Conflicts(conflicts))
 }
 
 pub fn fetch(dir: &Path) -> Result<()> {
@@ -103,7 +308,7 @@ pub fn push(worktree: &Path) -> Result<()> {
         worktree: worktree.to_path_buf(),
         branch: branch.clone(),
     };
-    if git::run(worktree, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok() {
+    if has_upstream(worktree) {
         push_porcelain(worktree, &["push", "--porcelain"], rejected)
     } else {
         let args = ["push", "--porcelain", "-u", "origin", &branch];
@@ -645,5 +850,209 @@ mod tests {
             "{list:?}"
         );
         assert!(delete_remote_branch(&main, "nope").is_err());
+    }
+
+    /// `main` and a local `other`, both from `init`, each changing `a.txt` differently.
+    fn conflicting() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, root, main) = cloned();
+        std::fs::write(main.join("a.txt"), "main\n").unwrap();
+        g(&main, &["commit", "-qam", "main edit"]);
+        g(&main, &["switch", "-q", "-c", "other", "origin/main"]);
+        std::fs::write(main.join("a.txt"), "other\n").unwrap();
+        g(&main, &["commit", "-qam", "other edit"]);
+        g(&main, &["switch", "-q", "main"]);
+        (tmp, root, main)
+    }
+
+    /// HEAD, branch and `status` (untracked files included) before an operation.
+    fn snapshot(dir: &Path) -> (String, Option<String>, String) {
+        (
+            head(dir, "HEAD"),
+            refs::current_branch(dir).unwrap(),
+            g(dir, &["status", "--porcelain", "--untracked-files=all"]),
+        )
+    }
+
+    #[test]
+    fn merge_fast_forwards() {
+        let (_tmp, _root, main) = cloned();
+        let out = merge(&main, "origin/feature/x", MergeMode::FastForward).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        assert_eq!(head(&main, "HEAD"), head(&main, "origin/feature/x"));
+        assert_eq!(
+            g(&main, &["log", "-1", "--format=%P"]).split(' ').count(),
+            1
+        );
+        assert!(main.join("b.txt").exists());
+        let again = merge(&main, "origin/feature/x", MergeMode::FastForward).unwrap();
+        assert_eq!(again, MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn merge_no_ff_creates_merge_commit() {
+        let (_tmp, _root, main) = cloned();
+        let before = head(&main, "HEAD");
+        let out = merge(&main, "origin/feature/x", MergeMode::NoFf).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        let parents = g(&main, &["log", "-1", "--format=%P"]);
+        let want = format!("{before} {}", head(&main, "origin/feature/x"));
+        assert_eq!(parents, want, "two parents: main, then the branch");
+        assert!(main.join("b.txt").exists());
+    }
+
+    #[test]
+    fn merge_squash_stages_without_committing() {
+        let (_tmp, _root, main) = cloned();
+        let before = head(&main, "HEAD");
+        let out = merge(&main, "origin/feature/x", MergeMode::Squash).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        assert_eq!(head(&main, "HEAD"), before, "nothing committed");
+        assert_eq!(g(&main, &["diff", "--cached", "--name-only"]), "b.txt");
+        assert!(git::run(&main, &["rev-parse", "--verify", "-q", "MERGE_HEAD"]).is_err());
+        assert_eq!(in_progress(&main).unwrap(), None);
+        commit(&main, "Squash feature/x into main").unwrap();
+        assert_eq!(
+            g(&main, &["log", "-1", "--format=%P"]),
+            before,
+            "one parent"
+        );
+        let again = merge(&main, "origin/feature/x", MergeMode::Squash).unwrap();
+        assert_eq!(again, MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn merge_conflict_aborts_and_reports_files() {
+        let (_tmp, _root, main) = conflicting();
+        std::fs::write(main.join("untracked.txt"), "u\n").unwrap();
+        let before = snapshot(&main);
+        for mode in [MergeMode::FastForward, MergeMode::NoFf, MergeMode::Squash] {
+            let out = merge(&main, "other", mode).unwrap();
+            assert_eq!(
+                out,
+                MergeOutcome::Conflicts(vec!["a.txt".into()]),
+                "{mode:?}"
+            );
+            assert_eq!(snapshot(&main), before, "{mode:?}");
+            assert_eq!(in_progress(&main).unwrap(), None, "{mode:?}");
+            assert_eq!(
+                std::fs::read_to_string(main.join("a.txt")).unwrap(),
+                "main\n"
+            );
+            assert!(g(&main, &["diff", "--cached", "--name-only"]).is_empty());
+        }
+    }
+
+    #[test]
+    fn rebase_replays_commits_onto_branch() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        let out = rebase(&main, "origin/feature/x").unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        assert_eq!(head(&main, "HEAD~1"), head(&main, "origin/feature/x"));
+        assert_eq!(head_message(&main).unwrap(), "add file");
+        assert_eq!(
+            refs::current_branch(&main).unwrap().as_deref(),
+            Some("main")
+        );
+        assert!(main.join("b.txt").exists() && main.join("c.txt").exists());
+        let again = rebase(&main, "origin/feature/x").unwrap();
+        assert_eq!(again, MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn rebase_conflict_aborts_and_restores_head() {
+        let (_tmp, _root, main) = conflicting();
+        std::fs::write(main.join("untracked.txt"), "u\n").unwrap();
+        let before = snapshot(&main);
+        let out = rebase(&main, "other").unwrap();
+        assert_eq!(out, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(snapshot(&main), before);
+        assert_eq!(in_progress(&main).unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(main.join("a.txt")).unwrap(),
+            "main\n"
+        );
+    }
+
+    #[test]
+    fn dirty_tracked_files_refuse_merge_and_rebase() {
+        let (_tmp, _root, main) = cloned();
+        let x = "origin/feature/x";
+        std::fs::write(main.join("a.txt"), "changed\n").unwrap();
+        let err = merge(&main, x, MergeMode::FastForward).unwrap_err();
+        assert!(err.to_string().contains("Commit or stash"), "{err}");
+        g(&main, &["add", "a.txt"]);
+        let err = rebase(&main, x).unwrap_err();
+        assert!(err.to_string().contains("Commit or stash"), "staged: {err}");
+        g(&main, &["reset", "-q", "--hard"]);
+        // Untracked files alone are git's call; this one is not in the way.
+        std::fs::write(main.join("new.txt"), "n\n").unwrap();
+        let out = merge(&main, x, MergeMode::FastForward).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+    }
+
+    #[test]
+    fn untracked_file_in_the_way_is_gits_error() {
+        let (_tmp, _root, main) = cloned();
+        std::fs::write(main.join("b.txt"), "mine\n").unwrap();
+        let before = snapshot(&main);
+        let err = merge(&main, "origin/feature/x", MergeMode::FastForward).unwrap_err();
+        assert!(err.to_string().contains("untracked"), "{err}");
+        assert_eq!(snapshot(&main), before);
+    }
+
+    #[test]
+    fn operation_in_progress_refuses() {
+        let (_tmp, _root, main) = conflicting();
+        assert!(git::run(&main, &["merge", "--no-edit", "other"]).is_err());
+        assert_eq!(in_progress(&main).unwrap(), Some("merge"));
+        let err = merge(&main, "origin/feature/x", MergeMode::NoFf).unwrap_err();
+        assert!(
+            err.to_string().contains("merge is already in progress"),
+            "{err}"
+        );
+        let err = rebase(&main, "origin/feature/x").unwrap_err();
+        assert!(
+            err.to_string().contains("merge is already in progress"),
+            "{err}"
+        );
+        g(&main, &["merge", "--abort"]);
+        assert_eq!(in_progress(&main).unwrap(), None);
+    }
+
+    #[test]
+    fn detached_head_or_same_branch_refuses() {
+        let (_tmp, _root, main) = cloned();
+        let err = merge(&main, "main", MergeMode::FastForward).unwrap_err();
+        assert!(err.to_string().contains("checked-out branch"), "{err}");
+        g(&main, &["checkout", "-q", "--detach"]);
+        let err = rebase(&main, "origin/feature/x").unwrap_err();
+        assert!(
+            err.to_string().contains("Check out a branch first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rebase_counts_pushed_commits_it_rewrites() {
+        let (_tmp, _root, main) = cloned();
+        let x = "origin/feature/x";
+        assert_eq!(
+            rebase_rewrites_pushed(&main, x).unwrap(),
+            0,
+            "only init, on x"
+        );
+        write_commit(&main, "c.txt");
+        assert_eq!(rebase_rewrites_pushed(&main, x).unwrap(), 0, "not pushed");
+        push(&main).unwrap();
+        assert_eq!(rebase_rewrites_pushed(&main, x).unwrap(), 1);
+        write_commit(&main, "d.txt");
+        assert_eq!(
+            rebase_rewrites_pushed(&main, x).unwrap(),
+            1,
+            "d is not pushed"
+        );
+        g(&main, &["switch", "-q", "-c", "topic"]);
+        assert_eq!(rebase_rewrites_pushed(&main, x).unwrap(), 0, "no upstream");
     }
 }
