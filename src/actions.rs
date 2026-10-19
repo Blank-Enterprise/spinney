@@ -12,6 +12,13 @@ pub enum CheckoutOutcome {
     NeedsWorktree,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// `git branch -d` refused: the branch has commits its upstream (or HEAD) lacks.
+    NotMerged,
+}
+
 pub fn commit(worktree: &Path, message: &str) -> Result<()> {
     if message.trim().is_empty() {
         bail!("empty commit message");
@@ -83,11 +90,52 @@ pub fn create_branch(worktree: &Path, name: &str, base: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails when any worktree of the project (not just `dir`'s) has `branch` checked out.
+pub fn ensure_not_checked_out(dir: &Path, branch: &str) -> Result<()> {
+    if let Some(w) = list_worktrees(dir)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+    {
+        let name = w.path.file_name().unwrap_or(w.path.as_os_str());
+        bail!(
+            "{branch} is checked out in worktree {}",
+            name.to_string_lossy()
+        );
+    }
+    Ok(())
+}
+
+/// `git branch -d` (`-D` when `force`), refusing first when any worktree has `branch` out.
+pub fn delete_branch(worktree: &Path, branch: &str, force: bool) -> Result<DeleteOutcome> {
+    ensure_not_checked_out(worktree, branch)?;
+    let flag = if force { "-D" } else { "-d" };
+    match git::run(worktree, &["branch", flag, branch]) {
+        Ok(_) => Ok(DeleteOutcome::Deleted),
+        // git runs with LC_ALL=C; older versions capitalise "The branch", so compare lowercase.
+        Err(e) if e.to_string().to_lowercase().contains("not fully merged") => {
+            Ok(DeleteOutcome::NotMerged)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `git push <remote> --delete <name>` for `remote_branch` (`origin/feature/x`); the push
+/// also drops the remote-tracking ref.
+pub fn delete_remote_branch(worktree: &Path, remote_branch: &str) -> Result<()> {
+    let Some((remote, name)) = remote_branch.split_once('/') else {
+        bail!("{remote_branch} is not a remote branch");
+    };
+    // The full ref, so a tag with the same name is never the one deleted.
+    let full = format!("refs/heads/{name}");
+    git::run(worktree, &["push", remote, "--delete", &full])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Space;
-    use crate::project::clone_into;
+    use crate::project::{add_worktree_existing, clone_into};
 
     fn space() -> Space {
         Space {
@@ -231,5 +279,61 @@ mod tests {
         let (_tmp, _root, main) = cloned();
         create_branch(&main, "new", "main").unwrap();
         git::run(&main, &["rev-parse", "--verify", "new"]).unwrap();
+    }
+
+    #[test]
+    fn delete_merged_branch() {
+        let (_tmp, _root, main) = cloned();
+        create_branch(&main, "done", "main").unwrap();
+        let out = delete_branch(&main, "done", false).unwrap();
+        assert_eq!(out, DeleteOutcome::Deleted);
+        assert!(git::run(&main, &["rev-parse", "--verify", "done"]).is_err());
+    }
+
+    #[test]
+    fn delete_unmerged_needs_force() {
+        let (_tmp, _root, main) = cloned();
+        // No upstream, so `-d` judges against HEAD (main), which lacks feature/x's commit.
+        git::run(
+            &main,
+            &["branch", "--no-track", "topic", "origin/feature/x"],
+        )
+        .unwrap();
+        let out = delete_branch(&main, "topic", false).unwrap();
+        assert_eq!(out, DeleteOutcome::NotMerged);
+        git::run(&main, &["rev-parse", "--verify", "topic"]).unwrap();
+        let out = delete_branch(&main, "topic", true).unwrap();
+        assert_eq!(out, DeleteOutcome::Deleted);
+        assert!(git::run(&main, &["rev-parse", "--verify", "topic"]).is_err());
+    }
+
+    #[test]
+    fn delete_refuses_branch_checked_out_elsewhere() {
+        let (_tmp, root, main) = cloned();
+        add_worktree_existing(&root, "feature/x").unwrap();
+        let err = delete_branch(&main, "feature/x", true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("checked out in worktree feature-x"),
+            "{err}"
+        );
+        git::run(&main, &["rev-parse", "--verify", "feature/x"]).unwrap();
+        let err = delete_branch(&main, "main", true).unwrap_err();
+        assert!(err.to_string().contains("worktree main"), "{err}");
+    }
+
+    #[test]
+    fn delete_remote_branch_on_file_remote() {
+        let (tmp, _root, main) = cloned();
+        delete_remote_branch(&main, "origin/feature/x").unwrap();
+        let remote = remote_dir(&tmp);
+        assert!(git::run(&remote, &["rev-parse", "--verify", "feature/x"]).is_err());
+        git::run(&remote, &["rev-parse", "--verify", "main"]).unwrap();
+        let list = refs::branches(&main).unwrap();
+        assert!(
+            list.iter().all(|b| b.name != "origin/feature/x"),
+            "{list:?}"
+        );
+        assert!(delete_remote_branch(&main, "nope").is_err());
     }
 }

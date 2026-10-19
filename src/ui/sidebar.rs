@@ -128,7 +128,7 @@ fn branch_row(ui: &mut egui::Ui, b: &Branch, layout: Layout, actions: &mut Vec<A
         leaf.to_string()
     };
     let r = row(ui, b.head, text, track.trim().to_string()).on_hover_text(&b.name);
-    branch_menu(&r, layout, &b.name, actions);
+    branch_menu(&r, layout, b, actions);
 }
 
 /// Case-insensitive substring match of the sidebar filter on a branch or worktree name.
@@ -221,7 +221,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
     });
 }
 
-fn branch_menu(r: &egui::Response, layout: Layout, name: &str, actions: &mut Vec<Action>) {
+fn branch_menu(r: &egui::Response, layout: Layout, b: &Branch, actions: &mut Vec<Action>) {
+    let name = b.name.as_str();
     r.context_menu(|ui| {
         if ui.button("Checkout").clicked() {
             actions.push(Action::Checkout(name.to_string()));
@@ -238,6 +239,19 @@ fn branch_menu(r: &egui::Response, layout: Layout, name: &str, actions: &mut Vec
             );
         if r.clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));
+            ui.close();
+        }
+        ui.separator();
+        let (label, action) = if b.remote {
+            (
+                "Delete remote branch…",
+                Action::AskDeleteRemote(name.to_string()),
+            )
+        } else {
+            ("Delete branch…", Action::AskDeleteBranch(name.to_string()))
+        };
+        if ui.button(label).clicked() {
+            actions.push(action);
             ui.close();
         }
     });

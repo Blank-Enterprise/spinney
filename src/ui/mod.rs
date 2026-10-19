@@ -18,7 +18,7 @@ use crate::refs::{self, Branch};
 use crate::stage::Direction;
 use crate::status::{FileStatus, Status};
 use crate::{creds, git};
-use dialogs::{CloneDialog, CreateDialog, Dialogs, NewWorktreeDialog};
+use dialogs::{CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui::{self, Margin};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -245,6 +245,8 @@ enum JobKind {
     Fetch,
     Pull,
     Push,
+    /// `git push <remote> --delete`, run like a push.
+    DeleteRemote,
     CommitGraph,
 }
 
@@ -325,11 +327,16 @@ impl Jobs {
         self.active.iter().any(|(k, r)| *k == kind && r == root)
     }
 
-    /// A fetch, pull or push is in flight for `root`.
+    /// A fetch, pull, push or remote branch delete is in flight for `root`.
     fn network_busy(&self, root: &Path) -> bool {
-        [JobKind::Fetch, JobKind::Pull, JobKind::Push]
-            .into_iter()
-            .any(|k| self.running(k, root))
+        [
+            JobKind::Fetch,
+            JobKind::Pull,
+            JobKind::Push,
+            JobKind::DeleteRemote,
+        ]
+        .into_iter()
+        .any(|k| self.running(k, root))
     }
 }
 
@@ -356,6 +363,10 @@ pub enum Action {
     Push,
     Checkout(String),
     NewWorktreeFrom(String),
+    /// Ask before deleting a local branch (refused when a worktree has it checked out).
+    AskDeleteBranch(String),
+    /// Ask before deleting `remote/branch` on its remote.
+    AskDeleteRemote(String),
     /// New branch from the given base: a worktree in the worktree layout, else a switch.
     NewBranch(String),
     /// Open Terminal.app at the active worktree.
@@ -500,7 +511,7 @@ impl SpinneyApp {
                     self.open_tab(&root, &space);
                 }
             }
-            JobKind::Fetch | JobKind::Pull | JobKind::Push => {
+            JobKind::Fetch | JobKind::Pull | JobKind::Push | JobKind::DeleteRemote => {
                 if kind == JobKind::Fetch {
                     if let Ok(common) = common_dir(&root) {
                         self.jobs.commit_graph(root.clone(), common);
@@ -622,6 +633,26 @@ impl SpinneyApp {
                     worktree: true,
                 });
             }
+            Action::AskDeleteBranch(branch) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    // Refuse now rather than after the confirmation.
+                    match actions::ensure_not_checked_out(&tab.active_worktree, &branch) {
+                        Ok(()) => {
+                            let remote = format!("origin/{branch}");
+                            let has_remote =
+                                tab.branches.iter().any(|b| b.remote && b.name == remote);
+                            self.dialogs.delete_branch = Some(DeleteBranchDialog {
+                                branch,
+                                remote: has_remote.then_some(remote),
+                                also_remote: false,
+                                not_merged: false,
+                            });
+                        }
+                        Err(e) => errors.push(format!("{e:#}")),
+                    }
+                }
+            }
+            Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
             Action::NewBranch(base) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     self.dialogs.new_worktree = Some(NewWorktreeDialog {
