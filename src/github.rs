@@ -1,4 +1,6 @@
-//! GitHub REST: list the repositories a space's token can see.
+//! GitHub: list the repositories a space's token can see; sign in with the OAuth device flow.
+
+#![allow(dead_code)] // the device flow is wired into the space editor in the next commit
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Deserializer};
@@ -118,6 +120,158 @@ pub fn filter<'a>(repos: &'a [Repo], query: &str) -> Vec<&'a Repo> {
         .collect()
 }
 
+/// Spinney's OAuth App (public; the device flow needs no client secret).
+pub const GITHUB_CLIENT_ID: &str = "Ov23liCPm15HJJ4KHBlA";
+const DEVICE_SCOPE: &str = "repo read:org";
+/// The device flow only ever talks to github.com.
+const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// GitHub's documented defaults, used when a reply omits (or zeroes) them.
+const DEFAULT_INTERVAL: u64 = 5;
+const DEFAULT_EXPIRES_IN: u64 = 900;
+
+/// A started device flow. `device_code` is a secret: never shown, logged or put in errors.
+#[derive(Clone, PartialEq)]
+pub struct DeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+/// One token poll's outcome. The token is a secret.
+#[derive(Clone, PartialEq)]
+pub enum Poll {
+    Pending,
+    /// Polled too fast: wait this many seconds from now on.
+    SlowDown(u64),
+    Token(String),
+    Denied,
+    Expired,
+}
+
+impl std::fmt::Debug for Poll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Poll::Pending => f.write_str("Pending"),
+            Poll::SlowDown(s) => write!(f, "SlowDown({s})"),
+            Poll::Token(_) => f.write_str("Token(<redacted>)"),
+            Poll::Denied => f.write_str("Denied"),
+            Poll::Expired => f.write_str("Expired"),
+        }
+    }
+}
+
+/// Raw `/login/device/code` reply: the codes, or an `error`.
+#[derive(Deserialize, Default)]
+pub struct DeviceCodeReply {
+    device_code: Option<String>,
+    user_code: Option<String>,
+    verification_uri: Option<String>,
+    expires_in: Option<u64>,
+    interval: Option<u64>,
+    error: Option<String>,
+}
+
+/// Raw `/login/oauth/access_token` reply: a token, or an `error` (with `interval` on slow_down).
+#[derive(Deserialize, Default)]
+pub struct PollReply {
+    access_token: Option<String>,
+    error: Option<String>,
+    interval: Option<u64>,
+}
+
+/// Ask github.com for a device and user code.
+pub fn start_device_flow(client_id: &str) -> Result<DeviceCode> {
+    let reply = post_form(
+        DEVICE_CODE_URL,
+        &[("client_id", client_id), ("scope", DEVICE_SCOPE)],
+    )?;
+    parse_device_code(reply)
+}
+
+/// Ask github.com once whether the user approved; `interval` is the current poll interval.
+pub fn poll_once(client_id: &str, device_code: &str, interval: u64) -> Result<Poll> {
+    let form = [
+        ("client_id", client_id),
+        ("device_code", device_code),
+        ("grant_type", DEVICE_GRANT),
+    ];
+    parse_poll(&post_form(ACCESS_TOKEN_URL, &form)?, interval)
+}
+
+/// POST a form to github.com and decode its JSON reply. Errors name only the HTTP status or
+/// transport failure, never the form (which carries the device code).
+fn post_form<T: serde::de::DeserializeOwned>(url: &str, form: &[(&str, &str)]) -> Result<T> {
+    let mut resp = match agent()
+        .post(url)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .header("Accept", "application/json")
+        .header("User-Agent", "spinney")
+        .send_form(form.iter().copied())
+    {
+        Ok(r) => r,
+        Err(e) => bail!("Could not reach GitHub: {e}"),
+    };
+    let status = resp.status().as_u16();
+    match resp.body_mut().read_json::<T>() {
+        Ok(v) => Ok(v),
+        Err(_) if status >= 400 => bail!("GitHub answered HTTP {status}"),
+        Err(_) => bail!("GitHub sent an unreadable reply"),
+    }
+}
+
+/// Validate a device-code reply, falling back to GitHub's defaults for a missing timing.
+pub fn parse_device_code(r: DeviceCodeReply) -> Result<DeviceCode> {
+    if let Some(code) = r.error {
+        bail!("GitHub refused sign-in: {code}");
+    }
+    let (Some(device_code), Some(user_code), Some(verification_uri)) =
+        (r.device_code, r.user_code, r.verification_uri)
+    else {
+        bail!("GitHub sent an incomplete sign-in reply");
+    };
+    Ok(DeviceCode {
+        device_code,
+        user_code,
+        verification_uri,
+        expires_in: r
+            .expires_in
+            .filter(|&s| s > 0)
+            .unwrap_or(DEFAULT_EXPIRES_IN),
+        interval: r.interval.filter(|&s| s > 0).unwrap_or(DEFAULT_INTERVAL),
+    })
+}
+
+/// Map a token-poll reply to its outcome. `slow_down` uses the returned interval, or adds 5s.
+pub fn parse_poll(r: &PollReply, interval: u64) -> Result<Poll> {
+    match (r.access_token.as_deref(), r.error.as_deref()) {
+        (Some(t), _) if !t.is_empty() => Ok(Poll::Token(t.to_string())),
+        (_, Some("authorization_pending")) => Ok(Poll::Pending),
+        (_, Some("slow_down")) => Ok(Poll::SlowDown(r.interval.unwrap_or(0).max(interval + 5))),
+        (_, Some("expired_token" | "token_expired")) => Ok(Poll::Expired),
+        (_, Some("access_denied")) => Ok(Poll::Denied),
+        (_, Some(code)) => bail!("GitHub sign-in failed: {code}"),
+        _ => bail!("GitHub sent an empty sign-in reply"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +356,106 @@ mod tests {
         let mut want = repo("octo-org/widget", None);
         want.private = true;
         assert_eq!(repos, [want]);
+    }
+
+    const SECRET: &str = "sentinel-secret-value";
+
+    fn poll(json: &str, interval: u64) -> Result<Poll> {
+        parse_poll(&serde_json::from_str(json).unwrap(), interval)
+    }
+
+    #[test]
+    fn poll_maps_every_documented_reply() {
+        let pending = r#"{"error":"authorization_pending","error_description":"x"}"#;
+        assert_eq!(poll(pending, 5).unwrap(), Poll::Pending);
+        let token =
+            format!(r#"{{"access_token":"{SECRET}","token_type":"bearer","scope":"repo"}}"#);
+        assert_eq!(poll(&token, 5).unwrap(), Poll::Token(SECRET.into()));
+        for expired in [
+            r#"{"error":"expired_token"}"#,
+            r#"{"error":"token_expired"}"#,
+        ] {
+            assert_eq!(poll(expired, 5).unwrap(), Poll::Expired, "{expired}");
+        }
+        assert_eq!(
+            poll(r#"{"error":"access_denied"}"#, 5).unwrap(),
+            Poll::Denied
+        );
+    }
+
+    #[test]
+    fn slow_down_uses_returned_interval_or_adds_five() {
+        let returned = r#"{"error":"slow_down","interval":10}"#;
+        assert_eq!(poll(returned, 5).unwrap(), Poll::SlowDown(10));
+        assert_eq!(
+            poll(r#"{"error":"slow_down"}"#, 5).unwrap(),
+            Poll::SlowDown(10)
+        );
+        assert_eq!(
+            poll(r#"{"error":"slow_down"}"#, 10).unwrap(),
+            Poll::SlowDown(15)
+        );
+        // A returned interval never makes polling faster than the documented +5s.
+        let lower = r#"{"error":"slow_down","interval":1}"#;
+        assert_eq!(poll(lower, 10).unwrap(), Poll::SlowDown(15));
+    }
+
+    #[test]
+    fn unknown_or_empty_poll_reply_is_an_error_naming_only_the_code() {
+        for code in [
+            "incorrect_device_code",
+            "device_flow_disabled",
+            "unsupported_grant_type",
+            "incorrect_client_credentials",
+        ] {
+            let json = format!(r#"{{"error":"{code}","error_description":"{SECRET}"}}"#);
+            let err = format!("{:#}", poll(&json, 5).unwrap_err());
+            assert!(err.contains(code), "{err}");
+            assert!(!err.contains(SECRET), "{err}");
+        }
+        assert!(poll("{}", 5).is_err());
+        assert!(poll(r#"{"access_token":""}"#, 5).is_err());
+    }
+
+    #[test]
+    fn device_code_reply_is_validated_with_default_timing() {
+        let json = format!(
+            r#"{{"device_code":"{SECRET}","user_code":"WDJB-MJHT",
+            "verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}}"#
+        );
+        let dc = parse_device_code(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(dc.device_code, SECRET);
+        assert_eq!(dc.user_code, "WDJB-MJHT");
+        assert_eq!(dc.verification_uri, "https://github.com/login/device");
+        assert_eq!((dc.expires_in, dc.interval), (900, 5));
+
+        let zero = format!(
+            r#"{{"device_code":"{SECRET}","user_code":"WDJB-MJHT",
+            "verification_uri":"https://github.com/login/device","expires_in":0,"interval":0}}"#
+        );
+        let dc = parse_device_code(serde_json::from_str(&zero).unwrap()).unwrap();
+        assert_eq!((dc.expires_in, dc.interval), (900, 5));
+
+        let err =
+            parse_device_code(serde_json::from_str(r#"{"error":"device_flow_disabled"}"#).unwrap())
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("device_flow_disabled"));
+        let partial = format!(r#"{{"device_code":"{SECRET}"}}"#);
+        let err = parse_device_code(serde_json::from_str(&partial).unwrap()).unwrap_err();
+        assert!(!format!("{err:#}").contains(SECRET));
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let dc = DeviceCode {
+            device_code: SECRET.into(),
+            user_code: "WDJB-MJHT".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            expires_in: 900,
+            interval: 5,
+        };
+        let shown = format!("{dc:?} {:?}", Poll::Token(SECRET.into()));
+        assert!(!shown.contains(SECRET), "{shown}");
+        assert!(shown.contains("WDJB-MJHT"));
     }
 }
