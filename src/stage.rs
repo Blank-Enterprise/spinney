@@ -150,10 +150,11 @@ pub fn stage_file(worktree: &Path, path: &str) -> Result<()> {
 }
 
 pub fn unstage_file(worktree: &Path, path: &str) -> Result<()> {
-    // `restore --staged` needs HEAD; before the first commit, drop the path from the index.
+    // `restore --staged` needs HEAD; before the first commit `reset` drops the path from the
+    // index (`rm --cached` would refuse once the file was edited after staging).
     let unborn = git::run(worktree, &["rev-parse", "--verify", "-q", "HEAD"]).is_err();
     let args: &[&str] = if unborn {
-        &["--literal-pathspecs", "rm", "--cached", "-q", "--", path]
+        &["--literal-pathspecs", "reset", "-q", "--", path]
     } else {
         &["--literal-pathspecs", "restore", "--staged", "--", path]
     };
@@ -435,9 +436,15 @@ mod tests {
         fs::write(d.join("new.txt"), "x\n").unwrap();
         stage_file(d, "new.txt").unwrap();
         assert_eq!(g(d, &["ls-files"]), "new.txt\n");
+        // Edited after staging: `rm --cached` would refuse (index differs from file and HEAD).
+        fs::write(d.join("new.txt"), "x\ny\n").unwrap();
         unstage_file(d, "new.txt").unwrap();
         assert!(g(d, &["ls-files"]).is_empty());
-        assert!(d.join("new.txt").exists(), "worktree file kept");
+        assert_eq!(
+            fs::read_to_string(d.join("new.txt")).unwrap(),
+            "x\ny\n",
+            "worktree kept"
+        );
     }
 
     #[test]
