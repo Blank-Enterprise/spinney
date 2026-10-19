@@ -1,7 +1,8 @@
 use super::{theme, toolbar::folder_name, Action, ProjectTab};
-use crate::project::Layout;
+use crate::project::{Layout, Worktree};
 use crate::refs::Branch;
 use eframe::egui::{self, RichText};
+use std::path::Path;
 
 /// Branches grouped by their `/` segments, GitKraken style: `feat/login` sits in `feat`.
 #[derive(Debug, PartialEq)]
@@ -136,12 +137,56 @@ pub fn filter_matches(query: &str, name: &str) -> bool {
     name.to_lowercase().contains(&query.trim().to_lowercase())
 }
 
-/// Full-width sidebar row; `right` is muted, right-aligned text.
+/// Full-width sidebar row; `right` is muted, right-aligned text. Text that doesn't fit is
+/// cut with "…": wrapping would stack a squeezed label one character per line.
 fn row(ui: &mut egui::Ui, on: bool, text: String, right: String) -> egui::Response {
     let b = egui::Button::selectable(on, text)
         .right_text(RichText::new(right).color(theme::MUTED))
+        .truncate()
         .min_size(egui::vec2(ui.available_width(), 0.0));
     ui.add(b)
+}
+
+/// The id of a Claude Code agent whose worktree this is (`.claude/worktrees/agent-<id>`).
+pub fn agent_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent()?;
+    let agents = parent.file_name()? == "worktrees" && parent.parent()?.file_name()? == ".claude";
+    (agents && name.starts_with("agent-")).then_some(name)
+}
+
+/// A worktree's row: its branch (what you know it as) or the detached commit, and a muted
+/// "agent" tag for an agent's worktree. The folder goes in the hover.
+pub fn worktree_label(wt: &Worktree) -> (String, String) {
+    let text = match &wt.branch {
+        Some(b) => b.clone(),
+        None => format!("detached at {}", short_sha(&wt.head)),
+    };
+    let tag = if agent_id(&wt.path).is_some() {
+        "agent"
+    } else {
+        ""
+    };
+    (text, tag.into())
+}
+
+/// Hover lines for a worktree: the agent (if any), branch, folder and full path.
+pub fn worktree_hover(wt: &Worktree) -> Vec<String> {
+    let mut lines = vec![];
+    if let Some(id) = agent_id(&wt.path) {
+        lines.push(format!("Claude Code agent worktree · {id}"));
+    }
+    lines.push(match &wt.branch {
+        Some(b) => format!("Branch {b} at {}", short_sha(&wt.head)),
+        None => format!("Detached at {}", short_sha(&wt.head)),
+    });
+    lines.push(format!("Folder {}", folder_name(&wt.path)));
+    lines.push(wt.path.display().to_string());
+    lines
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 fn section(
@@ -198,15 +243,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .collect();
         section(ui, "worktrees", "Worktrees", worktrees.len(), true, |ui| {
             for wt in worktrees {
-                let name = folder_name(&wt.path);
-                let branch = match &wt.branch {
-                    Some(b) if *b != name => b.clone(),
-                    Some(_) => String::new(),
-                    None => "detached".into(),
-                };
+                let (text, tag) = worktree_label(wt);
                 let on = wt.path == tab.active_worktree;
-                let r = row(ui, on, format!("▣ {name}"), branch)
-                    .on_hover_text(wt.path.display().to_string());
+                let r = row(ui, on, format!("▣ {text}"), tag).on_hover_ui(|ui| {
+                    // The agent line leads, in the accent colour; the path is muted.
+                    let lines = worktree_hover(wt);
+                    let agent = agent_id(&wt.path).is_some();
+                    for (i, line) in lines.iter().enumerate() {
+                        let color = match i {
+                            0 if agent => theme::ACCENT_TEXT,
+                            _ if i + 1 == lines.len() => theme::MUTED,
+                            _ => theme::TEXT,
+                        };
+                        ui.label(RichText::new(line).color(color));
+                    }
+                });
                 if r.clicked() {
                     actions.push(Action::ActivateWorktree(wt.path.clone()));
                 }
@@ -289,6 +340,67 @@ fn branch_menu(r: &egui::Response, layout: Layout, b: &Branch, actions: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn wt(path: &str, branch: Option<&str>) -> Worktree {
+        Worktree {
+            path: PathBuf::from(path),
+            branch: branch.map(str::to_string),
+            head: "83174b7246c76c9b6426a95147a715f0d26bf6c6".into(),
+            is_bare: false,
+        }
+    }
+
+    #[test]
+    fn agent_worktrees_are_recognised_by_path() {
+        let id = |p: &str| agent_id(Path::new(p)).map(str::to_string);
+        assert_eq!(
+            id("/p/spinney/.claude/worktrees/agent-a152de48b1153d030").as_deref(),
+            Some("agent-a152de48b1153d030")
+        );
+        assert_eq!(id("/p/spinney/feat-x"), None);
+        assert_eq!(
+            id("/p/spinney/.claude/worktrees/feat-x"),
+            None,
+            "not an agent"
+        );
+        assert_eq!(id("/p/worktrees/agent-1"), None, "not under .claude");
+        assert_eq!(id("/"), None);
+    }
+
+    #[test]
+    fn worktrees_are_labelled_by_branch() {
+        let long = "feat/merge-rebase-from-branch-menu";
+        let agent = wt(
+            "/p/spinney/.claude/worktrees/agent-a152de48b1153d030",
+            Some(long),
+        );
+        assert_eq!(worktree_label(&agent), (long.into(), "agent".into()));
+        let main = wt("/p/spinney", Some("main"));
+        assert_eq!(worktree_label(&main), ("main".into(), String::new()));
+        let detached = wt("/p/spinney/hotfix", None);
+        assert_eq!(
+            worktree_label(&detached),
+            ("detached at 83174b7".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn worktree_hover_names_agent_folder_and_path() {
+        let path = "/p/spinney/.claude/worktrees/agent-a152de48b1153d030";
+        let hover = worktree_hover(&wt(path, Some("feat/x")));
+        assert_eq!(
+            hover,
+            [
+                "Claude Code agent worktree · agent-a152de48b1153d030",
+                "Branch feat/x at 83174b7",
+                "Folder agent-a152de48b1153d030",
+                path,
+            ]
+        );
+        let hover = worktree_hover(&wt("/p/spinney", None));
+        assert_eq!(hover[0], "Detached at 83174b7", "no agent line");
+    }
 
     fn branch(name: &str) -> Branch {
         Branch {
