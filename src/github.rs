@@ -307,6 +307,39 @@ pub fn add_ssh_key(api_base: &str, token: &str, title: &str, key: &str) -> Resul
     }
 }
 
+/// Whether `token` lacks the `workflow` scope, so GitHub refuses pushes that change
+/// `.github/workflows/`. `false` when unknown: fine-grained tokens report no scopes.
+pub fn lacks_workflow_scope(api_base: &str, token: &str) -> Result<bool> {
+    if token.starts_with("github_pat_") {
+        return Ok(false); // fine-grained: permissions, not scopes
+    }
+    let resp = match agent()
+        .get(format!("{api_base}/user"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "spinney")
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(code)) => bail!("GitHub answered HTTP {code}"),
+        Err(e) => bail!("Could not reach GitHub: {e}"),
+    };
+    let scopes = resp
+        .headers()
+        .get("x-oauth-scopes")
+        .and_then(|v| v.to_str().ok());
+    Ok(scopes_lack_workflow(scopes))
+}
+
+/// An `X-OAuth-Scopes` value (`repo, read:org`) without `workflow`; absent or blank → `false`.
+pub fn scopes_lack_workflow(header: Option<&str>) -> bool {
+    match header.map(str::trim) {
+        None | Some("") => false,
+        Some(h) => !h.split(',').any(|s| s.trim() == "workflow"),
+    }
+}
+
 pub fn key_upload_outcome(status: u16) -> Result<KeyUpload> {
     match status {
         200..=299 => Ok(KeyUpload::Added),
@@ -367,6 +400,19 @@ mod tests {
             clone_url: format!("https://example.com/{full_name}.git"),
             pushed_at: None,
         }
+    }
+
+    #[test]
+    fn workflow_scope_from_header() {
+        assert!(scopes_lack_workflow(Some(
+            "repo, read:org, write:public_key"
+        )));
+        assert!(scopes_lack_workflow(Some("repo,read:org")));
+        assert!(!scopes_lack_workflow(Some("repo, workflow")));
+        assert!(!scopes_lack_workflow(Some("workflow")));
+        // Unknown (fine-grained tokens, no header) is not reported as missing.
+        assert!(!scopes_lack_workflow(None));
+        assert!(!scopes_lack_workflow(Some("  ")));
     }
 
     #[test]

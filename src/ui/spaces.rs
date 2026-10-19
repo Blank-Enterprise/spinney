@@ -9,7 +9,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 const SCOPE_HINT: &str =
-    "A classic token with repo, read:org, write:public_key (to add SSH keys) and workflow.";
+    "A classic token with repo, read:org, write:public_key (to add SSH keys) and workflow \
+     (to push workflow files). Fine-grained tokens need Workflows: read and write.";
 
 /// "● Space ▾" menu: pick a space, or create/edit one.
 pub fn switcher(ui: &mut egui::Ui, cfg: &Config, actions: &mut Vec<Action>) {
@@ -43,6 +44,7 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
     let (mut result, mut browse) = (None, false);
     e.poll_auth(ctx);
     e.poll_ssh(ctx);
+    e.poll_scopes(ctx);
     let title = if e.id.is_some() {
         "Edit space"
     } else {
@@ -141,6 +143,11 @@ fn token_account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
         ui.label(egui::RichText::new("Token ready, saved with the space ✓").color(theme::ADDED));
     } else if e.keychain_usable() {
         ui.label(egui::RichText::new("Connected ✓").color(theme::ADDED));
+        if e.lacks_workflow() {
+            ui.label(theme::caption(
+                "This token can't push workflow files. Create one with the workflow scope.",
+            ));
+        }
     } else {
         ui.label(theme::caption(
             "Connect to browse your repositories and add SSH keys.",
@@ -179,6 +186,7 @@ fn token_account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
 fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
     ui.label(theme::section("GitHub account"));
     let (mut next, mut sign_out) = (None, false);
+    let lacks_workflow = e.lacks_workflow();
     match &mut e.auth {
         Auth::SignedOut | Auth::Failed(_) => {
             if let Auth::Failed(why) = &e.auth {
@@ -245,6 +253,15 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
                 ui.label(theme::caption(
                     "Saved to the Keychain when you save the space.",
                 ));
+            } else if lacks_workflow {
+                ui.horizontal(|ui| {
+                    ui.label(theme::caption(
+                        "Sign in again to allow pushing workflow files.",
+                    ));
+                    if ui.button("Sign in again").clicked() {
+                        next = Some(start(ui.ctx()));
+                    }
+                });
             }
             if *confirm {
                 ui.horizontal(|ui| {
@@ -536,6 +553,17 @@ enum Upload {
     Failed(String),
 }
 
+/// Whether the Keychain token may push workflow files (it needs the `workflow` scope).
+#[derive(Default)]
+enum ScopeCheck {
+    /// Not asked yet; asked once while the editor is open with a Keychain token.
+    #[default]
+    Unchecked,
+    Running(Receiver<bool>),
+    /// `true` = the token lacks `workflow`. Unknown or failed counts as `false`.
+    Done(bool),
+}
+
 /// Editor buffer for a new (`id: None`) or existing space. The PAT is write-only.
 #[derive(Default)]
 pub struct SpaceEdit {
@@ -558,6 +586,7 @@ pub struct SpaceEdit {
     /// Why "Use GitHub CLI login" found no token.
     cli_error: Option<String>,
     upload: Upload,
+    scopes: ScopeCheck,
 }
 
 /// What saving a space does with its Keychain token.
@@ -610,6 +639,7 @@ impl SpaceEdit {
             ssh_with_sign_in: false,
             cli_error: None,
             upload: Upload::Idle,
+            scopes: ScopeCheck::Unchecked,
         }
         .resting()
     }
@@ -682,6 +712,7 @@ impl SpaceEdit {
             held,
             confirm: false,
         };
+        self.scopes = ScopeCheck::Done(false); // a new sign-in asks for `workflow`
         store
     }
 
@@ -786,6 +817,46 @@ impl SpaceEdit {
         }
         let id = self.id.as_ref().filter(|_| self.keychain_usable())?;
         creds::get_token(id).ok().flatten()
+    }
+
+    /// The Keychain token is known to lack `workflow` (and is still this space's token).
+    fn lacks_workflow(&self) -> bool {
+        matches!(self.scopes, ScopeCheck::Done(true)) && self.keychain_usable()
+    }
+
+    /// Ask GitHub once which scopes the Keychain token has; take the answer when it arrives.
+    fn poll_scopes(&mut self, ctx: &egui::Context) {
+        match &self.scopes {
+            ScopeCheck::Unchecked if self.keychain_usable() => {
+                let token = self
+                    .id
+                    .as_ref()
+                    .and_then(|id| creds::get_token(id).ok().flatten());
+                let Some(token) = token else {
+                    return self.scopes = ScopeCheck::Done(false);
+                };
+                let api_base = Space {
+                    host: self.saved_host.clone(),
+                    ..Default::default()
+                }
+                .api_base();
+                let (tx, rx) = mpsc::channel();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let lacks = github::lacks_workflow_scope(&api_base, &token).unwrap_or(false);
+                    if tx.send(lacks).is_ok() {
+                        ctx.request_repaint();
+                    }
+                });
+                self.scopes = ScopeCheck::Running(rx);
+            }
+            ScopeCheck::Running(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.scopes = ScopeCheck::Done(false),
+                Ok(lacks) => self.scopes = ScopeCheck::Done(lacks),
+            },
+            _ => {}
+        }
     }
 
     /// Take a finished upload; start a pending one once a token is available.
@@ -1096,6 +1167,20 @@ mod tests {
             matches!(e.auth, Auth::SignedIn { held: None, .. }),
             "Keychain kept"
         );
+    }
+
+    #[test]
+    fn workflow_hint_only_for_the_stored_token() {
+        let (cfg, _) = saved_github_space();
+        let mut e = SpaceEdit::from_space(&cfg.spaces[0], true);
+        assert!(!e.lacks_workflow(), "not checked yet");
+        e.scopes = ScopeCheck::Done(true);
+        assert!(e.lacks_workflow());
+        e.host = "github.example.com".into();
+        assert!(!e.lacks_workflow(), "the token belongs to the old host");
+        e.host = "github.com".into();
+        e.accept_token("new".into());
+        assert!(!e.lacks_workflow(), "a new sign-in has the scope");
     }
 
     #[test]
