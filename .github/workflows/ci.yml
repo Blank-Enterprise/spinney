@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Git identity for test fixtures
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+      - run: cargo fmt --check
+      - run: cargo build --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: bash scripts/leak-check.sh
