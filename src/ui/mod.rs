@@ -258,7 +258,7 @@ struct JobDone {
     /// The project the job is about (for a clone, the folder being created).
     root: PathBuf,
     space_id: String,
-    result: Result<(), String>,
+    result: anyhow::Result<()>,
 }
 
 /// Background git work (network, clone, commit-graph). Workers wake the UI when done, so
@@ -292,7 +292,7 @@ impl Jobs {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.active.push((kind, root.clone()));
         std::thread::spawn(move || {
-            let result = work().map_err(|e| format!("{e:#}"));
+            let result = work();
             let _ = tx.send(JobDone {
                 kind,
                 root,
@@ -389,6 +389,11 @@ pub enum Action {
     AskDiscardAll,
     DiscardAll,
     CancelDiscard,
+    /// From the rejected-push bar: `AskForcePush` asks to confirm, `ForcePush` does it
+    /// (with lease), `DismissPush` hides the bar.
+    AskForcePush,
+    ForcePush,
+    DismissPush,
     /// Tick or untick "Amend previous commit".
     SetAmend(bool),
     /// Commit or amend; amending a pushed HEAD asks first (`ConfirmAmend` / `CancelAmend`).
@@ -419,6 +424,15 @@ pub struct SpinneyApp {
     confirm_discard: Option<PathBuf>,
     /// Root of the tab whose amend of a pushed HEAD is awaiting confirmation.
     confirm_amend: Option<PathBuf>,
+    /// The last push rejected as non-fast-forward, offering Pull or Force push… in the top bar.
+    rejected_push: Option<RejectedPush>,
+}
+
+struct RejectedPush {
+    root: PathBuf,
+    rejected: actions::PushRejected,
+    /// Set by Force push…: the lease to confirm, snapshotted from the tracking ref then.
+    lease: Option<actions::Lease>,
 }
 
 impl SpinneyApp {
@@ -447,6 +461,7 @@ impl SpinneyApp {
             focused: true,
             confirm_discard: None,
             confirm_amend: None,
+            rejected_push: None,
         };
         app.open_visible_tabs();
         app
@@ -507,7 +522,16 @@ impl SpinneyApp {
             result,
         } = done;
         if let Err(e) = result {
-            self.errors.push(format!("{kind:?} failed: {e}"));
+            match e.downcast::<actions::PushRejected>() {
+                Ok(rejected) => {
+                    self.rejected_push = Some(RejectedPush {
+                        root,
+                        rejected,
+                        lease: None,
+                    })
+                }
+                Err(e) => self.errors.push(format!("{kind:?} failed: {e:#}")),
+            }
             return;
         }
         match kind {
@@ -607,8 +631,39 @@ impl SpinneyApp {
                 self.dialogs.create = self.space().as_ref().map(CreateDialog::new)
             }
             Action::Fetch => self.network(JobKind::Fetch),
-            Action::Pull => self.network(JobKind::Pull),
-            Action::Push => self.network(JobKind::Push),
+            Action::Pull => {
+                self.rejected_push = None;
+                self.network(JobKind::Pull)
+            }
+            Action::Push => {
+                self.rejected_push = None;
+                self.network(JobKind::Push)
+            }
+            Action::AskForcePush => {
+                if let Some(r) = &mut self.rejected_push {
+                    match actions::lease(&r.rejected.worktree) {
+                        Ok(lease) if lease.branch == r.rejected.branch => r.lease = Some(lease),
+                        // Switched branch since the push: never force push a different one.
+                        Ok(_) => {
+                            self.rejected_push = None;
+                            errors.push("force push: the branch changed since the push".into());
+                        }
+                        Err(e) => errors.push(format!("force push: {e:#}")),
+                    }
+                }
+            }
+            Action::ForcePush => {
+                if let Some(RejectedPush {
+                    root,
+                    lease: Some(lease),
+                    ..
+                }) = self.rejected_push.take()
+                {
+                    let work = move || actions::force_push(&lease);
+                    self.jobs.spawn(JobKind::Push, root, String::new(), work);
+                }
+            }
+            Action::DismissPush => self.rejected_push = None,
             Action::ToggleInline => {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
@@ -858,6 +913,71 @@ impl SpinneyApp {
         });
     }
 
+    /// The rejected push, when it was for the active tab's active worktree.
+    fn push_tab(&self) -> Option<&RejectedPush> {
+        let r = self.rejected_push.as_ref()?;
+        if self.showing_new_tab() {
+            return None;
+        }
+        let tab = self.tabs.get(self.active_tab)?;
+        (tab.root == r.root && tab.active_worktree == r.rejected.worktree).then_some(r)
+    }
+
+    /// "Push rejected" with Pull / Force push…, then the force push confirmation.
+    fn push_bar(ui: &mut egui::Ui, r: &RejectedPush, busy: bool, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            let branch = &r.rejected.branch;
+            let text = match &r.lease {
+                None => format!(
+                    "Push of {branch} was rejected: the remote has commits this branch doesn't."
+                ),
+                Some(l) => {
+                    let lost = match l.lost {
+                        0 => "Commits on the remote that aren't on this branch".to_string(),
+                        1 => format!("1 commit on {} that isn't on this branch", l.tracking),
+                        n => format!("{n} commits on {} that aren't on this branch", l.tracking),
+                    };
+                    format!(
+                        "Force push {}? {lost} will be lost. If someone pushed since your \
+                         last fetch, the push is refused.",
+                        l.branch
+                    )
+                }
+            };
+            let icon = if r.lease.is_some() { "⚠" } else { "↑" };
+            ui.label(egui::RichText::new(icon).color(theme::WARN));
+            ui.label(egui::RichText::new(text).color(theme::TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() {
+                    actions.push(Action::DismissPush);
+                }
+                ui.add_enabled_ui(!busy, |ui| {
+                    if r.lease.is_some() {
+                        let force = egui::Button::new(
+                            egui::RichText::new("Force push")
+                                .color(theme::ON_ACCENT)
+                                .strong(),
+                        )
+                        .fill(theme::DELETED)
+                        .small();
+                        if ui.add(force).clicked() {
+                            actions.push(Action::ForcePush);
+                        }
+                    } else {
+                        if ui.small_button("Force push…").clicked() {
+                            actions.push(Action::AskForcePush);
+                        }
+                        if ui.small_button("Pull").clicked() {
+                            actions.push(Action::Pull);
+                        }
+                    }
+                })
+                .response
+                .on_disabled_hover_text("Waiting for the running job");
+            });
+        });
+    }
+
     fn error_banner(&mut self, ui: &mut egui::Ui) {
         let mut dismiss = None;
         for (i, e) in self.errors.iter().enumerate() {
@@ -976,6 +1096,20 @@ impl eframe::App for SpinneyApp {
                     .frame(bar)
                     .show(ui, |ui| Self::amend_bar(ui, &mut actions));
             }
+        }
+        if let Some(r) = self.push_tab() {
+            let busy = self.jobs.network_busy(&r.root);
+            let fill = if r.lease.is_some() {
+                theme::DIFF_DEL
+            } else {
+                theme::PANEL
+            };
+            let bar = egui::Frame::new()
+                .fill(fill)
+                .inner_margin(Margin::symmetric(14, 6));
+            egui::Panel::top("push_rejected")
+                .frame(bar)
+                .show(ui, |ui| Self::push_bar(ui, r, busy, &mut actions));
         }
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
@@ -1266,6 +1400,7 @@ mod tests {
             focused: true,
             confirm_discard: None,
             confirm_amend: None,
+            rejected_push: None,
         }
     }
 
@@ -1335,6 +1470,37 @@ mod tests {
             .iter()
             .any(|e| e.starts_with("CommitGraph failed")));
         assert!(app.config.spaces[1].projects.contains(&root), "still added");
+    }
+
+    #[test]
+    fn rejected_push_shows_bar_instead_of_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let proj = repo(1);
+        let rejected = actions::PushRejected {
+            worktree: proj.path().to_path_buf(),
+            branch: "main".into(),
+        };
+        app.job_done(JobDone {
+            kind: JobKind::Push,
+            root: proj.path().to_path_buf(),
+            space_id: String::new(),
+            result: Err(rejected.clone().into()),
+        });
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.rejected_push.as_ref().unwrap().rejected, rejected);
+
+        // No remote-tracking ref to lease against: say so, and do not ask to confirm.
+        app.apply(Action::AskForcePush);
+        assert!(app.errors[0].contains("fetch first"), "{:?}", app.errors);
+        assert!(app.rejected_push.as_ref().unwrap().lease.is_none());
+        app.apply(Action::ForcePush);
+        assert!(
+            app.jobs.active.is_empty(),
+            "nothing confirmed, nothing pushed"
+        );
+        app.apply(Action::DismissPush);
+        assert!(app.rejected_push.is_none());
     }
 
     #[test]

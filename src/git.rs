@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
@@ -65,6 +65,14 @@ fn exec(dir: &Path, args: &[&str], stdin: &[u8], ok: &[i32]) -> Result<Vec<u8>> 
     let result = finish(child, args, ok);
     let _ = writer.join();
     result
+}
+
+/// Run git in `dir` and return its status, stdout and stderr, whatever the exit code.
+pub fn output(dir: &Path, args: &[&str]) -> Result<Output> {
+    command(dir, args)
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to spawn git")
 }
 
 /// Spawn git with stdout piped for streaming; the caller owns the child.
