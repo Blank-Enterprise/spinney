@@ -1023,6 +1023,24 @@ impl SpinneyApp {
             .filter(|t| t.root == root)
     }
 
+    /// Drop the confirmations pending for `root`: they name files and worktrees that a
+    /// conversion is about to move, so they must not come back when its tab reopens.
+    fn forget_pending(&mut self, root: &Path) {
+        if self
+            .confirm_discard
+            .as_ref()
+            .is_some_and(|(r, _)| r == root)
+        {
+            self.confirm_discard = None;
+        }
+        if self.confirm_amend.as_deref() == Some(root) {
+            self.confirm_amend = None;
+        }
+        if self.rejected_push.as_ref().is_some_and(|r| r.root == root) {
+            self.rejected_push = None;
+        }
+    }
+
     /// "The last commit is already pushed" with Amend / Cancel.
     fn amend_bar(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
@@ -1702,6 +1720,34 @@ mod tests {
         );
         app.apply(Action::DismissPush);
         assert!(app.rejected_push.is_none());
+    }
+
+    #[test]
+    fn converting_forgets_only_that_projects_confirmations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let (root, other) = (PathBuf::from("/p/root"), PathBuf::from("/p/other"));
+        let rejected = |r: &Path| RejectedPush {
+            root: r.to_path_buf(),
+            rejected: actions::PushRejected {
+                worktree: r.to_path_buf(),
+                branch: "main".into(),
+            },
+            lease: None,
+        };
+        app.confirm_discard = Some((root.clone(), Discard::All));
+        app.confirm_amend = Some(root.clone());
+        app.rejected_push = Some(rejected(&root));
+        app.forget_pending(&root);
+        assert!(app.confirm_discard.is_none() && app.confirm_amend.is_none());
+        assert!(app.rejected_push.is_none());
+
+        app.confirm_discard = Some((other.clone(), Discard::All));
+        app.confirm_amend = Some(other.clone());
+        app.rejected_push = Some(rejected(&other));
+        app.forget_pending(&root);
+        assert!(app.confirm_discard.is_some() && app.confirm_amend.is_some());
+        assert!(app.rejected_push.is_some());
     }
 
     #[test]

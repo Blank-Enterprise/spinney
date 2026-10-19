@@ -368,11 +368,7 @@ impl SpinneyApp {
                     drop.label
                 ));
                 ui.horizontal(|ui| {
-                    let button = egui::Button::new(
-                        egui::RichText::new("Drop").color(theme::ON_ACCENT).strong(),
-                    )
-                    .fill(theme::DELETED);
-                    if ui.add(button).clicked() {
+                    if ui.add(danger("Drop")).clicked() {
                         result = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -471,6 +467,7 @@ impl SpinneyApp {
         if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
             self.close_tab(i);
         }
+        self.forget_pending(&root);
         let target = root.join(&plan.target_dir_name);
         self.converting.push((root.clone(), target));
         let id = space.id.clone();
