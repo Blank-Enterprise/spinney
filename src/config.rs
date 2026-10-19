@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)] // a field added later must not break older configs (and the credential helper)
 pub struct Space {
     pub id: String,
     pub name: String,
@@ -100,6 +101,19 @@ mod tests {
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), cfg);
+    }
+
+    #[test]
+    fn space_missing_fields_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let toml = "[[spaces]]\nid = \"w-1\"\nname = \"Work\"\nhost = \"github.com\"\n\
+                    author_name = \"Test User\"\nauthor_email = \"test@example.com\"\n";
+        std::fs::write(&path, toml).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.spaces[0].id, "w-1");
+        assert!(cfg.spaces[0].projects.is_empty());
+        assert_eq!(cfg.spaces[0].default_clone_dir, None);
     }
 
     #[test]
