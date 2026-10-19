@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash scripts/check.sh)",
+      "Bash(bash scripts/leak-check.sh)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo test *)",
+      "Bash(cargo build *)",
+      "Bash(cargo check *)",
+      "Bash(cargo run *)",
+      "Bash(cargo metadata *)",
+      "Bash(cargo tree *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch --show-current)",
+      "Bash(git worktree list *)",
+      "Bash(git fetch *)",
+      "Bash(gh issue view *)",
+      "Bash(gh issue list *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr list *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh pr diff *)",
+      "Bash(gh run list *)",
+      "Bash(gh run view *)"
+    ]
+  }
+}
