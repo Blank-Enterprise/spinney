@@ -3,6 +3,7 @@ mod config;
 mod creds;
 mod diff;
 mod git;
+mod github;
 mod graph;
 mod project;
 mod refs;
