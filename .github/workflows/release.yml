@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable
-      - run: cargo test
+      - run: cargo test --locked
       - run: bash scripts/leak-check.sh
       - run: bash scripts/bundle.sh "${GITHUB_REF_NAME#v}"
       - run: gh release create "$GITHUB_REF_NAME" dist/Spinney-macos-arm64.zip --generate-notes

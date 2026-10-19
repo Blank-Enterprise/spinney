@@ -5,7 +5,7 @@ set -euo pipefail
 version="${1:?usage: bundle.sh <version>}"
 cd "$(dirname "$0")/.."
 
-cargo build --release
+cargo build --release --locked
 
 rm -rf dist
 mkdir -p dist/Spinney.app/Contents/MacOS
