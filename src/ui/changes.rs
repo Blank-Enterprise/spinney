@@ -147,16 +147,29 @@ fn file_list(
         };
         if let Some((label, action)) = all {
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let enabled = !files.is_empty() && !conflicts;
+                let why = if conflicts {
+                    "Resolve conflicts first"
+                } else {
+                    "Nothing to do"
+                };
                 let b = egui::Button::new(RichText::new(label).size(11.5)).small();
-                let r = ui
-                    .add_enabled(!files.is_empty() && !conflicts, b)
-                    .on_disabled_hover_text(if conflicts {
-                        "Resolve conflicts first"
-                    } else {
-                        "Nothing to do"
-                    });
-                if r.clicked() {
+                if ui
+                    .add_enabled(enabled, b)
+                    .on_disabled_hover_text(why)
+                    .clicked()
+                {
                     actions.push(action);
+                }
+                if list == List::Unstaged {
+                    let bin = egui::Button::new(RichText::new("🗑").size(12.0)).small();
+                    let r = ui
+                        .add_enabled(enabled, bin)
+                        .on_hover_text("Discard all changes")
+                        .on_disabled_hover_text(why);
+                    if r.clicked() {
+                        actions.push(Action::AskDiscardAll);
+                    }
                 }
             });
         }
@@ -330,6 +343,20 @@ impl ProjectTab {
         };
         if let Err(e) = res {
             errors.push(format!("{e:#}"));
+        }
+        self.after_stage(errors);
+    }
+
+    /// Discard every unstaged change: tracked files back to the index, untracked ones deleted.
+    pub(super) fn discard_all(&mut self, errors: &mut Vec<String>) {
+        let (untracked, tracked): (Vec<FileStatus>, Vec<FileStatus>) = (self.status.unstaged)
+            .iter()
+            .cloned()
+            .partition(|f| f.change == Change::Untracked);
+        let untracked: Vec<&str> = untracked.iter().map(|f| f.path.as_str()).collect();
+        let tracked = change_paths(&tracked);
+        if let Err(e) = stage::discard_files(&self.active_worktree, &tracked, &untracked) {
+            errors.push(format!("discard: {e:#}"));
         }
         self.after_stage(errors);
     }
