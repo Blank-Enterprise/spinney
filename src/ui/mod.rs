@@ -16,7 +16,8 @@ use crate::graph::{LogStream, Row};
 use crate::project::{self, Layout, Worktree};
 use crate::refs::{self, Branch};
 use crate::stage::Direction;
-use crate::status::{FileStatus, Status};
+use crate::stash::{self, Stash};
+use crate::status::{self, FileStatus, Status};
 use crate::{creds, git};
 use dialogs::{CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui::{self, Margin};
@@ -112,6 +113,7 @@ pub struct ProjectTab {
     worktrees: Vec<Worktree>,
     active_worktree: PathBuf,
     branches: Vec<Branch>,
+    stashes: Vec<Stash>,
     log: LogPager,
     rows: Vec<Row>,
     selected_commit: Option<usize>,
@@ -176,6 +178,7 @@ impl ProjectTab {
             log: LogPager::start(active_worktree.clone(), ctx.clone()),
             active_worktree,
             branches: vec![],
+            stashes: vec![],
             rows: vec![],
             selected_commit: None,
             commit_files: vec![],
@@ -188,6 +191,7 @@ impl ProjectTab {
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
+        tab.load_stashes(errors);
         tab.reload_changes(errors);
         Ok(tab)
     }
@@ -215,6 +219,7 @@ impl ProjectTab {
             }
         }
         self.load_branches(errors);
+        self.load_stashes(errors);
         self.log = LogPager::start(self.active_worktree.clone(), ctx.clone());
         self.log.request(PAGE);
         self.rows.clear();
@@ -228,6 +233,72 @@ impl ProjectTab {
             Ok(b) => self.branches = b,
             Err(e) => errors.push(format!("branches: {e:#}")),
         }
+    }
+
+    fn load_stashes(&mut self, errors: &mut Vec<String>) {
+        match stash::list(&self.active_worktree) {
+            Ok(s) => self.stashes = s,
+            Err(e) => errors.push(format!("stashes: {e:#}")),
+        }
+    }
+
+    /// Run a stash action in `wt`, refresh, and return a notice to show (if any).
+    /// Apply/Pop/DropConfirmed name the stash by hash and re-resolve its current index.
+    fn stash_action(
+        &mut self,
+        action: Action,
+        wt: &Path,
+        ctx: &egui::Context,
+        errors: &mut Vec<String>,
+    ) -> Option<String> {
+        let conflicted = |wt: &Path| -> Vec<String> {
+            status::status(wt)
+                .map(|s| s.conflicted.into_iter().map(|f| f.path).collect())
+                .unwrap_or_default()
+        };
+        let before = conflicted(wt);
+        let mut notice = None;
+        let mut applies = false;
+        let (pop, drop) = (
+            matches!(action, Action::PopStash(_)),
+            matches!(action, Action::DropStashConfirmed(_)),
+        );
+        let res = match action {
+            Action::Stash => stash::save(wt, None).map(|saved| {
+                if !saved {
+                    notice = Some("Nothing to stash".to_string());
+                }
+            }),
+            Action::ApplyStash(h) | Action::PopStash(h) | Action::DropStashConfirmed(h) => {
+                applies = !drop;
+                match stash::index_of(wt, &h) {
+                    Ok(Some(i)) if drop => stash::drop(wt, i),
+                    Ok(Some(i)) if pop => stash::pop(wt, i),
+                    Ok(Some(i)) => stash::apply(wt, i),
+                    Ok(None) => {
+                        self.refresh(ctx, errors);
+                        return Some("Stash list changed — refreshed".to_string());
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => return None,
+        };
+        self.refresh(ctx, errors);
+        if let Err(e) = res {
+            // A conflicted apply/pop exits non-zero; the Conflicted list shows the files.
+            let new_conflicts = self
+                .status
+                .conflicted
+                .iter()
+                .any(|f| !before.contains(&f.path));
+            if applies && new_conflicts {
+                notice = Some("Stash applied with conflicts".to_string());
+            } else {
+                errors.push(format!("{e:#}"));
+            }
+        }
+        notice
     }
 
     /// Append any page that arrived; returns an error message from the worker.
@@ -251,6 +322,8 @@ enum JobKind {
     /// `git push <remote> --delete`, run like a push.
     DeleteRemote,
     CommitGraph,
+    /// Normal clone to worktree layout; the project's tab is closed while it runs.
+    Convert,
 }
 
 struct JobDone {
@@ -330,6 +403,11 @@ impl Jobs {
         self.active.iter().any(|(k, r)| *k == kind && r == root)
     }
 
+    /// Any job is in flight for `root`.
+    fn busy(&self, root: &Path) -> bool {
+        self.active.iter().any(|(_, r)| r == root)
+    }
+
     /// A fetch, pull, push or remote branch delete is in flight for `root`.
     fn network_busy(&self, root: &Path) -> bool {
         [
@@ -379,6 +457,15 @@ pub enum Action {
     Fetch,
     Pull,
     Push,
+    /// Stash all changes (untracked included).
+    Stash,
+    /// Stash commit hashes, so a stale list can never hit another stash.
+    ApplyStash(String),
+    PopStash(String),
+    /// Ask to drop a stash (hash, label): opens the confirm dialog.
+    RequestDropStash(String, String),
+    /// Drop after confirmation; only the dialog sends this.
+    DropStashConfirmed(String),
     Checkout(String),
     NewWorktreeFrom(String),
     /// Ask before deleting a local branch (refused when a worktree has it checked out).
@@ -389,6 +476,10 @@ pub enum Action {
     NewBranch(String),
     /// Open Terminal.app at the active worktree.
     OpenTerminal,
+    /// Show the convert-to-worktree-layout confirm screen for a project.
+    RequestConvert(PathBuf),
+    /// "Not now" on the convert banner: hide it for that project for good.
+    DismissConvert(PathBuf),
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
     SelectCommit(usize),
@@ -427,6 +518,8 @@ pub struct SpinneyApp {
     active_tab: usize,
     jobs: Jobs,
     errors: Vec<String>,
+    /// Non-error banner messages.
+    notices: Vec<String>,
     dialogs: Dialogs,
     /// The New Tab page is showing over the open tabs (it always shows when there are none).
     new_tab: bool,
@@ -441,6 +534,8 @@ pub struct SpinneyApp {
     confirm_amend: Option<PathBuf>,
     /// The last push rejected as non-fast-forward, offering Pull or Force push… in the top bar.
     rejected_push: Option<RejectedPush>,
+    /// Conversions in flight: (project root, worktree to activate afterwards).
+    converting: Vec<(PathBuf, PathBuf)>,
 }
 
 struct RejectedPush {
@@ -469,12 +564,14 @@ impl SpinneyApp {
             active_tab: 0,
             jobs: Jobs::new(ctx.clone()),
             errors,
+            notices: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
             ctx,
             focused: true,
             confirm_discard: None,
+            converting: vec![],
             confirm_amend: None,
             rejected_push: None,
         };
@@ -504,6 +601,14 @@ impl SpinneyApp {
     }
 
     fn open_tab(&mut self, root: &Path, space: &Space) {
+        if self.jobs.running(JobKind::Convert, root) {
+            // Its files are moving; git must not run on it until the job is done.
+            self.notices.push(format!(
+                "{} is being converted; it reopens when done",
+                root.display()
+            ));
+            return;
+        }
         match ProjectTab::open(root, space, &self.ctx, &mut self.jobs, &mut self.errors) {
             Ok(tab) => {
                 self.tabs.push(tab);
@@ -536,6 +641,9 @@ impl SpinneyApp {
             space_id,
             result,
         } = done;
+        if kind == JobKind::Convert {
+            return self.convert_done(root, result);
+        }
         if let Err(e) = result {
             match e.downcast::<actions::PushRejected>() {
                 Ok(rejected) => {
@@ -573,7 +681,7 @@ impl SpinneyApp {
                 }
                 self.errors.extend(errors);
             }
-            JobKind::CommitGraph => {}
+            JobKind::CommitGraph | JobKind::Convert => {}
         }
     }
 
@@ -679,6 +787,24 @@ impl SpinneyApp {
                 }
             }
             Action::DismissPush => self.rejected_push = None,
+            Action::Stash | Action::ApplyStash(_) | Action::PopStash(_) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    let wt = tab.active_worktree.clone();
+                    let notice = tab.stash_action(action, &wt, &ctx, &mut errors);
+                    self.notices.extend(notice);
+                }
+            }
+            Action::DropStashConfirmed(_) => {} // sent by the confirm dialog only
+            Action::RequestDropStash(hash, label) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    self.dialogs.confirm_drop_stash = Some(dialogs::DropStash {
+                        root: tab.root.clone(),
+                        worktree: tab.active_worktree.clone(),
+                        hash,
+                        label,
+                    });
+                }
+            }
             Action::ToggleInline => {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
@@ -777,6 +903,16 @@ impl SpinneyApp {
                     }
                 }
             }
+            Action::RequestConvert(root) => {
+                let plan = crate::convert::plan(&root).map_err(|e| format!("{e:#}"));
+                self.dialogs.convert = Some(dialogs::ConvertDialog { root, plan });
+            }
+            Action::DismissConvert(root) => {
+                if !self.config.convert_dismissed.contains(&root) {
+                    self.config.convert_dismissed.push(root);
+                    self.save_config();
+                }
+            }
             Action::Checkout(name) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     checkout(tab, &name, &mut errors);
@@ -860,6 +996,11 @@ impl SpinneyApp {
         }
     }
 
+    /// Whether to show the "normal clone" banner for `tab`.
+    fn offer_convert(&self, tab: &ProjectTab) -> bool {
+        tab.layout == Layout::NormalClone && !self.config.convert_dismissed.contains(&tab.root)
+    }
+
     /// Whether the centre shows the New Tab page instead of the active project.
     fn showing_new_tab(&self) -> bool {
         self.new_tab || self.tabs.is_empty()
@@ -880,6 +1021,24 @@ impl SpinneyApp {
         self.tabs
             .get_mut(self.active_tab)
             .filter(|t| t.root == root)
+    }
+
+    /// Drop the confirmations pending for `root`: they name files and worktrees that a
+    /// conversion is about to move, so they must not come back when its tab reopens.
+    fn forget_pending(&mut self, root: &Path) {
+        if self
+            .confirm_discard
+            .as_ref()
+            .is_some_and(|(r, _)| r == root)
+        {
+            self.confirm_discard = None;
+        }
+        if self.confirm_amend.as_deref() == Some(root) {
+            self.confirm_amend = None;
+        }
+        if self.rejected_push.as_ref().is_some_and(|r| r.root == root) {
+            self.rejected_push = None;
+        }
     }
 
     /// "The last commit is already pushed" with Amend / Cancel.
@@ -1013,6 +1172,18 @@ impl SpinneyApp {
         if let Some(i) = dismiss {
             self.errors.remove(i);
         }
+        let mut dismiss = None;
+        for (i, n) in self.notices.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::ACCENT_TEXT, n);
+                if ui.small_button("Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
+        if let Some(i) = dismiss {
+            self.notices.remove(i);
+        }
     }
 }
 
@@ -1065,6 +1236,7 @@ impl eframe::App for SpinneyApp {
         if focused && !self.focused {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.reload_changes(&mut self.errors);
+                tab.load_stashes(&mut self.errors);
             }
         }
         self.focused = focused;
@@ -1091,6 +1263,24 @@ impl eframe::App for SpinneyApp {
                     let running = |k| jobs.running(k, &tab.root);
                     toolbar::toolbar(ui, tab, projects, busy, running, &mut actions)
                 });
+                if self.offer_convert(tab) {
+                    let root = tab.root.clone();
+                    egui::Panel::top("convert_offer").frame(bar).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("This project uses a normal clone");
+                            ui.label(theme::caption(
+                                "Convert it to the worktree layout to work on several \
+                                 branches side by side.",
+                            ));
+                            if ui.add(theme::primary("Convert…")).clicked() {
+                                actions.push(Action::RequestConvert(root.clone()));
+                            }
+                            if ui.button("Not now").clicked() {
+                                actions.push(Action::DismissConvert(root));
+                            }
+                        });
+                    });
+                }
             }
         }
         let question = self.confirm_discard.clone().and_then(|(_, what)| {
@@ -1137,7 +1327,7 @@ impl eframe::App for SpinneyApp {
                 .frame(bar)
                 .show(ui, |ui| Self::push_bar(ui, r, busy, &mut actions));
         }
-        if !self.errors.is_empty() {
+        if !self.errors.is_empty() || !self.notices.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
         let shortcuts = !self.dialogs.any_open();
@@ -1283,6 +1473,7 @@ mod tests {
             ],
             active_space: Some("a".into()),
             diff_inline: false,
+            convert_dismissed: vec![],
         }
     }
 
@@ -1419,12 +1610,14 @@ mod tests {
             active_tab: 0,
             jobs: Jobs::new(ctx.clone()),
             errors: vec![],
+            notices: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
             ctx,
             focused: true,
             confirm_discard: None,
+            converting: vec![],
             confirm_amend: None,
             rejected_push: None,
         }
@@ -1527,6 +1720,34 @@ mod tests {
         );
         app.apply(Action::DismissPush);
         assert!(app.rejected_push.is_none());
+    }
+
+    #[test]
+    fn converting_forgets_only_that_projects_confirmations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let (root, other) = (PathBuf::from("/p/root"), PathBuf::from("/p/other"));
+        let rejected = |r: &Path| RejectedPush {
+            root: r.to_path_buf(),
+            rejected: actions::PushRejected {
+                worktree: r.to_path_buf(),
+                branch: "main".into(),
+            },
+            lease: None,
+        };
+        app.confirm_discard = Some((root.clone(), Discard::All));
+        app.confirm_amend = Some(root.clone());
+        app.rejected_push = Some(rejected(&root));
+        app.forget_pending(&root);
+        assert!(app.confirm_discard.is_none() && app.confirm_amend.is_none());
+        assert!(app.rejected_push.is_none());
+
+        app.confirm_discard = Some((other.clone(), Discard::All));
+        app.confirm_amend = Some(other.clone());
+        app.rejected_push = Some(rejected(&other));
+        app.forget_pending(&root);
+        assert!(app.confirm_discard.is_some() && app.confirm_amend.is_some());
+        assert!(app.rejected_push.is_some());
     }
 
     #[test]

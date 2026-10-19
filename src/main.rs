@@ -1,5 +1,6 @@
 mod actions;
 mod config;
+mod convert;
 mod creds;
 mod diff;
 mod git;
@@ -9,6 +10,7 @@ mod project;
 mod refs;
 mod ssh;
 mod stage;
+mod stash;
 mod status;
 mod ui;
 

@@ -1,9 +1,11 @@
-//! Modal dialogs: clone, create, new worktree, confirm worktree removal and branch deletion.
+//! Modal dialogs: clone, create, new worktree, confirm worktree removal and branch deletion,
+//! convert.
 
 use super::{
     actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
-    JobKind, SpinneyApp,
+    toolbar::folder_name, visible_projects, JobKind, SpinneyApp,
 };
+use crate::convert::{self, Plan};
 use crate::{creds, github};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use std::path::{Path, PathBuf};
@@ -239,6 +241,22 @@ pub(super) struct Dialogs {
     pub(super) delete_branch: Option<DeleteBranchDialog>,
     /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
     pub(super) delete_remote: Option<String>,
+    pub(super) confirm_drop_stash: Option<DropStash>,
+    pub(super) convert: Option<ConvertDialog>,
+}
+
+/// Convert-to-worktree-layout confirm screen; `plan` holds the refusal when it cannot run.
+pub(super) struct ConvertDialog {
+    pub root: PathBuf,
+    pub plan: Result<Plan, String>,
+}
+
+/// A stash drop awaiting confirmation, bound to the tab and worktree it was requested in.
+pub(super) struct DropStash {
+    pub root: PathBuf,
+    pub worktree: PathBuf,
+    pub hash: String,
+    pub label: String,
 }
 
 impl Dialogs {
@@ -249,6 +267,8 @@ impl Dialogs {
             || self.create.is_some()
             || self.new_worktree.is_some()
             || self.confirm_remove.is_some()
+            || self.confirm_drop_stash.is_some()
+            || self.convert.is_some()
             || self.delete_branch.is_some()
             || self.delete_remote.is_some()
     }
@@ -340,6 +360,44 @@ impl SpinneyApp {
                 None => self.dialogs.confirm_remove = Some(path),
             }
         }
+        if let Some(drop) = self.dialogs.confirm_drop_stash.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("confirm_drop_stash")).show(ctx, |ui| {
+                ui.label(format!(
+                    "Drop {}? Its saved changes will be lost permanently.",
+                    drop.label
+                ));
+                ui.horizontal(|ui| {
+                    if ui.add(danger("Drop")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => {
+                    let ctx = self.ctx.clone();
+                    let mut errors = vec![];
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.root == drop.root) {
+                        let action = super::Action::DropStashConfirmed(drop.hash.clone());
+                        let notice = tab.stash_action(action, &drop.worktree, &ctx, &mut errors);
+                        self.notices.extend(notice);
+                    }
+                    self.errors.extend(errors);
+                }
+                Some(false) => {}
+                None => self.dialogs.confirm_drop_stash = Some(drop),
+            }
+        }
+        if let Some(d) = self.dialogs.convert.take() {
+            match (convert_dialog(ctx, &d), d.plan) {
+                (Some(true), Ok(plan)) => self.start_convert(d.root, plan),
+                (None, plan) => self.dialogs.convert = Some(ConvertDialog { root: d.root, plan }),
+                _ => {}
+            }
+        }
         if let Some(mut d) = self.dialogs.delete_branch.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("delete_branch")).show(ctx, |ui| {
@@ -392,6 +450,65 @@ impl SpinneyApp {
                 Some(false) => {}
                 None => self.dialogs.delete_remote = Some(name),
             }
+        }
+    }
+
+    /// Close the project's tab (so nothing runs git in it while files move) and convert on
+    /// a worker thread; `convert_done` reopens it.
+    pub(super) fn start_convert(&mut self, root: PathBuf, plan: Plan) {
+        let Some(space) = self.space() else { return };
+        if self.jobs.busy(&root) {
+            self.errors.push(format!(
+                "{} has background work running; convert it when that finishes",
+                root.display()
+            ));
+            return;
+        }
+        if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
+            self.close_tab(i);
+        }
+        self.forget_pending(&root);
+        let target = root.join(&plan.target_dir_name);
+        self.converting.push((root.clone(), target));
+        let id = space.id.clone();
+        self.jobs.spawn(JobKind::Convert, root, id, move || {
+            convert::convert(&plan, &space).map(|_| ())
+        });
+    }
+
+    /// Reopen the project after a conversion (converted, or rolled back on failure).
+    pub(super) fn convert_done(&mut self, root: PathBuf, result: anyhow::Result<()>) {
+        let target = self
+            .converting
+            .iter()
+            .position(|(r, _)| *r == root)
+            .map(|i| self.converting.swap_remove(i).1);
+        match &result {
+            Ok(()) => {
+                let mut notice = format!("{} now uses the worktree layout", folder_name(&root));
+                if let Some(t) = &target {
+                    notice += &convert_strays_note(&root, t);
+                }
+                self.notices.push(notice);
+            }
+            Err(e) => self.errors.push(format!("Convert failed: {e:#}")),
+        }
+        let Some(space) = self.space() else { return };
+        if !visible_projects(&self.config).contains(&root) {
+            return; // the space was switched meanwhile
+        }
+        self.open_tab(&root, &space);
+        if result.is_err() {
+            return;
+        }
+        let (ctx, mut errors) = (self.ctx.clone(), vec![]);
+        if let (Some(target), Some(tab)) = (target, self.tab_mut(&root)) {
+            tab.active_worktree = target;
+            tab.refresh(&ctx, &mut errors);
+        }
+        self.errors.extend(errors);
+        if !self.jobs.running(JobKind::CommitGraph, &root) {
+            self.jobs.commit_graph(root.clone(), root.join(".bare"));
         }
     }
 
@@ -504,6 +621,118 @@ impl SpinneyApp {
         }
         self.errors.extend(errors);
     }
+}
+
+/// Names of entries that appeared in `root` while converting (they did not move), if any.
+fn convert_strays_note(root: &Path, target: &Path) -> String {
+    match convert::strays(root, target) {
+        Ok(s) if s.is_empty() => String::new(),
+        Ok(s) => {
+            let names: Vec<_> = s.iter().map(|p| p.display().to_string()).collect();
+            format!(
+                ". These appeared in the project folder while converting and were not moved \
+                 into {}: {}",
+                folder_name(target),
+                names.join(", ")
+            )
+        }
+        Err(e) => format!(". Could not check the project folder for leftovers: {e:#}"),
+    }
+}
+
+/// Items listed by name in the preview; the rest are counted.
+const PREVIEW_ITEMS: usize = 6;
+
+/// Before/after folder trees for the convert confirm screen.
+fn convert_preview(name: &str, plan: &Plan) -> (String, String) {
+    let shown = plan.items.len().min(PREVIEW_ITEMS);
+    let mut items: Vec<String> = plan.items[..shown]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    if plan.items.len() > shown {
+        items.push(format!("… {} more", plan.items.len() - shown));
+    }
+    let tree = |lines: &[String], indent: &str| -> String {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let branch = if i + 1 == lines.len() {
+                    "└─"
+                } else {
+                    "├─"
+                };
+                format!("{indent}{branch} {l}\n")
+            })
+            .collect()
+    };
+    let mut before_lines = vec![".git/".to_string()];
+    before_lines.extend(items.iter().cloned());
+    let before = format!("{name}/\n{}", tree(&before_lines, ""));
+    let target = &plan.target_dir_name;
+    let after_top = [
+        ".bare/   ← was .git/".to_string(),
+        ".git     ← file: gitdir: ./.bare".to_string(),
+        format!("{target}/"),
+    ];
+    let after = format!("{name}/\n{}{}", tree(&after_top, ""), tree(&items, "   "));
+    (before, after)
+}
+
+fn convert_dialog(ctx: &egui::Context, d: &ConvertDialog) -> Option<bool> {
+    let mut result = None;
+    egui::Modal::new(egui::Id::unique("convert_dialog")).show(ctx, |ui| {
+        ui.set_max_width(480.0);
+        ui.heading("Convert to worktree layout");
+        ui.add_space(6.0);
+        match &d.plan {
+            Err(e) => {
+                ui.colored_label(ui.visuals().error_fg_color, format!("Can't convert: {e}"));
+                ui.add_space(6.0);
+                if ui.button("Close").clicked() {
+                    result = Some(false);
+                }
+            }
+            Ok(plan) => {
+                let (before, after) = convert_preview(&folder_name(&d.root), plan);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(theme::caption("Before"));
+                        ui.monospace(before);
+                    });
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        ui.label(theme::caption("After"));
+                        ui.monospace(after);
+                    });
+                });
+                ui.add_space(6.0);
+                let n = plan.items.len();
+                ui.label(format!(
+                    "{n} item{} move into {}/, including uncommitted, untracked and ignored \
+                     files. Nothing is copied or deleted; if anything fails, every change is \
+                     undone.",
+                    if n == 1 { "" } else { "s" },
+                    plan.target_dir_name
+                ));
+                ui.colored_label(
+                    theme::WARN,
+                    "Close this project in your IDE and terminals first.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary("Convert")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            }
+        }
+    });
+    result
 }
 
 /// Height of a repository row: name line plus description line.
@@ -822,6 +1051,72 @@ mod tests {
         d
     }
 
+    fn plan_with(items: usize) -> Plan {
+        Plan {
+            root: PathBuf::from("/tmp/proj"),
+            git_dir: PathBuf::from("/tmp/proj/.git"),
+            target_dir_name: "feature-x".into(),
+            worktree_id: "feature-x".into(),
+            items: (0..items).map(|i| PathBuf::from(format!("f{i}"))).collect(),
+            branch: Some("feature/x".into()),
+        }
+    }
+
+    #[test]
+    fn convert_preview_shows_layout_and_counts_extra_items() {
+        let (before, after) = convert_preview("proj", &plan_with(8));
+        assert!(before.starts_with("proj/\n├─ .git/\n├─ f0\n"), "{before}");
+        assert!(before.ends_with("└─ … 2 more\n"), "{before}");
+        assert!(
+            after.contains(".bare/") && after.contains("gitdir: ./.bare"),
+            "{after}"
+        );
+        assert!(after.contains("└─ feature-x/\n   ├─ f0\n"), "{after}");
+        assert!(after.ends_with("   └─ … 2 more\n"), "{after}");
+        let (_, after) = convert_preview("proj", &plan_with(1));
+        assert!(after.ends_with("feature-x/\n   └─ f0\n"), "{after}");
+    }
+
+    #[test]
+    fn success_notice_lists_strays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for d in [".bare", "main"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join(".git"), "gitdir: ./.bare\n").unwrap();
+        assert_eq!(convert_strays_note(root, &root.join("main")), "");
+        std::fs::write(root.join(".DS_Store"), "x").unwrap();
+        let note = convert_strays_note(root, &root.join("main"));
+        assert!(note.contains("not moved into main: .DS_Store"), "{note}");
+    }
+
+    #[test]
+    fn not_now_persists_per_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut app = super::super::tests::test_app(super::super::tests::cfg(), &cfg_path);
+        let root = PathBuf::from("/tmp/p1");
+        app.apply(super::super::Action::DismissConvert(root.clone()));
+        app.apply(super::super::Action::DismissConvert(root.clone()));
+        let saved = crate::config::Config::load_from(&cfg_path).unwrap();
+        assert_eq!(saved.convert_dismissed, [root]);
+    }
+
+    #[test]
+    fn convert_refusal_is_shown_instead_of_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        app.apply(super::super::Action::RequestConvert(
+            tmp.path().to_path_buf(),
+        ));
+        let d = app.dialogs.convert.as_ref().expect("dialog open");
+        assert!(d.plan.is_err(), "not a repo, so plan refuses");
+    }
+
     #[test]
     fn any_open_sees_every_dialog() {
         let mut d = Dialogs::default();
@@ -845,6 +1140,20 @@ mod tests {
         d.confirm_remove = Some(PathBuf::from("/tmp/wt"));
         assert!(d.any_open());
         d.confirm_remove = None;
+        d.confirm_drop_stash = Some(DropStash {
+            root: PathBuf::from("/tmp/r"),
+            worktree: PathBuf::from("/tmp/r"),
+            hash: "h".into(),
+            label: "l".into(),
+        });
+        assert!(d.any_open());
+        d.confirm_drop_stash = None;
+        d.convert = Some(ConvertDialog {
+            root: PathBuf::from("/tmp/r"),
+            plan: Err("no".into()),
+        });
+        assert!(d.any_open());
+        d.convert = None;
         d.delete_branch = Some(DeleteBranchDialog {
             branch: "topic".into(),
             remote: None,

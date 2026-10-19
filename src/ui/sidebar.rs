@@ -218,6 +218,34 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
+        section(ui, "stashes", "Stashes", tab.stashes.len(), true, |ui| {
+            for st in &tab.stashes {
+                let r = row(
+                    ui,
+                    false,
+                    st.message.clone(),
+                    st.branch.clone().unwrap_or_default(),
+                );
+                r.context_menu(|ui| {
+                    if ui.button("Apply").clicked() {
+                        actions.push(Action::ApplyStash(st.hash.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Pop").clicked() {
+                        actions.push(Action::PopStash(st.hash.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Drop").clicked() {
+                        let label = match &st.branch {
+                            Some(b) => format!("\"{}\" (on {b})", st.message),
+                            None => format!("\"{}\"", st.message),
+                        };
+                        actions.push(Action::RequestDropStash(st.hash.clone(), label));
+                        ui.close();
+                    }
+                });
+            }
+        });
     });
 }
 
@@ -235,7 +263,8 @@ fn branch_menu(r: &egui::Response, layout: Layout, b: &Branch, actions: &mut Vec
                 egui::Button::new("New worktree from here"),
             )
             .on_disabled_hover_text(
-                "Converting normal clones to the worktree layout comes in a later version",
+                "This project is a normal clone: right-click its tab and choose Convert to \
+                 worktree layout",
             );
         if r.clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));

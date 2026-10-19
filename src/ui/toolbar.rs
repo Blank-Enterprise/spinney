@@ -16,9 +16,17 @@ impl SpinneyApp {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (i, tab) in self.tabs.iter().enumerate() {
                 let active = i == self.active_tab && !self.new_tab;
-                let (select, close) = tab_button(ui, &tab.name(), active, true);
-                if select {
+                let (label, close) = tab_button(ui, &tab.name(), active, true);
+                if label.clicked() {
                     actions.push(Action::SelectTab(i));
+                }
+                if tab.layout == Layout::NormalClone {
+                    label.context_menu(|ui| {
+                        if ui.button("Convert to worktree layout…").clicked() {
+                            actions.push(Action::RequestConvert(tab.root.clone()));
+                            ui.close();
+                        }
+                    });
                 }
                 if close {
                     actions.push(Action::CloseTab(i));
@@ -46,20 +54,29 @@ impl SpinneyApp {
                     ui.add(egui::Spinner::new().size(14.0))
                         .on_hover_text("Cloning…");
                 }
+                if self.jobs.any(JobKind::Convert) {
+                    ui.add(egui::Spinner::new().size(14.0))
+                        .on_hover_text("Converting to the worktree layout…");
+                }
             });
         });
     }
 }
 
-/// A rounded-top tab; returns (name clicked, close clicked).
-fn tab_button(ui: &mut egui::Ui, name: &str, active: bool, closable: bool) -> (bool, bool) {
+/// A rounded-top tab; returns (the name label's response, close clicked).
+fn tab_button(
+    ui: &mut egui::Ui,
+    name: &str,
+    active: bool,
+    closable: bool,
+) -> (egui::Response, bool) {
     let (fill, color) = if active {
         (theme::BG, Color32::WHITE)
     } else {
         (Color32::TRANSPARENT, TAB_TEXT)
     };
-    let mut out = (false, false);
-    egui::Frame::new()
+    let mut close = false;
+    let frame = egui::Frame::new()
         .fill(fill)
         .corner_radius(CornerRadius {
             nw: 7,
@@ -79,16 +96,18 @@ fn tab_button(ui: &mut egui::Ui, name: &str, active: bool, closable: bool) -> (b
                 let label = egui::Label::new(RichText::new(name).size(12.5).color(color))
                     .selectable(false)
                     .sense(Sense::click());
-                out.0 = ui.add(label).clicked();
+                let label = ui.add(label);
                 if closable {
                     let x = egui::Button::new(RichText::new("×").color(TAB_TEXT))
                         .frame(false)
                         .small();
-                    out.1 = ui.add(x).on_hover_text("Close tab").clicked();
+                    close = ui.add(x).on_hover_text("Close tab").clicked();
                 }
-            });
+                label
+            })
+            .inner
         });
-    out
+    (frame.inner, close)
 }
 
 /// Current branch of the tab's active worktree, for the toolbar.
@@ -183,6 +202,20 @@ pub(super) fn toolbar(
             }
             if tool_button(ui, "⎇", "Branch", true, false, "New branch") {
                 actions.push(Action::NewBranch(base));
+            }
+            let top = tab.stashes.first();
+            if tool_button(
+                ui,
+                "⤓",
+                "Pop",
+                top.is_some(),
+                false,
+                "Apply and remove the top stash",
+            ) {
+                actions.extend(top.map(|s| Action::PopStash(s.hash.clone())));
+            }
+            if tool_button(ui, "⤒", "Stash", true, false, "Stash all changes") {
+                actions.push(Action::Stash);
             }
             for (icon, label, kind, action) in [
                 ("↑", "Push", JobKind::Push, Action::Push),
