@@ -468,7 +468,8 @@ impl SpinneyApp {
             self.close_tab(i);
         }
         self.forget_pending(&root);
-        let target = root.join(&plan.target_dir_name);
+        // Canonical, like the paths `git worktree list` gives refresh() to match against.
+        let target = plan.root.join(&plan.target_dir_name);
         self.converting.push((root.clone(), target));
         let id = space.id.clone();
         self.jobs.spawn(JobKind::Convert, root, id, move || {

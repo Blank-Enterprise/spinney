@@ -195,7 +195,7 @@ pub(super) fn toolbar(
             let hint = if worktrees {
                 "New worktree"
             } else {
-                "Converting normal clones to the worktree layout comes in a later version"
+                "Convert this clone to the worktree layout first (right-click its tab)"
             };
             if tool_button(ui, "⊞", "Worktree", worktrees, false, hint) {
                 actions.push(Action::NewWorktreeFrom(base.clone()));
@@ -203,18 +203,19 @@ pub(super) fn toolbar(
             if tool_button(ui, "⎇", "Branch", true, false, "New branch") {
                 actions.push(Action::NewBranch(base));
             }
+            // Not while a pull or push may be changing the same worktree's files.
+            let waiting = "Waiting for the running job";
             let top = tab.stashes.first();
-            if tool_button(
-                ui,
-                "⤓",
-                "Pop",
-                top.is_some(),
-                false,
-                "Apply and remove the top stash",
-            ) {
+            let pop = if busy {
+                waiting
+            } else {
+                "Apply and remove the top stash"
+            };
+            if tool_button(ui, "⤓", "Pop", top.is_some() && !busy, false, pop) {
                 actions.extend(top.map(|s| Action::PopStash(s.hash.clone())));
             }
-            if tool_button(ui, "⤒", "Stash", true, false, "Stash all changes") {
+            let stash = if busy { waiting } else { "Stash all changes" };
+            if tool_button(ui, "⤒", "Stash", !busy, false, stash) {
                 actions.push(Action::Stash);
             }
             for (icon, label, kind, action) in [
