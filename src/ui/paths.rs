@@ -37,6 +37,29 @@ pub fn absolute(input: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     }
 }
 
+/// A typed folder that must exist: `~`-expanded, absolute, canonicalized.
+pub fn existing_dir(input: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    if input.trim().is_empty() {
+        return Err("Choose a folder".into());
+    }
+    let p = absolute(input, home)?;
+    if !p.is_dir() {
+        return Err(format!("{} is not a folder", p.display()));
+    }
+    p.canonicalize()
+        .map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// A new project folder name: non-empty, no `/`, not `.` or `..`.
+pub fn check_name(name: &str) -> Result<(), String> {
+    match name.trim() {
+        "" => Err("Enter a name".into()),
+        n @ ("." | "..") => Err(format!("{n} is not a valid name")),
+        n if n.contains('/') => Err("Name cannot contain /".into()),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +90,34 @@ mod tests {
         assert!(absolute("code", h).is_err());
         assert!(absolute("~/x", None).is_err());
         assert!(absolute("", h).is_err());
+    }
+
+    #[test]
+    fn existing_dir_is_canonical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canon = tmp.path().canonicalize().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let typed = format!(" {}/sub/.. ", tmp.path().display());
+        assert_eq!(existing_dir(&typed, None).unwrap(), canon);
+        assert_eq!(
+            existing_dir("~/sub", Some(tmp.path())).unwrap(),
+            canon.join("sub")
+        );
+        assert!(existing_dir("", None).is_err());
+        assert!(existing_dir("sub", Some(tmp.path())).is_err(), "relative");
+        assert!(existing_dir(&format!("{}/nope", tmp.path().display()), None).is_err());
+        let file = tmp.path().join("f");
+        std::fs::write(&file, "").unwrap();
+        assert!(existing_dir(&file.display().to_string(), None).is_err());
+    }
+
+    #[test]
+    fn names_are_single_segments() {
+        assert!(check_name("proj").is_ok());
+        assert!(check_name(" proj.v2 ").is_ok());
+        for bad in ["", "  ", ".", "..", "a/b", "/"] {
+            assert!(check_name(bad).is_err(), "{bad:?}");
+        }
     }
 }

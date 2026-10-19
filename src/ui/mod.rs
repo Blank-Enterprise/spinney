@@ -505,19 +505,7 @@ impl SpinneyApp {
                 }
             }
             Action::OpenFolder => self.dialogs.open_folder = Some(String::new()),
-            Action::CloneUrl => {
-                let dest = self
-                    .space()
-                    .and_then(|s| s.default_clone_dir)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.dialogs.clone = Some(CloneDialog {
-                    url: String::new(),
-                    dest,
-                    name: String::new(),
-                    name_edited: false,
-                });
-            }
+            Action::CloneUrl => self.dialogs.clone = self.space().as_ref().map(CloneDialog::new),
             Action::Fetch => self.network(JobKind::Fetch),
             Action::Pull => self.network(JobKind::Pull),
             Action::Push => self.network(JobKind::Push),
