@@ -793,6 +793,7 @@ impl eframe::App for SpinneyApp {
         if !self.errors.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
+        let shortcuts = !self.dialogs.any_open();
         let tab = if self.showing_new_tab() {
             None
         } else {
@@ -808,7 +809,7 @@ impl eframe::App for SpinneyApp {
                 .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(260.0)
-                .show(ui, |ui| changes::show(ui, tab, &mut actions));
+                .show(ui, |ui| changes::show(ui, tab, shortcuts, &mut actions));
             let inline = self.config.diff_inline;
             let center = egui::Frame::new()
                 .fill(theme::BG)

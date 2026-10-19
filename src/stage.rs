@@ -149,22 +149,36 @@ pub fn stage_file(worktree: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stage every change in the worktree (`git add -A`).
-pub fn stage_all(worktree: &Path) -> Result<()> {
-    git::run(worktree, &["add", "-A"])?;
+/// Stage exactly `paths` (new, modified or deleted) in one call; nothing when empty.
+pub fn stage_paths(worktree: &Path, paths: &[&str]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(()); // a bare `add -A` would stage everything, conflicts included
+    }
+    let mut args = vec!["--literal-pathspecs", "add", "-A", "--"];
+    args.extend_from_slice(paths);
+    git::run(worktree, &args)?;
     Ok(())
 }
 
 pub fn unstage_file(worktree: &Path, path: &str) -> Result<()> {
-    // `restore --staged` needs HEAD; before the first commit `reset` drops the path from the
-    // index (`rm --cached` would refuse once the file was edited after staging).
+    unstage_files(worktree, &[path])
+}
+
+/// Unstage `paths` in one call; nothing when empty.
+pub fn unstage_files(worktree: &Path, paths: &[&str]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // `restore --staged` needs HEAD; before the first commit `reset` drops the paths from the
+    // index (`rm --cached` would refuse once a file was edited after staging).
     let unborn = git::run(worktree, &["rev-parse", "--verify", "-q", "HEAD"]).is_err();
-    let args: &[&str] = if unborn {
-        &["--literal-pathspecs", "reset", "-q", "--", path]
+    let mut args = if unborn {
+        vec!["--literal-pathspecs", "reset", "-q", "--"]
     } else {
-        &["--literal-pathspecs", "restore", "--staged", "--", path]
+        vec!["--literal-pathspecs", "restore", "--staged", "--"]
     };
-    git::run(worktree, args)?;
+    args.extend_from_slice(paths);
+    git::run(worktree, &args)?;
     Ok(())
 }
 
@@ -453,18 +467,90 @@ mod tests {
         );
     }
 
+    fn commit(d: &Path, msg: &str) {
+        let c = [
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+        ];
+        let mut args = c.to_vec();
+        args.extend(["-c", "commit.gpgsign=false", "commit", "-q", "-am", msg]);
+        g(d, &args);
+    }
+
     #[test]
-    fn stage_all_stages_every_kind() {
-        let tmp = repo("f.txt", BASE, WORK);
+    fn stage_paths_leaves_conflicts_unmerged() {
+        let tmp = repo("f.txt", BASE, BASE);
         let d = tmp.path();
+        fs::write(d.join("c.txt"), "base\n").unwrap();
+        g(d, &["add", "c.txt"]);
+        commit(d, "c");
+        g(d, &["checkout", "-q", "-b", "other"]);
+        fs::write(d.join("c.txt"), "theirs\n").unwrap();
+        commit(d, "theirs");
+        g(d, &["checkout", "-q", "-"]);
+        fs::write(d.join("c.txt"), "ours\n").unwrap();
+        commit(d, "ours");
+        assert!(git::run(d, &["merge", "-q", "other"]).is_err(), "conflict");
+        fs::write(d.join("f.txt"), WORK).unwrap();
+        fs::write(d.join("*.txt"), "glob\n").unwrap();
+
+        let st = crate::status::status(d).unwrap();
+        assert_eq!(st.conflicted.len(), 1);
+        let paths: Vec<&str> = st.unstaged.iter().map(|f| f.path.as_str()).collect();
+        stage_paths(d, &paths).unwrap();
+        let st = crate::status::status(d).unwrap();
+        assert!(st.unstaged.is_empty(), "{st:?}");
+        assert_eq!(st.conflicted.len(), 1, "conflict still unmerged: {st:?}");
+        assert_eq!(index(d, "f.txt"), WORK);
+        stage_paths(d, &[]).unwrap(); // no paths: no-op, not `add -A` of everything
+        assert_eq!(crate::status::status(d).unwrap().conflicted.len(), 1);
+    }
+
+    #[test]
+    fn stage_paths_stages_deletions_and_new_files() {
+        let tmp = repo("f.txt", BASE, BASE);
+        let d = tmp.path();
+        fs::remove_file(d.join("f.txt")).unwrap();
         fs::write(d.join("new.txt"), "n\n").unwrap();
-        stage_all(d).unwrap();
+        stage_paths(d, &["f.txt", "new.txt"]).unwrap();
         let st = crate::status::status(d).unwrap();
         assert!(st.unstaged.is_empty(), "{st:?}");
         assert_eq!(st.staged.len(), 2);
-        fs::remove_file(d.join("f.txt")).unwrap();
-        stage_all(d).unwrap();
-        assert!(g(d, &["ls-files", "f.txt"]).is_empty(), "deletion staged");
+    }
+
+    #[test]
+    fn unstage_files_in_one_call() {
+        let tmp = repo("f.txt", BASE, WORK);
+        let d = tmp.path();
+        fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(d, &["add", "a.txt"]);
+        commit(d, "a");
+        fs::write(d.join("f.txt"), "changed\n").unwrap(); // `commit -a` took WORK
+        g(d, &["mv", "a.txt", "b.txt"]);
+        stage_file(d, "f.txt").unwrap();
+        let st = crate::status::status(d).unwrap();
+        assert_eq!(st.staged.len(), 2, "{st:?}");
+        unstage_files(d, &["f.txt", "b.txt", "a.txt"]).unwrap();
+        assert!(crate::status::status(d).unwrap().staged.is_empty());
+        assert_eq!(
+            fs::read_to_string(d.join("f.txt")).unwrap(),
+            "changed\n",
+            "worktree kept"
+        );
+
+        let fresh = tempfile::tempdir().unwrap();
+        let d = fresh.path();
+        g(d, &["init", "-q"]);
+        for f in ["x.txt", "y.txt"] {
+            fs::write(d.join(f), "x\n").unwrap();
+            stage_file(d, f).unwrap();
+        }
+        fs::write(d.join("x.txt"), "edited\n").unwrap();
+        unstage_files(d, &["x.txt", "y.txt"]).unwrap();
+        assert!(g(d, &["ls-files"]).is_empty(), "unborn HEAD");
+        unstage_files(d, &[]).unwrap();
     }
 
     #[test]

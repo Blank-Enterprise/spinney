@@ -24,8 +24,8 @@ pub fn commit_message(summary: &str, description: &str) -> String {
     m
 }
 
-/// Every path to unstage for "Unstage all" (both sides of a rename).
-pub fn unstage_paths(staged: &[FileStatus]) -> Vec<&str> {
+/// Every path of `files`, both sides of a rename (for "Stage all" / "Unstage all").
+pub fn change_paths(staged: &[FileStatus]) -> Vec<&str> {
     let mut paths = vec![];
     for f in staged {
         paths.push(f.path.as_str());
@@ -57,7 +57,8 @@ enum List {
 
 const COMMIT_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 
-pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) {
+/// `shortcuts` is false while a dialog is open, so ⌘↵ there never commits behind it.
+pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &mut Vec<Action>) {
     if let Some(i) = tab.selected_commit {
         commit_files(ui, tab, i, actions);
         return;
@@ -68,7 +69,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
     };
     let enabled = commit_enabled(&tab.commit_summary, &tab.status);
     // Before the text fields see the key, so ⌘↵ never inserts a newline.
-    if enabled && ui.input_mut(|i| i.consume_shortcut(&COMMIT_KEY)) {
+    if shortcuts && enabled && ui.input_mut(|i| i.consume_shortcut(&COMMIT_KEY)) {
         actions.push(Action::Commit);
     }
     let n = tab.status.changed_files();
@@ -88,10 +89,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
         .show(ui, |ui| {
             let st = &tab.status;
             if !st.conflicted.is_empty() {
-                file_list(ui, List::Conflicted, &st.conflicted, &open, actions);
+                file_list(ui, List::Conflicted, &st.conflicted, &open, false, actions);
             }
-            file_list(ui, List::Unstaged, &st.unstaged, &open, actions);
-            file_list(ui, List::Staged, &st.staged, &open, actions);
+            let conflicts = !st.conflicted.is_empty();
+            file_list(ui, List::Unstaged, &st.unstaged, &open, conflicts, actions);
+            file_list(ui, List::Staged, &st.staged, &open, false, actions);
         });
 }
 
@@ -127,6 +129,7 @@ fn file_list(
     list: List,
     files: &[FileStatus],
     open: &Option<(String, bool)>,
+    conflicts: bool,
     actions: &mut Vec<Action>,
 ) {
     let (title, button) = match list {
@@ -145,7 +148,14 @@ fn file_list(
         if let Some((label, action)) = all {
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let b = egui::Button::new(RichText::new(label).size(11.5)).small();
-                if ui.add_enabled(!files.is_empty(), b).clicked() {
+                let r = ui
+                    .add_enabled(!files.is_empty() && !conflicts, b)
+                    .on_disabled_hover_text(if conflicts {
+                        "Resolve conflicts first"
+                    } else {
+                        "Nothing to do"
+                    });
+                if r.clicked() {
                     actions.push(action);
                 }
             });
@@ -308,15 +318,15 @@ impl ProjectTab {
         self.reload_changes(errors);
     }
 
-    /// Stage everything, or with `unstage` unstage every staged file.
+    /// Stage every listed unstaged file, or with `unstage` unstage every staged one, in one git call.
     pub(super) fn stage_all(&mut self, unstage: bool, errors: &mut Vec<String>) {
         let wt = &self.active_worktree;
         let res = if unstage {
-            unstage_paths(&self.status.staged)
-                .into_iter()
-                .try_for_each(|p| stage::unstage_file(wt, p))
+            stage::unstage_files(wt, &change_paths(&self.status.staged))
+        } else if self.status.conflicted.is_empty() {
+            stage::stage_paths(wt, &change_paths(&self.status.unstaged))
         } else {
-            stage::stage_all(wt)
+            Ok(()) // the button is disabled; never mark conflicts resolved by accident
         };
         if let Err(e) = res {
             errors.push(format!("{e:#}"));
@@ -395,6 +405,6 @@ mod tests {
                 change: Change::Renamed { from: "old".into() },
             },
         ];
-        assert_eq!(unstage_paths(&staged), ["a", "new", "old"]);
+        assert_eq!(change_paths(&staged), ["a", "new", "old"]);
     }
 }

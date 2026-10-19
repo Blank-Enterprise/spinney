@@ -131,6 +131,17 @@ pub(super) struct Dialogs {
     pub(super) confirm_remove: Option<PathBuf>,
 }
 
+impl Dialogs {
+    /// Any dialog, modal or the space editor is showing.
+    pub(super) fn any_open(&self) -> bool {
+        self.space.is_some()
+            || self.clone.is_some()
+            || self.create.is_some()
+            || self.new_worktree.is_some()
+            || self.confirm_remove.is_some()
+    }
+}
+
 impl SpinneyApp {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(mut edit) = self.dialogs.space.take() {
@@ -429,6 +440,30 @@ mod tests {
         d.url = url.into();
         d.name = name.into();
         d
+    }
+
+    #[test]
+    fn any_open_sees_every_dialog() {
+        let mut d = Dialogs::default();
+        assert!(!d.any_open());
+        d.space = Some(spaces::SpaceEdit::new_space());
+        assert!(d.any_open());
+        d.space = None;
+        d.clone = Some(CloneDialog::new(&Space::default()));
+        assert!(d.any_open());
+        d.clone = None;
+        d.create = Some(CreateDialog::new(&Space::default()));
+        assert!(d.any_open());
+        d.create = None;
+        d.new_worktree = Some(NewWorktreeDialog {
+            base: "main".into(),
+            branch: String::new(),
+            worktree: true,
+        });
+        assert!(d.any_open());
+        d.new_worktree = None;
+        d.confirm_remove = Some(PathBuf::from("/tmp/wt"));
+        assert!(d.any_open());
     }
 
     #[test]
