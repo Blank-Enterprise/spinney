@@ -1,7 +1,8 @@
-//! GitHub: list the repositories a space's token can see; sign in with the OAuth device flow.
+//! GitHub: list the repositories a space's token can see; sign in with the OAuth device flow;
+//! add an SSH key to the signed-in account.
 
 use anyhow::{bail, Result};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
 
 /// Pages followed at most (100 repos each).
@@ -120,7 +121,8 @@ pub fn filter<'a>(repos: &'a [Repo], query: &str) -> Vec<&'a Repo> {
 
 /// Spinney's OAuth App (public; the device flow needs no client secret).
 pub const GITHUB_CLIENT_ID: &str = "Ov23liCPm15HJJ4KHBlA";
-const DEVICE_SCOPE: &str = "repo read:org";
+/// `write:public_key` lets sign-in add the space's SSH key to the account.
+const DEVICE_SCOPE: &str = "repo read:org write:public_key";
 /// The device flow only ever talks to github.com.
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -235,6 +237,84 @@ fn post_form<T: serde::de::DeserializeOwned>(url: &str, form: &[(&str, &str)]) -
     }
 }
 
+/// Classic-token scopes Spinney asks for: repos, org membership (org repos), adding SSH keys.
+pub const TOKEN_SCOPES: &str = "repo,read:org,write:public_key";
+
+/// The "new personal access token" page on `host`, with Spinney's description and scopes
+/// filled in. `None` unless `host` is a bare host name (it ends up in a URL the browser opens).
+pub fn new_token_url(host: &str) -> Option<String> {
+    let bare = !host.is_empty()
+        && !host.starts_with(['-', '.'])
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'));
+    bare.then(|| {
+        format!("https://{host}/settings/tokens/new?description=Spinney&scopes={TOKEN_SCOPES}")
+    })
+}
+
+/// The token the GitHub CLI holds for `host` (`gh auth token`; local, no network). Apps opened
+/// from Finder get a bare PATH, so Homebrew's install locations are tried too.
+pub fn gh_cli_token(host: &str) -> Result<String> {
+    for gh in ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+        let Ok(out) = std::process::Command::new(gh)
+            .args(["auth", "token", "--hostname", host])
+            .output()
+        else {
+            continue; // not installed here
+        };
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || token.is_empty() {
+            bail!("The GitHub CLI isn't signed in to {host}. Run: gh auth login --hostname {host}");
+        }
+        return Ok(token);
+    }
+    bail!("The GitHub CLI (gh) isn't installed")
+}
+
+/// Outcome of adding an SSH key to the token's account.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyUpload {
+    Added,
+    /// GitHub already has this key (422 "key is already in use").
+    AlreadyThere,
+    /// The token may not add keys (no `write:public_key`; GitHub answers 403 or 404).
+    NeedsPermission,
+}
+
+/// Add `key` (one `ssh-… AAAA… comment` line) to the account `token` belongs to.
+pub fn add_ssh_key(api_base: &str, token: &str, title: &str, key: &str) -> Result<KeyUpload> {
+    #[derive(Serialize)]
+    struct NewKey<'a> {
+        title: &'a str,
+        key: &'a str,
+    }
+    let resp = agent()
+        .post(format!("{api_base}/user/keys"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "spinney")
+        .send_json(NewKey { title, key });
+    match resp {
+        Ok(r) => key_upload_outcome(r.status().as_u16()),
+        Err(e) => bail!("Could not reach GitHub: {e}"),
+    }
+}
+
+pub fn key_upload_outcome(status: u16) -> Result<KeyUpload> {
+    match status {
+        200..=299 => Ok(KeyUpload::Added),
+        422 => Ok(KeyUpload::AlreadyThere),
+        403 | 404 => Ok(KeyUpload::NeedsPermission),
+        401 => bail!("Token rejected — sign in again"),
+        code => bail!("GitHub answered HTTP {code}"),
+    }
+}
+
 /// Validate a device-code reply, falling back to GitHub's defaults for a missing timing.
 pub fn parse_device_code(r: DeviceCodeReply) -> Result<DeviceCode> {
     if let Some(code) = r.error {
@@ -285,6 +365,38 @@ mod tests {
             clone_url: format!("https://example.com/{full_name}.git"),
             pushed_at: None,
         }
+    }
+
+    #[test]
+    fn token_page_only_for_bare_hosts() {
+        assert_eq!(
+            new_token_url("github.mit.edu").as_deref(),
+            Some("https://github.mit.edu/settings/tokens/new?description=Spinney&scopes=repo,read:org,write:public_key")
+        );
+        assert!(new_token_url("ghe.example.com:8443").is_some());
+        for bad in [
+            "",
+            "evil.com/x",
+            "a b",
+            "-a",
+            ".x",
+            "x?y",
+            "evil.com#",
+            "user@host",
+        ] {
+            assert_eq!(new_token_url(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_upload_statuses() {
+        assert_eq!(key_upload_outcome(201).unwrap(), KeyUpload::Added);
+        assert_eq!(key_upload_outcome(422).unwrap(), KeyUpload::AlreadyThere);
+        for s in [403, 404] {
+            assert_eq!(key_upload_outcome(s).unwrap(), KeyUpload::NeedsPermission);
+        }
+        assert!(key_upload_outcome(401).is_err());
+        assert!(key_upload_outcome(500).is_err());
     }
 
     #[test]

@@ -1,13 +1,15 @@
 use super::{active_space, paths, theme, Action};
 use crate::config::{Config, Space};
-use crate::creds;
-use crate::github::{self, DeviceCode, Poll, GITHUB_CLIENT_ID};
+use crate::github::{self, DeviceCode, KeyUpload, Poll, GITHUB_CLIENT_ID};
+use crate::{creds, ssh};
 use eframe::egui;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-const SCOPE_HINT: &str = "Needs repo contents read/write, pull requests read/write, metadata read.";
+const SCOPE_HINT: &str =
+    "A classic token with repo, read:org and write:public_key (to add SSH keys).";
 
 /// "● Space ▾" menu: pick a space, or create/edit one.
 pub fn switcher(ui: &mut egui::Ui, cfg: &Config, actions: &mut Vec<Action>) {
@@ -40,6 +42,7 @@ pub fn switcher(ui: &mut egui::Ui, cfg: &Config, actions: &mut Vec<Action>) {
 pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
     let (mut result, mut browse) = (None, false);
     e.poll_auth(ctx);
+    e.poll_ssh(ctx);
     let title = if e.id.is_some() {
         "Edit space"
     } else {
@@ -66,22 +69,24 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
                     browse = ui.button("Browse").clicked();
                 });
                 ui.end_row();
-                if !e.github_com() {
-                    ui.label(theme::caption("Personal access token"));
-                    pat_field(ui, e);
-                    ui.end_row();
-                }
             });
+            ui.add_space(6.0);
+            if e.github_com() {
+                account(ui, e);
+            } else {
+                token_account(ui, e);
+            }
+            ui.add_space(6.0);
+            ssh_section(ui, e);
             if e.github_com() {
                 ui.add_space(6.0);
-                account(ui, e);
-                ui.add_space(6.0);
-            } else {
-                ui.label(theme::caption(SCOPE_HINT));
+                advanced(ui, e); // elsewhere the token is the account section itself
             }
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 // Saving drops the editor (and an unfinished sign-in) with it.
-                let busy = matches!(e.auth, Auth::Starting(_) | Auth::Waiting { .. });
+                let busy = matches!(e.auth, Auth::Starting(_) | Auth::Waiting { .. })
+                    || matches!(e.upload, Upload::Running(_));
                 if ui.add_enabled(!busy, theme::primary("Save")).clicked() {
                     result = Some(true);
                 }
@@ -116,10 +121,64 @@ fn pat_field(ui: &mut egui::Ui, e: &mut SpaceEdit) {
     );
 }
 
-/// "GitHub account" section of a github.com space: device-flow sign-in, or a pasted PAT.
+/// Collapsed token field: a github.com alternative to signing in.
+fn advanced(ui: &mut egui::Ui, e: &mut SpaceEdit) {
+    egui::CollapsingHeader::new(theme::caption("Advanced"))
+        .id_salt("space_advanced")
+        .show(ui, |ui| {
+            ui.label(theme::caption("Personal access token"));
+            pat_field(ui, e); // a non-blank value replaces any token on Save
+            ui.label(theme::caption(SCOPE_HINT));
+        });
+}
+
+/// Account section of a GitHub Enterprise (or other) space, as GitKraken does it: open the
+/// host's token page with everything filled in, then paste; or reuse the GitHub CLI's login.
+fn token_account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
+    let host = normalize_host(&e.host);
+    ui.label(theme::section(&format!("{host} account")));
+    if !e.pat.trim().is_empty() {
+        ui.label(egui::RichText::new("Token ready, saved with the space ✓").color(theme::ADDED));
+    } else if e.keychain_usable() {
+        ui.label(egui::RichText::new("Connected ✓").color(theme::ADDED));
+    } else {
+        ui.label(theme::caption(
+            "Connect to browse your repositories and add SSH keys.",
+        ));
+    }
+    if let Some(why) = &e.cli_error {
+        ui.label(egui::RichText::new(why.as_str()).color(theme::DELETED));
+    }
+    let url = github::new_token_url(&host);
+    ui.horizontal(|ui| {
+        let create = theme::primary(format!("Create token on {host}"));
+        if ui.add_enabled(url.is_some(), create).clicked() {
+            if let Some(url) = &url {
+                open_url(url);
+            }
+        }
+        let cli = ui.button("Use GitHub CLI login").on_hover_text(format!(
+            "Take the token from `gh auth login --hostname {host}`"
+        ));
+        if cli.clicked() {
+            match github::gh_cli_token(&host) {
+                Ok(token) => {
+                    e.pat = token;
+                    e.cli_error = None;
+                }
+                Err(err) => e.cli_error = Some(format!("{err:#}")),
+            }
+        }
+    });
+    ui.label(theme::caption("Paste the token here:"));
+    pat_field(ui, e); // a non-blank value replaces any token on Save
+    ui.label(theme::caption(SCOPE_HINT));
+}
+
+/// "GitHub account" section of a github.com space: device-flow sign-in.
 fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
     ui.label(theme::section("GitHub account"));
-    let (mut next, mut sign_out, mut show_pat) = (None, false, false);
+    let (mut next, mut sign_out) = (None, false);
     match &mut e.auth {
         Auth::SignedOut | Auth::Failed(_) => {
             if let Auth::Failed(why) = &e.auth {
@@ -133,8 +192,12 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
             if ui.add(theme::primary(label)).clicked() {
                 next = Some(start(ui.ctx()));
             }
-            ui.label(theme::caption("or paste a personal access token"));
-            show_pat = true;
+            if e.ssh_key.is_none() {
+                ui.checkbox(
+                    &mut e.ssh_with_sign_in,
+                    theme::caption("Also set up SSH (creates a key and adds it to GitHub)"),
+                );
+            }
         }
         Auth::Starting(_) => {
             ui.horizontal(|ui| {
@@ -176,11 +239,7 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
                 });
             });
         }
-        Auth::SignedIn {
-            held,
-            confirm,
-            replace,
-        } => {
+        Auth::SignedIn { held, confirm } => {
             ui.label(egui::RichText::new("Signed in to GitHub ✓").color(theme::ADDED));
             if held.is_some() {
                 ui.label(theme::caption(
@@ -200,19 +259,7 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
             } else if ui.button("Sign out").clicked() {
                 *confirm = true;
             }
-            if *replace {
-                show_pat = true;
-            } else {
-                let link =
-                    egui::Button::new(theme::caption("Replace with a personal access token"))
-                        .frame(false);
-                *replace = ui.add(link).clicked();
-            }
         }
-    }
-    if show_pat {
-        pat_field(ui, e); // a non-blank value replaces any token on Save
-        ui.label(theme::caption(SCOPE_HINT));
     }
     if let Some(a) = next {
         e.auth = a; // dropping a Starting/Waiting state stops its thread
@@ -224,6 +271,160 @@ fn account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
             }
         }
     }
+}
+
+/// "SSH" section: the space's key, whether it reached the host, and how to pick one.
+fn ssh_section(ui: &mut egui::Ui, e: &mut SpaceEdit) {
+    ui.label(theme::section("SSH"));
+    let home = paths::home();
+    let mut pick: Option<Option<PathBuf>> = None;
+    match e.ssh_key.clone() {
+        Some(key) => {
+            ui.horizontal(|ui| {
+                ui.label("🔑");
+                ui.label(paths::abbreviate_home(&key, home.as_deref()));
+            });
+            upload_status(ui, e);
+            ui.horizontal(|ui| {
+                if ui.button("Copy public key").clicked() {
+                    match ssh::public_key(&key) {
+                        Ok(k) => ui.ctx().copy_text(k),
+                        Err(err) => e.upload = Upload::Failed(format!("{err:#}")),
+                    }
+                }
+                if ui.button("Use HTTPS instead").clicked() {
+                    pick = Some(None);
+                }
+            });
+        }
+        None => {
+            ui.label(theme::caption("Push and pull over SSH instead of HTTPS."));
+            if let Upload::Failed(why) = &e.upload {
+                ui.label(egui::RichText::new(why.as_str()).color(theme::DELETED));
+            }
+            let ssh_dir = home.as_deref().map(|h| h.join(".ssh"));
+            let mut browse = false;
+            ui.horizontal(|ui| {
+                if ui.button("Generate key").clicked() {
+                    e.generate_key();
+                }
+                egui::ComboBox::from_id_salt("existing_ssh_key")
+                    .selected_text("Use existing key…")
+                    .show_ui(ui, |ui| {
+                        // Listed only while the menu is open.
+                        let keys = ssh_dir
+                            .as_deref()
+                            .map(ssh::existing_keys)
+                            .unwrap_or_default();
+                        if keys.is_empty() {
+                            ui.weak("No keys in ~/.ssh");
+                        }
+                        for k in keys {
+                            let name = paths::abbreviate_home(&k, home.as_deref());
+                            if ui.selectable_label(false, name).clicked() {
+                                pick = Some(Some(k));
+                            }
+                        }
+                    });
+                if ui
+                    .button("Browse…")
+                    .on_hover_text("Choose a private key file anywhere")
+                    .clicked()
+                {
+                    browse = true;
+                }
+            });
+            if browse {
+                let start = ssh_dir.as_deref().or(home.as_deref());
+                if let Some(file) = paths::pick_file("Choose an SSH private key", start) {
+                    match ssh::chosen_key(&file) {
+                        Ok(k) => pick = Some(Some(k)),
+                        Err(err) => e.upload = Upload::Failed(format!("{err:#}")),
+                    }
+                    ui.ctx().request_repaint(); // show the pick now, not on the next input
+                }
+            }
+        }
+    }
+    if let Some(key) = pick {
+        e.set_key(key);
+    }
+}
+
+/// Whether the key reached the host, with the action that moves it along.
+fn upload_status(ui: &mut egui::Ui, e: &mut SpaceEdit) {
+    let host = normalize_host(&e.host);
+    let mut next = None;
+    match &e.upload {
+        Upload::Idle if e.has_token() => {
+            if ui.button(format!("Add to {host}")).clicked() {
+                next = Some(Upload::Pending);
+            }
+        }
+        Upload::Idle => {
+            ui.label(theme::caption(&format!(
+                "Add the public key to your account on {host}."
+            )));
+        }
+        Upload::Pending if e.github_com() => {
+            ui.label(theme::caption(
+                "Sign in above to add it to your GitHub account.",
+            ));
+        }
+        Upload::Pending => {
+            ui.label(theme::caption(&format!(
+                "Add a token under Advanced, or add the public key on {host} yourself."
+            )));
+        }
+        Upload::Running(_) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(theme::caption(&format!("Adding to {host}…")));
+            });
+        }
+        Upload::Done(msg) => {
+            ui.label(egui::RichText::new(format!("{msg} ✓")).color(theme::ADDED));
+        }
+        Upload::NeedsPermission => {
+            ui.label(
+                egui::RichText::new("Spinney isn't allowed to add SSH keys with this sign-in.")
+                    .color(theme::DELETED),
+            );
+            if e.github_com() && ui.button("Sign in again").clicked() {
+                e.auth = start(ui.ctx());
+            }
+        }
+        Upload::Failed(why) => {
+            ui.label(egui::RichText::new(why.as_str()).color(theme::DELETED));
+            if ui.button("Retry").clicked() {
+                next = Some(Upload::Pending);
+            }
+        }
+    }
+    if let Some(u) = next {
+        e.upload = u;
+    }
+}
+
+/// Add the public key on a worker thread; it wakes the UI when the host answers.
+fn start_upload(
+    ctx: &egui::Context,
+    api_base: String,
+    token: String,
+    title: String,
+    key: String,
+) -> Upload {
+    let (tx, rx) = mpsc::channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        if tx
+            .send(github::add_ssh_key(&api_base, &token, &title, &key))
+            .is_ok()
+        {
+            ctx.request_repaint();
+        }
+    });
+    Upload::Running(rx)
 }
 
 /// Request a device code on a worker thread; it wakes the UI once, when GitHub answers.
@@ -282,11 +483,16 @@ fn after_poll(interval: u64, poll: Poll) -> ControlFlow<Poll, u64> {
 /// Open GitHub's device page, only if it really is on github.com.
 fn open_in_browser(uri: &str) {
     if let Some(url) = browser_url(uri) {
-        let url = url.to_string();
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("open").arg(url).status();
-        });
+        open_url(url);
     }
+}
+
+/// Open a URL Spinney built itself (already validated) in the default browser.
+fn open_url(url: &str) {
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("open").arg(url).status();
+    });
 }
 
 fn browser_url(uri: &str) -> Option<&str> {
@@ -312,9 +518,22 @@ enum Auth {
     SignedIn {
         held: Option<String>,
         confirm: bool,
-        /// The PAT field is shown to replace the token.
-        replace: bool,
     },
+}
+
+/// Getting the space's public SSH key onto the host.
+#[derive(Default)]
+enum Upload {
+    /// Nothing automatic (a key saved earlier); offers "Add to host" when a token is at hand.
+    #[default]
+    Idle,
+    /// Upload as soon as a token is available (after sign-in).
+    Pending,
+    Running(Receiver<anyhow::Result<KeyUpload>>),
+    Done(&'static str),
+    /// The token lacks `write:public_key`; signing in again grants it.
+    NeedsPermission,
+    Failed(String),
 }
 
 /// Editor buffer for a new (`id: None`) or existing space. The PAT is write-only.
@@ -327,11 +546,18 @@ pub struct SpaceEdit {
     pub author_email: String,
     pub clone_dir: String,
     pub pat: String,
+    /// Private SSH key for the space; `None` = HTTPS.
+    pub ssh_key: Option<PathBuf>,
     /// Host of the space as saved (normalized); empty for a new space.
     saved_host: String,
     /// A Keychain token existed when the editor opened.
     stored: bool,
     auth: Auth,
+    /// When sign-in finishes without a key: generate one and add it to GitHub.
+    ssh_with_sign_in: bool,
+    /// Why "Use GitHub CLI login" found no token.
+    cli_error: Option<String>,
+    upload: Upload,
 }
 
 /// What saving a space does with its Keychain token.
@@ -352,6 +578,7 @@ impl SpaceEdit {
     pub fn new_space() -> Self {
         SpaceEdit {
             host: "github.com".into(),
+            ssh_with_sign_in: true,
             ..Default::default()
         }
     }
@@ -376,9 +603,13 @@ impl SpaceEdit {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             pat: String::new(),
+            ssh_key: s.ssh_key.clone(),
             saved_host: normalize_host(&s.host),
             stored,
             auth: Auth::SignedOut,
+            ssh_with_sign_in: false,
+            cli_error: None,
+            upload: Upload::Idle,
         }
         .resting()
     }
@@ -395,7 +626,6 @@ impl SpaceEdit {
             Auth::SignedIn {
                 held: None,
                 confirm: false,
-                replace: false,
             }
         } else {
             Auth::SignedOut
@@ -451,7 +681,6 @@ impl SpaceEdit {
         self.auth = Auth::SignedIn {
             held,
             confirm: false,
-            replace: false,
         };
         store
     }
@@ -499,6 +728,7 @@ impl SpaceEdit {
                             self.auth = Auth::Failed(format!("Could not save the token: {err}"));
                         }
                     }
+                    self.after_sign_in();
                 }
                 Ok(Ok(Poll::Denied)) => {
                     self.auth = Auth::Failed("Sign-in was cancelled on GitHub".into())
@@ -508,6 +738,94 @@ impl SpaceEdit {
                     self.auth = Auth::Failed("Unexpected response from GitHub".into())
                 }
             },
+            _ => {}
+        }
+    }
+
+    /// Sign-in finished: set up SSH if asked to, and retry an upload that was waiting on it.
+    fn after_sign_in(&mut self) {
+        if self.ssh_key.is_none() && self.ssh_with_sign_in {
+            self.generate_key();
+        } else if self.ssh_key.is_some()
+            && matches!(self.upload, Upload::NeedsPermission | Upload::Failed(_))
+        {
+            self.upload = Upload::Pending;
+        }
+    }
+
+    /// Use `key` for SSH (`None` = HTTPS). A chosen key is added to the host when possible.
+    fn set_key(&mut self, key: Option<PathBuf>) {
+        self.upload = if key.is_some() {
+            Upload::Pending
+        } else {
+            Upload::Idle
+        };
+        self.ssh_key = key;
+    }
+
+    fn generate_key(&mut self) {
+        let comment = format!("spinney {}", self.name.trim()).trim().to_string();
+        match ssh::generate(&ssh::keys_dir(), &comment) {
+            Ok(key) => self.set_key(Some(key)),
+            Err(err) => self.upload = Upload::Failed(format!("{err:#}")),
+        }
+    }
+
+    /// A token the editor can use right now: typed or held, or the Keychain one for this host.
+    fn has_token(&self) -> bool {
+        self.token().is_some() || self.keychain_usable()
+    }
+
+    fn keychain_usable(&self) -> bool {
+        self.stored && self.id.is_some() && normalize_host(&self.host) == self.saved_host
+    }
+
+    fn upload_token(&self) -> Option<String> {
+        if let Some(t) = self.token() {
+            return Some(t.to_string());
+        }
+        let id = self.id.as_ref().filter(|_| self.keychain_usable())?;
+        creds::get_token(id).ok().flatten()
+    }
+
+    /// Take a finished upload; start a pending one once a token is available.
+    fn poll_ssh(&mut self, ctx: &egui::Context) {
+        match &self.upload {
+            Upload::Running(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.upload = Upload::Failed("Adding the key stopped".into())
+                }
+                Ok(Ok(KeyUpload::Added)) => self.upload = Upload::Done("Added to your account"),
+                Ok(Ok(KeyUpload::AlreadyThere)) => {
+                    self.upload = Upload::Done("Already on your account")
+                }
+                Ok(Ok(KeyUpload::NeedsPermission)) => self.upload = Upload::NeedsPermission,
+                Ok(Err(err)) => self.upload = Upload::Failed(format!("{err:#}")),
+            },
+            Upload::Pending => {
+                let Some(key) = &self.ssh_key else { return };
+                if !self.has_token() {
+                    return; // waiting for sign-in or a typed token
+                }
+                let Some(token) = self.upload_token() else {
+                    return self.upload = Upload::Failed("No saved token — sign in again".into());
+                };
+                let public = match ssh::public_key(key) {
+                    Ok(k) => k,
+                    Err(err) => return self.upload = Upload::Failed(format!("{err:#}")),
+                };
+                let api_base = Space {
+                    host: normalize_host(&self.host),
+                    ..Default::default()
+                }
+                .api_base();
+                let title = match self.name.trim() {
+                    "" => "Spinney".to_string(),
+                    name => format!("Spinney – {name}"),
+                };
+                self.upload = start_upload(ctx, api_base, token, title, public);
+            }
             _ => {}
         }
     }
@@ -534,6 +852,7 @@ impl SpaceEdit {
             s.author_name = author_name.to_string();
             s.author_email = author_email.to_string();
             s.default_clone_dir = dir.clone();
+            s.ssh_key = self.ssh_key.clone();
         };
         match &self.id {
             Some(id) => {
@@ -841,6 +1160,59 @@ mod tests {
         assert_eq!(new.token_save(), TokenSave::Keep);
         new.pat = "pat".into();
         assert_eq!(new.token_save(), TokenSave::Store("pat"));
+    }
+
+    #[test]
+    fn ssh_key_is_saved_with_the_space_and_reopened() {
+        let (mut cfg, mut e) = saved_github_space();
+        assert_eq!(e.ssh_key, None);
+        e.set_key(Some(PathBuf::from("/k/id")));
+        assert!(
+            matches!(e.upload, Upload::Pending),
+            "added to GitHub when possible"
+        );
+        e.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.spaces[0].ssh_key, Some(PathBuf::from("/k/id")));
+        let mut e = SpaceEdit::from_space(&cfg.spaces[0], true);
+        assert_eq!(e.ssh_key, Some(PathBuf::from("/k/id")));
+        assert!(matches!(e.upload, Upload::Idle), "no re-upload on open");
+        e.set_key(None);
+        e.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.spaces[0].ssh_key, None, "back to HTTPS");
+    }
+
+    #[test]
+    fn sign_in_retries_an_upload_that_lacked_permission() {
+        let mut e = SpaceEdit::new_space();
+        e.set_key(Some(PathBuf::from("/k/id")));
+        e.upload = Upload::NeedsPermission;
+        e.accept_token("tok".into());
+        e.after_sign_in();
+        assert!(matches!(e.upload, Upload::Pending));
+        e.upload = Upload::Done("Added to your account");
+        e.after_sign_in();
+        assert!(
+            matches!(e.upload, Upload::Done(_)),
+            "a finished upload is left alone"
+        );
+    }
+
+    #[test]
+    fn only_new_spaces_set_up_ssh_on_sign_in_by_default() {
+        assert!(SpaceEdit::new_space().ssh_with_sign_in);
+        let (_, e) = saved_github_space();
+        assert!(!e.ssh_with_sign_in, "an existing space keeps its choice");
+    }
+
+    #[test]
+    fn a_token_for_uploads_never_crosses_hosts() {
+        let mut e = edited("github.com", true, "github.com");
+        assert!(e.has_token(), "Keychain token for this host");
+        e.host = "ghe.example.com".into();
+        assert!(!e.has_token());
+        e.pat = "pat".into();
+        assert!(e.has_token());
+        assert!(!SpaceEdit::new_space().has_token());
     }
 
     #[test]

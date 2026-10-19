@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::{Config, Space};
-use crate::git;
+use crate::{git, ssh};
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::Path;
@@ -80,9 +80,9 @@ pub fn helper_main(args: &[String]) -> i32 {
     }
 }
 
-/// Single-quote `exe` for `sh -c`, escaping embedded quotes as `'\''`.
+/// The helper line, with `exe` quoted for `sh -c`.
 fn helper_command(exe: &str, space_id: &str) -> String {
-    format!("!'{}' credential {}", exe.replace('\'', "'\\''"), space_id)
+    format!("!{} credential {}", ssh::sh_quote(exe), space_id)
 }
 
 fn helper_value(space: &Space) -> Result<String> {
@@ -90,7 +90,8 @@ fn helper_value(space: &Space) -> Result<String> {
     Ok(helper_command(&exe.to_string_lossy(), &space.id))
 }
 
-/// Write author identity and the Spinney-only credential helper into a repo's local config.
+/// Write author identity, the Spinney-only credential helper and the space's SSH routing
+/// into a repo's local config.
 /// `git_dir` is a bare repo or a `.git` directory.
 pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
     let helper = helper_value(space)?;
@@ -118,17 +119,52 @@ pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
         git_dir,
         &["config", "--local", "--add", "credential.helper", &helper],
     )?;
+    configure_ssh(git_dir, space)
+}
+
+/// With an SSH key: `https://host/` remotes go over SSH with only that key. Without: remove
+/// what Spinney set (a hand-written `core.sshCommand` is left alone).
+fn configure_ssh(git_dir: &Path, space: &Space) -> Result<()> {
+    let (url_key, https) = ssh::insteadof(&space.host);
+    let set = |k: &str, v: &str| git::run(git_dir, &["config", "--local", "--replace-all", k, v]);
+    // Exit 5: nothing to unset.
+    let unset =
+        |k: &str| git::run_ok_codes(git_dir, &["config", "--local", "--unset-all", k], &[0, 5]);
+    match &space.ssh_key {
+        Some(key) => {
+            set("core.sshCommand", &ssh::ssh_command(key))?;
+            set(&url_key, &https)?;
+        }
+        None => {
+            let current =
+                git::run_ok_codes(git_dir, &["config", "--local", "core.sshCommand"], &[0, 1])?;
+            if ssh::is_ours(current.trim()) {
+                unset("core.sshCommand")?;
+                unset(&url_key)?;
+            }
+        }
+    }
     Ok(())
 }
 
 /// `-c` args (to place before the git subcommand) for runs that happen before any repo config.
 pub fn git_env_args(space: &Space) -> Result<Vec<String>> {
-    Ok(vec![
+    let mut args = vec![
         "-c".into(),
         "credential.helper=".into(),
         "-c".into(),
         format!("credential.helper={}", helper_value(space)?),
-    ])
+    ];
+    if let Some(key) = &space.ssh_key {
+        let (url_key, https) = ssh::insteadof(&space.host);
+        args.extend([
+            "-c".into(),
+            format!("core.sshCommand={}", ssh::ssh_command(key)),
+            "-c".into(),
+            format!("{url_key}={https}"),
+        ]);
+    }
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -144,6 +180,7 @@ mod tests {
             author_email: "test@example.com".into(),
             default_clone_dir: None,
             projects: vec![],
+            ssh_key: None,
         }
     }
 
@@ -239,8 +276,58 @@ mod tests {
     #[test]
     fn git_env_args_shape() {
         let a = git_env_args(&space()).unwrap();
+        assert_eq!(a.len(), 4, "HTTPS only: {a:?}");
         assert_eq!(a[..3], ["-c", "credential.helper=", "-c"]);
         assert!(a[3].starts_with("credential.helper=!'"));
+        let ssh_space = Space {
+            ssh_key: Some("/k/id".into()),
+            ..space()
+        };
+        let a = git_env_args(&ssh_space).unwrap();
+        assert_eq!(
+            a[5],
+            format!("core.sshCommand={}", ssh::ssh_command(Path::new("/k/id")))
+        );
+        assert_eq!(a[7], "url.git@github.com:.insteadOf=https://github.com/");
+    }
+
+    #[test]
+    fn configure_repo_routes_https_over_ssh_and_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git::run(dir, &["init", "-q", "--bare"]).unwrap();
+        let get = |k: &str| git::run_ok_codes(dir, &["config", "--local", k], &[0, 1]).unwrap();
+        let ssh_space = Space {
+            ssh_key: Some("/k/id".into()),
+            ..space()
+        };
+        configure_repo(dir, &ssh_space).unwrap();
+        configure_repo(dir, &ssh_space).unwrap(); // idempotent
+        assert_eq!(
+            get("core.sshCommand").trim(),
+            ssh::ssh_command(Path::new("/k/id"))
+        );
+        let url = git::run(
+            dir,
+            &["ls-remote", "--get-url", "https://github.com/o/r.git"],
+        );
+        assert_eq!(url.unwrap().trim(), "git@github.com:o/r.git");
+
+        configure_repo(dir, &space()).unwrap();
+        assert!(get("core.sshCommand").is_empty());
+        assert!(get("url.git@github.com:.insteadOf").is_empty());
+
+        git::run(
+            dir,
+            &["config", "--local", "core.sshCommand", "ssh -i ~/.ssh/mine"],
+        )
+        .unwrap();
+        configure_repo(dir, &space()).unwrap();
+        assert_eq!(
+            get("core.sshCommand").trim(),
+            "ssh -i ~/.ssh/mine",
+            "not ours: kept"
+        );
     }
 
     /// Touches the real Keychain; run manually: cargo test smoke -- --ignored

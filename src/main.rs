@@ -7,6 +7,7 @@ mod github;
 mod graph;
 mod project;
 mod refs;
+mod ssh;
 mod stage;
 mod status;
 mod ui;
