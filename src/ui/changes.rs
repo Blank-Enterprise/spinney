@@ -2,26 +2,49 @@
 //! Also the ProjectTab handlers behind those controls.
 
 use super::diff_view::{Selection, WorkDiff};
-use super::{Action, Center, ProjectTab};
+use super::{theme, Action, Center, ProjectTab};
 use crate::actions;
 use crate::diff::{commit_diff, file_diff};
 use crate::stage::{self, Direction};
 use crate::status::{self, Change, FileStatus, Status};
-use eframe::egui;
+use eframe::egui::{self, Align, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
-/// Commit needs a non-blank message and something staged.
-pub fn commit_enabled(message: &str, status: &Status) -> bool {
-    !message.trim().is_empty() && !status.staged.is_empty()
+/// Commit needs a non-blank summary and something staged.
+pub fn commit_enabled(summary: &str, status: &Status) -> bool {
+    !summary.trim().is_empty() && !status.staged.is_empty()
 }
 
-fn letter(c: &Change) -> &'static str {
+/// The message git gets: the summary, then a blank line and the description if there is one.
+pub fn commit_message(summary: &str, description: &str) -> String {
+    let mut m = summary.trim().to_string();
+    if !description.trim().is_empty() {
+        m += "\n\n";
+        m += description.trim_end();
+    }
+    m
+}
+
+/// Every path to unstage for "Unstage all" (both sides of a rename).
+pub fn unstage_paths(staged: &[FileStatus]) -> Vec<&str> {
+    let mut paths = vec![];
+    for f in staged {
+        paths.push(f.path.as_str());
+        if let Change::Renamed { from } = &f.change {
+            paths.push(from.as_str());
+        }
+    }
+    paths
+}
+
+/// Status badge letter and colour.
+fn badge(c: &Change) -> (&'static str, Color32) {
     match c {
-        Change::Modified => "M",
-        Change::Added => "A",
-        Change::Deleted => "D",
-        Change::Renamed { .. } => "R",
-        Change::Untracked => "U",
-        Change::Conflicted => "!",
+        Change::Modified => ("M", theme::WARN),
+        Change::Added => ("A", theme::ADDED),
+        Change::Deleted => ("D", theme::DELETED),
+        Change::Renamed { .. } => ("R", theme::RENAMED),
+        Change::Untracked => ("?", theme::UNTRACKED),
+        Change::Conflicted => ("!", theme::DELETED),
     }
 }
 
@@ -32,6 +55,8 @@ enum List {
     Staged,
 }
 
+const COMMIT_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
+
 pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) {
     if let Some(i) = tab.selected_commit {
         commit_files(ui, tab, i, actions);
@@ -41,23 +66,23 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
         Center::Diff(w) => Some((w.fd.path.clone(), w.staged)),
         _ => None,
     };
-    egui::Panel::bottom("commit_box").show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut tab.commit_msg)
-                .hint_text("Commit message")
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
-        let enabled = commit_enabled(&tab.commit_msg, &tab.status);
-        if ui
-            .add_enabled(enabled, egui::Button::new("Commit"))
-            .clicked()
-        {
-            actions.push(Action::Commit);
-        }
-        ui.add_space(4.0);
-    });
+    let enabled = commit_enabled(&tab.commit_summary, &tab.status);
+    // Before the text fields see the key, so ⌘↵ never inserts a newline.
+    if enabled && ui.input_mut(|i| i.consume_shortcut(&COMMIT_KEY)) {
+        actions.push(Action::Commit);
+    }
+    let n = tab.status.changed_files();
+    let branch = super::toolbar::branch_label(tab);
+    let noun = if n == 1 { "change" } else { "changes" };
+    ui.label(RichText::new(format!("{n} {noun} on {branch}")).strong());
+    ui.add_space(4.0);
+    egui::Panel::bottom("commit_box")
+        .frame(egui::Frame::new().inner_margin(egui::Margin {
+            top: 8,
+            ..Default::default()
+        }))
+        .show_separator_line(false)
+        .show(ui, |ui| commit_card(ui, tab, enabled, actions));
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -68,6 +93,33 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             file_list(ui, List::Unstaged, &st.unstaged, &open, actions);
             file_list(ui, List::Staged, &st.staged, &open, actions);
         });
+}
+
+fn commit_card(ui: &mut egui::Ui, tab: &mut ProjectTab, enabled: bool, actions: &mut Vec<Action>) {
+    theme::card().show(ui, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut tab.commit_summary)
+                .hint_text("Commit summary")
+                .frame(egui::Frame::new())
+                .desired_width(f32::INFINITY),
+        );
+        ui.separator();
+        ui.add(
+            egui::TextEdit::multiline(&mut tab.commit_desc)
+                .hint_text("Description")
+                .frame(egui::Frame::new())
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(4.0);
+        let k = tab.status.staged.len();
+        let label = format!("Commit {k} {}", if k == 1 { "file" } else { "files" });
+        let button = theme::primary(label).min_size(egui::vec2(ui.available_width(), 28.0));
+        let r = ui.add_enabled(enabled, button).on_hover_text("⌘↵");
+        if r.clicked() {
+            actions.push(Action::Commit);
+        }
+    });
 }
 
 fn file_list(
@@ -83,15 +135,46 @@ fn file_list(
         List::Staged => ("Staged", "Unstage"),
     };
     let staged = list == List::Staged;
-    ui.strong(format!("{title} ({})", files.len()));
+    ui.horizontal(|ui| {
+        ui.label(theme::section(&format!("{title} · {}", files.len())));
+        let all = match list {
+            List::Unstaged => Some(("Stage all", Action::StageAll)),
+            List::Staged => Some(("Unstage all", Action::UnstageAll)),
+            List::Conflicted => None,
+        };
+        if let Some((label, action)) = all {
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let b = egui::Button::new(RichText::new(label).size(11.5)).small();
+                if ui.add_enabled(!files.is_empty(), b).clicked() {
+                    actions.push(action);
+                }
+            });
+        }
+    });
     for f in files {
-        ui.horizontal(|ui| {
-            if ui.small_button(button).clicked() {
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            let b = egui::Button::new(RichText::new(button).size(11.5)).small();
+            if ui.add(b).clicked() {
                 actions.push(Action::StageFile(f.clone(), staged));
             }
             let is_open =
                 list != List::Conflicted && open.as_ref() == Some(&(f.path.clone(), staged));
-            let r = ui.selectable_label(is_open, format!("{}  {}", letter(&f.change), f.path));
+            let (letter, color) = badge(&f.change);
+            let row = egui::Button::selectable(
+                is_open,
+                (
+                    RichText::new(format!(" {letter} "))
+                        .size(10.5)
+                        .strong()
+                        .color(color)
+                        .background_color(color.gamma_multiply(0.2)),
+                    RichText::new(&f.path).size(12.5),
+                ),
+            )
+            .right_text("") // grows, keeping the content left-aligned
+            .truncate()
+            .min_size(egui::vec2(ui.available_width(), 0.0));
+            let r = ui.add(row);
             let r = match &f.change {
                 Change::Renamed { from } => r.on_hover_text(format!("renamed from {from}")),
                 _ => r,
@@ -108,12 +191,21 @@ fn file_list(
 fn commit_files(ui: &mut egui::Ui, tab: &ProjectTab, i: usize, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         let sha = tab.rows.get(i).map_or("", |r| &r.commit.sha);
-        ui.strong(format!("Commit {}", sha.get(..8).unwrap_or(sha)));
-        if ui.small_button("Working copy").clicked() {
-            actions.push(Action::DeselectCommit);
-        }
+        ui.label(RichText::new(format!("Commit {}", sha.get(..8).unwrap_or(sha))).strong());
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button("Working copy").clicked() {
+                actions.push(Action::DeselectCommit);
+            }
+        });
     });
-    ui.separator();
+    if let Some(r) = tab.rows.get(i) {
+        ui.label(RichText::new(&r.commit.subject).color(theme::TEXT));
+    }
+    ui.add_space(6.0);
+    ui.label(theme::section(&format!(
+        "Files · {}",
+        tab.commit_files.len()
+    )));
     if tab.commit_files.is_empty() {
         ui.weak("No file changes.");
     }
@@ -122,7 +214,11 @@ fn commit_files(ui: &mut egui::Ui, tab: &ProjectTab, i: usize, actions: &mut Vec
         .show(ui, |ui| {
             for (k, f) in tab.commit_files.iter().enumerate() {
                 let open = matches!(&tab.center, Center::CommitFile(fd) if fd.path == f.path);
-                if ui.selectable_label(open, &f.path).clicked() {
+                let row = egui::Button::selectable(open, RichText::new(&f.path).size(12.5))
+                    .right_text("")
+                    .truncate()
+                    .min_size(egui::vec2(ui.available_width(), 0.0));
+                if ui.add(row).clicked() {
                     actions.push(Action::OpenCommitFile(k));
                 }
             }
@@ -209,11 +305,29 @@ impl ProjectTab {
         self.reload_changes(errors);
     }
 
+    /// Stage everything, or with `unstage` unstage every staged file.
+    pub(super) fn stage_all(&mut self, unstage: bool, errors: &mut Vec<String>) {
+        let wt = &self.active_worktree;
+        let res = if unstage {
+            unstage_paths(&self.status.staged)
+                .into_iter()
+                .try_for_each(|p| stage::unstage_file(wt, p))
+        } else {
+            stage::stage_all(wt)
+        };
+        if let Err(e) = res {
+            errors.push(format!("{e:#}"));
+        }
+        self.after_stage(errors);
+    }
+
     /// Commit the staged changes; on success clear the message and refresh everything.
     pub(super) fn commit(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
-        match actions::commit(&self.active_worktree, &self.commit_msg) {
+        let message = commit_message(&self.commit_summary, &self.commit_desc);
+        match actions::commit(&self.active_worktree, &message) {
             Ok(()) => {
-                self.commit_msg.clear();
+                self.commit_summary.clear();
+                self.commit_desc.clear();
                 self.refresh(ctx, errors);
             }
             Err(e) => errors.push(format!("commit: {e:#}")),
@@ -254,5 +368,30 @@ mod tests {
         assert!(commit_enabled("msg", &st));
         assert!(!commit_enabled("", &st));
         assert!(!commit_enabled("  \n\t", &st));
+    }
+
+    #[test]
+    fn message_is_summary_plus_optional_description() {
+        assert_eq!(commit_message(" fix: x ", ""), "fix: x");
+        assert_eq!(commit_message("fix: x", " \n "), "fix: x");
+        assert_eq!(
+            commit_message("fix: x", "why\nmore\n"),
+            "fix: x\n\nwhy\nmore"
+        );
+    }
+
+    #[test]
+    fn unstage_all_covers_both_paths_of_a_rename() {
+        let staged = [
+            FileStatus {
+                path: "a".into(),
+                change: Change::Added,
+            },
+            FileStatus {
+                path: "new".into(),
+                change: Change::Renamed { from: "old".into() },
+            },
+        ];
+        assert_eq!(unstage_paths(&staged), ["a", "new", "old"]);
     }
 }

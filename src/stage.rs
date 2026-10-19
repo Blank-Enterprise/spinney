@@ -149,6 +149,12 @@ pub fn stage_file(worktree: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stage every change in the worktree (`git add -A`).
+pub fn stage_all(worktree: &Path) -> Result<()> {
+    git::run(worktree, &["add", "-A"])?;
+    Ok(())
+}
+
 pub fn unstage_file(worktree: &Path, path: &str) -> Result<()> {
     // `restore --staged` needs HEAD; before the first commit `reset` drops the path from the
     // index (`rm --cached` would refuse once the file was edited after staging).
@@ -445,6 +451,20 @@ mod tests {
             "x\ny\n",
             "worktree kept"
         );
+    }
+
+    #[test]
+    fn stage_all_stages_every_kind() {
+        let tmp = repo("f.txt", BASE, WORK);
+        let d = tmp.path();
+        fs::write(d.join("new.txt"), "n\n").unwrap();
+        stage_all(d).unwrap();
+        let st = crate::status::status(d).unwrap();
+        assert!(st.unstaged.is_empty(), "{st:?}");
+        assert_eq!(st.staged.len(), 2);
+        fs::remove_file(d.join("f.txt")).unwrap();
+        stage_all(d).unwrap();
+        assert!(g(d, &["ls-files", "f.txt"]).is_empty(), "deletion staged");
     }
 
     #[test]

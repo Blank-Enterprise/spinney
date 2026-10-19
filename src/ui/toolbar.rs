@@ -92,7 +92,7 @@ fn tab_button(ui: &mut egui::Ui, name: &str, active: bool, closable: bool) -> (b
 }
 
 /// Current branch of the tab's active worktree, for the toolbar.
-fn branch_label(tab: &ProjectTab) -> String {
+pub(super) fn branch_label(tab: &ProjectTab) -> String {
     tab.branches
         .iter()
         .find(|b| b.head && !b.remote)

@@ -27,13 +27,18 @@ pub const TEXT: Color32 = rgb(0xcfd6e4);
 pub const MUTED: Color32 = rgba(0xcfd6e4, 140);
 pub const ACCENT: Color32 = rgb(0x2ec4b6);
 pub const ACCENT_TEXT: Color32 = rgb(0x5fe0d3);
+/// Text on an accent fill.
+pub const ON_ACCENT: Color32 = rgb(0x062b27);
 /// Selected row background.
 pub const SEL_BG: Color32 = rgba(0x2ec4b6, 0x1a);
 /// Selected item background (sidebar, buttons).
 pub const SEL_STRONG: Color32 = rgba(0x2ec4b6, 0x22);
 pub const HOVER: Color32 = rgba(0xffffff, 0x0a);
 pub const WARN: Color32 = rgb(0xf6a945);
+pub const ADDED: Color32 = rgb(0x5fe0d3);
 pub const DELETED: Color32 = rgb(0xff6b6b);
+pub const RENAMED: Color32 = rgb(0xc084fc);
+pub const UNTRACKED: Color32 = rgb(0x8b93a7);
 
 /// Graph lane hues, in order.
 pub const LANES: [Color32; 8] = [
@@ -123,6 +128,22 @@ pub fn section(text: &str) -> RichText {
         .size(11.0)
         .extra_letter_spacing(0.8)
         .color(MUTED)
+}
+
+/// Teal call-to-action button.
+pub fn primary(text: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.into()).color(ON_ACCENT).strong())
+        .fill(ACCENT)
+        .stroke(Stroke::NONE)
+}
+
+/// Rounded, bordered card.
+pub fn card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(BG)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CARD_R)
+        .inner_margin(10)
 }
 
 /// Frame of a side panel.

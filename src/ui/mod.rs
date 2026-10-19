@@ -119,7 +119,8 @@ pub struct ProjectTab {
     commit_files: Vec<FileDiff>,
     center: Center,
     status: Status,
-    commit_msg: String,
+    commit_summary: String,
+    commit_desc: String,
     /// Sidebar filter text.
     filter: String,
 }
@@ -178,7 +179,8 @@ impl ProjectTab {
             commit_files: vec![],
             center: Center::Graph,
             status: Status::default(),
-            commit_msg: String::new(),
+            commit_summary: String::new(),
+            commit_desc: String::new(),
             filter: String::new(),
         };
         tab.log.request(PAGE);
@@ -367,6 +369,8 @@ pub enum Action {
     /// Stage the file, or unstage it when the flag is set.
     StageFile(FileStatus, bool),
     ApplyPatch(String, Direction),
+    StageAll,
+    UnstageAll,
     Commit,
     ToggleInline,
     CloseDiff,
@@ -584,6 +588,8 @@ impl SpinneyApp {
             | Action::OpenCommitFile(_)
             | Action::StageFile(..)
             | Action::ApplyPatch(..)
+            | Action::StageAll
+            | Action::UnstageAll
             | Action::Commit
             | Action::CloseDiff => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -719,6 +725,8 @@ fn tab_action(tab: &mut ProjectTab, action: Action, ctx: &egui::Context, errors:
         Action::OpenCommitFile(k) => tab.open_commit_file(k),
         Action::StageFile(f, unstage) => tab.stage_file(&f, unstage, errors),
         Action::ApplyPatch(p, dir) => tab.apply_patch(&p, dir, errors),
+        Action::StageAll => tab.stage_all(false, errors),
+        Action::UnstageAll => tab.stage_all(true, errors),
         Action::Commit => tab.commit(ctx, errors),
         Action::CloseDiff => tab.center = Center::Graph,
         _ => {}
