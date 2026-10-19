@@ -64,16 +64,143 @@ pub fn pull(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A push the remote turned down because it has commits this branch lacks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PushRejected {
+    pub worktree: PathBuf,
+    pub branch: String,
+}
+
+impl std::fmt::Display for PushRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "push of {} rejected (non-fast-forward)", self.branch)
+    }
+}
+
+impl std::error::Error for PushRejected {}
+
+/// What a force push may overwrite: `remote_ref` on `remote`, only while it is still at
+/// `expect`, the commit our remote-tracking ref pointed at when the user asked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lease {
+    pub worktree: PathBuf,
+    pub branch: String,
+    pub remote: String,
+    pub remote_ref: String,
+    /// The remote-tracking branch, e.g. `origin/main`.
+    pub tracking: String,
+    pub expect: String,
+    /// Commits at `expect` that are not on the branch: what the force push drops.
+    pub lost: usize,
+}
+
+/// A non-fast-forward rejection fails with `PushRejected`.
 pub fn push(worktree: &Path) -> Result<()> {
     let Some(branch) = refs::current_branch(worktree)? else {
         bail!("detached HEAD");
     };
+    let rejected = || PushRejected {
+        worktree: worktree.to_path_buf(),
+        branch: branch.clone(),
+    };
     if git::run(worktree, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok() {
-        git::run(worktree, &["push"])?;
+        push_porcelain(worktree, &["push", "--porcelain"], rejected)
     } else {
-        git::run(worktree, &["push", "-u", "origin", &branch])?;
+        let args = ["push", "--porcelain", "-u", "origin", &branch];
+        push_porcelain(worktree, &args, rejected)
     }
-    Ok(())
+}
+
+/// Snapshot the lease for force pushing the current branch to its upstream (or
+/// `origin/<branch>` when it has none).
+pub fn lease(worktree: &Path) -> Result<Lease> {
+    let Some(branch) = refs::current_branch(worktree)? else {
+        bail!("detached HEAD");
+    };
+    let format =
+        "--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)";
+    let local = format!("refs/heads/{branch}");
+    let up = git::run(worktree, &["for-each-ref", format, &local])?;
+    let fields: Vec<&str> = up.trim_end().split('\0').collect();
+    let (tip, tracking, remote, remote_ref) = match fields[..] {
+        [tip, short, remote, remote_ref] if tip.starts_with("refs/remotes/") => (
+            tip.to_string(),
+            short.to_string(),
+            remote.to_string(),
+            remote_ref.to_string(),
+        ),
+        _ => (
+            format!("refs/remotes/origin/{branch}"),
+            format!("origin/{branch}"),
+            "origin".to_string(),
+            local,
+        ),
+    };
+    let Ok(expect) = git::run(worktree, &["rev-parse", "--verify", "--quiet", &tip]) else {
+        bail!("{tracking} is unknown; fetch first");
+    };
+    let expect = expect.trim().to_string();
+    let range = format!("HEAD..{expect}");
+    let lost = git::run(worktree, &["rev-list", "--count", &range])?;
+    Ok(Lease {
+        worktree: worktree.to_path_buf(),
+        branch,
+        remote,
+        remote_ref,
+        tracking,
+        expect,
+        lost: lost.trim().parse()?,
+    })
+}
+
+/// `git push --force-with-lease` bound to the commit in `lease`, never a plain `--force`:
+/// if the remote moved since then (even if a later fetch saw it), git refuses.
+pub fn force_push(lease: &Lease) -> Result<()> {
+    let with_lease = format!("--force-with-lease={}:{}", lease.remote_ref, lease.expect);
+    let refspec = format!("refs/heads/{}:{}", lease.branch, lease.remote_ref);
+    let args = ["push", "--porcelain", &with_lease, &lease.remote, &refspec];
+    let out = git::output(&lease.worktree, &args)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    if porcelain_rejected(&out.stdout, &["(stale info)"]) {
+        bail!(
+            "{} has changed since {} was fetched; fetch and review it first",
+            lease.remote_ref.trim_start_matches("refs/heads/"),
+            lease.tracking
+        );
+    }
+    bail!("git push failed: {}", stderr(&out));
+}
+
+/// Run a `--porcelain` push; a non-fast-forward rejection becomes `rejected()`.
+fn push_porcelain(
+    worktree: &Path,
+    args: &[&str],
+    rejected: impl FnOnce() -> PushRejected,
+) -> Result<()> {
+    let out = git::output(worktree, args)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // Porcelain status lines are stable across git versions and locales, unlike the hints.
+    if porcelain_rejected(&out.stdout, &["(non-fast-forward)", "(fetch first)"]) {
+        return Err(rejected().into());
+    }
+    bail!("git push failed: {}", stderr(&out));
+}
+
+/// Some ref was `!` `[rejected]` for one of `reasons` in `git push --porcelain` output.
+fn porcelain_rejected(stdout: &[u8], reasons: &[&str]) -> bool {
+    String::from_utf8_lossy(stdout).lines().any(|l| {
+        let summary = l.strip_prefix("!\t").and_then(|l| l.split('\t').nth(1));
+        summary
+            .is_some_and(|s| s.starts_with("[rejected]") && reasons.iter().any(|r| s.ends_with(r)))
+    })
+}
+
+fn stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
 pub fn checkout(
@@ -334,6 +461,97 @@ mod tests {
         git::run(&main, &["checkout", "-q", "--detach"]).unwrap();
         let err = push(&main).unwrap_err();
         assert!(err.to_string().contains("detached HEAD"), "{err}");
+    }
+
+    /// A bare `remote` with one commit on `main` and two clones of it, `ours` and `theirs`.
+    fn two_clones() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        git::run(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        )
+        .unwrap();
+        let url = format!("file://{}", remote.display());
+        let clone = |name: &str| {
+            git::run(tmp.path(), &["clone", "-q", &url, name]).unwrap();
+            let dir = tmp.path().join(name);
+            git::run(&dir, &["config", "user.name", "Test User"]).unwrap();
+            git::run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+            dir
+        };
+        let ours = clone("ours");
+        write_commit(&ours, "a.txt");
+        git::run(&ours, &["push", "-q", "-u", "origin", "main"]).unwrap();
+        let theirs = clone("theirs");
+        (tmp, remote, ours, theirs)
+    }
+
+    fn head(dir: &Path, rev: &str) -> String {
+        git::run(dir, &["rev-parse", rev])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn rejected(err: anyhow::Error) -> PushRejected {
+        err.downcast::<PushRejected>().expect("non-fast-forward")
+    }
+
+    #[test]
+    fn push_behind_remote_is_rejected_as_non_fast_forward() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        write_commit(&theirs, "t.txt");
+        push(&theirs).unwrap();
+        write_commit(&ours, "o.txt");
+        // Unfetched remote commits ("fetch first") and fetched ones ("non-fast-forward").
+        let err = rejected(push(&ours).unwrap_err());
+        assert_eq!(err.branch, "main");
+        assert_eq!(err.worktree, ours);
+        fetch(&ours).unwrap();
+        rejected(push(&ours).unwrap_err());
+    }
+
+    #[test]
+    fn push_other_failure_is_not_rejection() {
+        let (_tmp, _remote, ours, _theirs) = two_clones();
+        git::run(&ours, &["remote", "set-url", "origin", "/nonexistent/repo"]).unwrap();
+        write_commit(&ours, "o.txt");
+        let err = push(&ours).unwrap_err();
+        assert!(err.downcast_ref::<PushRejected>().is_none(), "{err}");
+    }
+
+    #[test]
+    fn force_push_with_lease_overwrites_when_up_to_date() {
+        let (_tmp, remote, ours, theirs) = two_clones();
+        write_commit(&theirs, "t.txt");
+        push(&theirs).unwrap();
+        fetch(&ours).unwrap();
+        write_commit(&ours, "o.txt");
+        rejected(push(&ours).unwrap_err());
+
+        let lease = lease(&ours).unwrap();
+        assert_eq!(lease.tracking, "origin/main");
+        assert_eq!(lease.expect, head(&theirs, "HEAD"));
+        assert_eq!(lease.lost, 1);
+        force_push(&lease).unwrap();
+        assert_eq!(head(&remote, "main"), head(&ours, "HEAD"));
+    }
+
+    #[test]
+    fn force_push_with_lease_refuses_when_remote_moved_after_fetch() {
+        let (_tmp, remote, ours, theirs) = two_clones();
+        write_commit(&ours, "o.txt");
+        let lease = lease(&ours).unwrap();
+        assert_eq!(lease.lost, 0);
+        write_commit(&theirs, "t.txt");
+        push(&theirs).unwrap();
+        // A fetch after the lease was taken must not let us drop their commit unseen.
+        fetch(&ours).unwrap();
+
+        let err = force_push(&lease).unwrap_err();
+        assert!(err.to_string().contains("fetch and review"), "{err}");
+        assert_eq!(head(&remote, "main"), head(&theirs, "HEAD"));
     }
 
     #[test]
