@@ -37,6 +37,11 @@ pub const HOVER: Color32 = rgba(0xffffff, 0x0a);
 pub const WARN: Color32 = rgb(0xf6a945);
 pub const ADDED: Color32 = rgb(0x5fe0d3);
 pub const DELETED: Color32 = rgb(0xff6b6b);
+/// Diff line tints, normal and selected.
+pub const DIFF_ADD: Color32 = rgba(0x2ec4b6, 0x1f);
+pub const DIFF_DEL: Color32 = rgba(0xff6b6b, 0x1f);
+pub const DIFF_ADD_SEL: Color32 = rgba(0x2ec4b6, 0x48);
+pub const DIFF_DEL_SEL: Color32 = rgba(0xff6b6b, 0x48);
 pub const RENAMED: Color32 = rgb(0xc084fc);
 pub const UNTRACKED: Color32 = rgb(0x8b93a7);
 

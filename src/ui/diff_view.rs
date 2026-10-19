@@ -1,10 +1,10 @@
 //! Centre-panel diff: side-by-side or inline, with line/hunk selection for staging.
 
-use super::{Action, Center};
+use super::{theme, Action, Center};
 use crate::diff::{side_by_side, FileDiff, LineKind};
 use crate::stage::{build_patch, Direction};
 use crate::status::{Change, FileStatus};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Vec2};
 use std::collections::HashSet;
 
 /// Selected `(hunk_idx, line_idx)` lines of the displayed diff, all in one hunk.
@@ -127,15 +127,21 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
         .as_ref()
         .is_some_and(|(_, change, ..)| line_staging(change, fd));
     ui.horizontal(|ui| {
-        if ui.button("← Graph").on_hover_text("Esc").clicked() {
-            actions.push(Action::CloseDiff);
-        }
-        ui.strong(&fd.path);
-        let mut inl = inline;
-        if ui.checkbox(&mut inl, "Inline").changed() {
-            actions.push(Action::ToggleInline);
-        }
+        ui.label(RichText::new(&fd.path).strong().color(Color32::WHITE));
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            let close =
+                egui::Button::new(RichText::new("×").size(16.0).color(theme::MUTED)).frame(false);
+            if ui.add(close).on_hover_text("Close (Esc)").clicked() {
+                actions.push(Action::CloseDiff);
+            }
+            if segmented(ui, inline) {
+                actions.push(Action::ToggleInline);
+            }
+        });
+    });
+    ui.horizontal(|ui| {
         let Some((staged, change, dir, sel)) = &work else {
+            ui.weak("committed");
             return;
         };
         ui.weak(if *staged { "staged" } else { "unstaged" });
@@ -162,6 +168,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
             }
         }
     });
+    ui.add_space(2.0);
     ui.separator();
     if fd.binary {
         ui.weak("Binary file.");
@@ -232,8 +239,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
                             match idx {
                                 Some(li) => cell.line(g, t, hi, li, old, false),
                                 None => {
-                                    let fill = cell.ui.visuals().faint_bg_color;
-                                    cell.ui.painter().rect_filled(side, 0.0, fill);
+                                    cell.ui.painter().rect_filled(side, 0.0, theme::PANEL);
                                 }
                             }
                         }
@@ -241,6 +247,26 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
                 }
             }
         });
+}
+
+/// "Side by side | Inline" segmented control; true when the other mode was clicked.
+fn segmented(ui: &mut egui::Ui, inline: bool) -> bool {
+    let mut toggle = false;
+    egui::Frame::new()
+        .fill(theme::FIELD)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(theme::WIDGET_R)
+        .inner_margin(2)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            // Right to left: Inline is added first so it lands on the right.
+            for (label, mode) in [("Inline", true), ("Side by side", false)] {
+                let b = egui::Button::selectable(inline == mode, RichText::new(label).size(11.5))
+                    .small();
+                toggle |= ui.add(b).clicked() && inline != mode;
+            }
+        });
+    toggle
 }
 
 fn split(r: Rect, at: f32) -> (Rect, Rect) {
@@ -269,13 +295,13 @@ fn hunk_header(
     font: &FontId,
     actions: &mut Vec<Action>,
 ) {
-    ui.painter()
-        .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+    ui.painter().rect_filled(rect, 0.0, theme::PANEL);
     let mut x = rect.left() + 4.0;
     if let Some((staged, dir)) = stage {
         let label = if staged { "Unstage hunk" } else { "Stage hunk" };
-        let b = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(96.0, ROW_H));
-        if ui.put(b, egui::Button::new(label).small()).clicked() {
+        let b = Rect::from_min_size(Pos2::new(x, rect.top() + 1.0), Vec2::new(90.0, ROW_H - 2.0));
+        let button = egui::Button::new(RichText::new(label).size(11.0)).small();
+        if ui.put(b, button).clicked() {
             if let Some(p) = build_patch(fd, &hunk_lines(fd, hi), dir) {
                 actions.push(Action::ApplyPatch(p, dir));
             }
@@ -287,7 +313,7 @@ fn hunk_header(
         Align2::LEFT_CENTER,
         &fd.hunks[hi].header,
         font.clone(),
-        ui.visuals().weak_text_color(),
+        theme::MUTED,
     );
 }
 
@@ -309,14 +335,12 @@ impl Cell<'_> {
         let l = &self.fd.hunks[hi].lines[li];
         let at = (hi, li);
         let selected = self.sel.as_ref().is_some_and(|s| s.lines.contains(&at));
-        let bg = if selected {
-            Some(self.ui.visuals().selection.bg_fill)
-        } else {
-            match l.kind {
-                LineKind::Add => Some(Color32::from_rgba_unmultiplied(0x5c, 0xb8, 0x5c, 48)),
-                LineKind::Del => Some(Color32::from_rgba_unmultiplied(0xe5, 0x6b, 0x6f, 48)),
-                LineKind::Context => None,
-            }
+        let bg = match (l.kind, selected) {
+            (LineKind::Add, false) => Some(theme::DIFF_ADD),
+            (LineKind::Add, true) => Some(theme::DIFF_ADD_SEL),
+            (LineKind::Del, false) => Some(theme::DIFF_DEL),
+            (LineKind::Del, true) => Some(theme::DIFF_DEL_SEL),
+            (LineKind::Context, _) => None,
         };
         let row = g.union(t);
         let painter = self
@@ -326,7 +350,11 @@ impl Cell<'_> {
         if let Some(bg) = bg {
             painter.rect_filled(row, 0.0, bg);
         }
-        let weak = self.ui.visuals().weak_text_color();
+        if selected {
+            let edge = Rect::from_min_size(row.min, Vec2::new(3.0, row.height()));
+            painter.rect_filled(edge, 0.0, theme::ACCENT);
+        }
+        let weak = theme::MUTED;
         let no = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
         let nums = if inline {
             vec![
@@ -363,7 +391,7 @@ impl Cell<'_> {
             Align2::LEFT_CENTER,
             text,
             self.font.clone(),
-            self.ui.visuals().text_color(),
+            theme::TEXT,
         );
         let Some(sel) = self.sel.as_deref_mut() else {
             return;
