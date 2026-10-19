@@ -14,7 +14,7 @@ pub enum Direction {
 
 /// Build a patch from the selected `(hunk_idx, line_idx)` lines of `fd`.
 /// Stage takes an index→worktree diff; Unstage takes a HEAD→index diff, applied reversed.
-/// `None` when the file is binary or no Add/Del line is selected.
+/// `None` when the file is binary, its diff is not valid UTF-8, or no Add/Del line is selected.
 /// Only for Modified files: added, deleted, untracked and mode-changed files are staged
 /// at file level (`stage_file` / `unstage_file`), since the patch carries no mode headers.
 pub fn build_patch(
@@ -22,7 +22,7 @@ pub fn build_patch(
     selected: &HashSet<(usize, usize)>,
     dir: Direction,
 ) -> Option<String> {
-    if fd.binary {
+    if fd.binary || fd.lossy {
         return None;
     }
     let mut body = String::new();
@@ -403,6 +403,24 @@ mod tests {
             build_patch(&bin, &whole_hunk(&fd, 0), Direction::Stage),
             None
         );
+    }
+
+    #[test]
+    fn non_utf8_refuses_line_staging_but_file_stage_is_exact() {
+        let tmp = repo("f.txt", "a\nb\nc\n", "a\nb\nc\n");
+        let d = tmp.path();
+        let work: &[u8] = b"a\nb\ncaf\xe9\nc\n";
+        fs::write(d.join("f.txt"), work).unwrap();
+        let fd = file_diff(d, "f.txt", false).unwrap();
+        assert!(fd.lossy);
+        assert_eq!(
+            build_patch(&fd, &whole_hunk(&fd, 0), Direction::Stage),
+            None
+        );
+        stage_file(d, "f.txt").unwrap();
+        assert_eq!(git::run_bytes(d, &["show", ":f.txt"], &[0]).unwrap(), work);
+        let utf8 = repo("g.txt", BASE, WORK);
+        assert!(!file_diff(utf8.path(), "g.txt", false).unwrap().lossy);
     }
 
     #[test]

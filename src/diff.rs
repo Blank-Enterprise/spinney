@@ -34,6 +34,8 @@ pub struct Hunk {
 pub struct FileDiff {
     pub path: String,
     pub binary: bool,
+    /// The diff was not valid UTF-8, so `text` fields are lossy and must not be written back.
+    pub lossy: bool,
     pub hunks: Vec<Hunk>,
 }
 
@@ -120,6 +122,7 @@ pub fn parse(unified: &str) -> Vec<FileDiff> {
             files.push(FileDiff {
                 path: header_path(rest),
                 binary: false,
+                lossy: false,
                 hunks: Vec::new(),
             });
         } else if let Some(file) = files.last_mut() {
@@ -147,6 +150,7 @@ fn empty(path: &str) -> FileDiff {
     FileDiff {
         path: path.to_string(),
         binary: false,
+        lossy: false,
         hunks: Vec::new(),
     }
 }
@@ -182,20 +186,23 @@ pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> 
         // --no-index exits 1 when the files differ.
         let mut args = base.to_vec();
         args.extend(["--no-index", "--", "/dev/null", path]);
-        git::run_ok_codes(worktree, &args, &[0, 1])?
+        git::run_bytes(worktree, &args, &[0, 1])?
     } else {
         let mut args = base.to_vec();
         if staged {
             args.push("--cached");
         }
         args.extend(["--", path]);
-        git::run(worktree, &args)?
+        git::run_bytes(worktree, &args, &[0])?
     };
-    Ok(parse(&out)
+    let lossy = std::str::from_utf8(&out).is_err();
+    let text = String::from_utf8_lossy(&out);
+    Ok(parse(&text)
         .into_iter()
         .next()
         .map(|mut f| {
             f.path = path.to_string();
+            f.lossy = lossy;
             f
         })
         .unwrap_or_else(|| empty(path)))

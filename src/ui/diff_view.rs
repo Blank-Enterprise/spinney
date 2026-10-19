@@ -53,9 +53,9 @@ pub fn selectable(fd: &FileDiff, (hi, li): (usize, usize)) -> bool {
         .is_some_and(|l| l.kind != LineKind::Context)
 }
 
-/// Line and hunk staging only for text files whose change is a plain modification.
+/// Line and hunk staging only for UTF-8 text files whose change is a plain modification.
 pub fn line_staging(change: &Change, fd: &FileDiff) -> bool {
-    *change == Change::Modified && !fd.binary
+    *change == Change::Modified && !fd.binary && !fd.lossy
 }
 
 /// Every Add/Del line of hunk `hi`.
@@ -418,6 +418,7 @@ mod tests {
         FileDiff {
             path: "f".into(),
             binary: false,
+            lossy: false,
             hunks: vec![hunk(&[Ctx, Del, Del, Add, Ctx]), hunk(&[Ctx, Add, Ctx])],
         }
     }
@@ -496,6 +497,11 @@ mod tests {
             ..fd.clone()
         };
         assert!(!line_staging(&Change::Modified, &bin));
+        let lossy = FileDiff {
+            lossy: true,
+            ..fd.clone()
+        };
+        assert!(!line_staging(&Change::Modified, &lossy));
         for c in [
             Change::Added,
             Change::Deleted,

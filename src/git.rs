@@ -14,7 +14,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-fn finish(child: Child, args: &[&str], ok: &[i32]) -> Result<String> {
+fn finish(child: Child, args: &[&str], ok: &[i32]) -> Result<Vec<u8>> {
     let out = child.wait_with_output()?;
     if !out.status.code().is_some_and(|c| ok.contains(&c)) {
         bail!(
@@ -23,7 +23,7 @@ fn finish(child: Child, args: &[&str], ok: &[i32]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
 /// Run git in `dir`, returning stdout. A non-zero exit becomes an error carrying stderr.
@@ -33,14 +33,23 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// Like `run`, but exit codes listed in `ok` count as success (e.g. `diff --no-index` exits 1).
 pub fn run_ok_codes(dir: &Path, args: &[&str], ok: &[i32]) -> Result<String> {
+    run_bytes(dir, args, ok).map(lossy)
+}
+
+/// Like `run_ok_codes`, but returns stdout's raw bytes (no lossy UTF-8 conversion).
+pub fn run_bytes(dir: &Path, args: &[&str], ok: &[i32]) -> Result<Vec<u8>> {
     exec(dir, args, &[], ok)
 }
 
 pub fn run_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Result<String> {
-    exec(dir, args, stdin, &[0])
+    exec(dir, args, stdin, &[0]).map(lossy)
 }
 
-fn exec(dir: &Path, args: &[&str], stdin: &[u8], ok: &[i32]) -> Result<String> {
+fn lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn exec(dir: &Path, args: &[&str], stdin: &[u8], ok: &[i32]) -> Result<Vec<u8>> {
     let mut child = command(dir, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
