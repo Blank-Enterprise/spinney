@@ -534,7 +534,7 @@ fn repo_browser(ui: &mut egui::Ui, d: &mut CloneDialog) -> bool {
             });
         }
         Browse::Done(Listing::NoToken) => {
-            ui.label("Add a personal access token to this space to browse repositories");
+            ui.label("Connect this space to its GitHub account to browse repositories");
             d.edit_space = ui.button("Edit space").clicked();
         }
         Browse::Done(Listing::Failed(e)) => {

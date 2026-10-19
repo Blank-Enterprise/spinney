@@ -17,6 +17,15 @@ pub fn pick_folder(title: &str, start: Option<&Path>) -> Option<PathBuf> {
     dialog.pick_folder()
 }
 
+/// Native file picker, starting in `start` when that is a folder. Blocks like `pick_folder`.
+pub fn pick_file(title: &str, start: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    if let Some(dir) = start.filter(|d| d.is_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_file()
+}
+
 /// Trimmed `input` with a leading `~` (alone or before `/`) replaced by `home`.
 pub fn expand_tilde(input: &str, home: Option<&Path>) -> PathBuf {
     let s = input.trim();

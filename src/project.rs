@@ -232,6 +232,7 @@ mod tests {
             author_email: "test@example.com".into(),
             default_clone_dir: None,
             projects: vec![],
+            ssh_key: None,
         }
     }
 
