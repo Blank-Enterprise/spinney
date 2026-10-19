@@ -474,6 +474,10 @@ pub enum Action {
     AskDeleteBranch(String),
     /// Ask before deleting `remote/branch` on its remote.
     AskDeleteRemote(String),
+    /// Ask how to merge the branch (local or remote) into the checked-out one.
+    AskMerge(String),
+    /// Ask before rebasing the checked-out branch onto the branch (local or remote).
+    AskRebase(String),
     /// New branch from the given base: a worktree in the worktree layout, else a switch.
     NewBranch(String),
     /// Open Terminal.app at the active worktree.
@@ -894,6 +898,8 @@ impl SpinneyApp {
                 }
             }
             Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
+            Action::AskMerge(branch) => self.ask_merge(branch, false, &mut errors),
+            Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
             Action::NewBranch(base) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     self.dialogs.new_worktree = Some(NewWorktreeDialog {

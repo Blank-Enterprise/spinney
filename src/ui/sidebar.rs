@@ -85,6 +85,7 @@ fn tree(
     nodes: &[Node],
     filtering: bool,
     layout: Layout,
+    current: Option<&str>,
     actions: &mut Vec<Action>,
 ) {
     for n in nodes {
@@ -103,17 +104,25 @@ fn tree(
                 } else {
                     header
                 };
-                let r = header.show(ui, |ui| tree(ui, id, children, filtering, layout, actions));
+                let r = header.show(ui, |ui| {
+                    tree(ui, id, children, filtering, layout, current, actions)
+                });
                 r.header_response
                     .on_hover_text(format!("{path} · {}", count(children)));
             }
-            Node::Branch(b) => branch_row(ui, b, layout, actions),
+            Node::Branch(b) => branch_row(ui, b, layout, current, actions),
         }
     }
 }
 
 /// One branch: its last name segment, ✓ when checked out, ahead/behind on the right.
-fn branch_row(ui: &mut egui::Ui, b: &Branch, layout: Layout, actions: &mut Vec<Action>) {
+fn branch_row(
+    ui: &mut egui::Ui,
+    b: &Branch,
+    layout: Layout,
+    current: Option<&str>,
+    actions: &mut Vec<Action>,
+) {
     let leaf = b.name.rsplit('/').next().unwrap_or(&b.name);
     let mut track = String::new();
     if b.ahead > 0 {
@@ -128,7 +137,7 @@ fn branch_row(ui: &mut egui::Ui, b: &Branch, layout: Layout, actions: &mut Vec<A
         leaf.to_string()
     };
     let r = row(ui, b.head, text, track.trim().to_string()).on_hover_text(&b.name);
-    branch_menu(&r, layout, b, actions);
+    branch_menu(&r, layout, b, current, actions);
 }
 
 /// Case-insensitive substring match of the sidebar filter on a branch or worktree name.
@@ -174,9 +183,15 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .filter(|b| !b.remote && filter_matches(q, &b.name))
             .collect();
         let filtering = !q.trim().is_empty();
+        // None when HEAD is detached.
+        let current = tab
+            .branches
+            .iter()
+            .find(|b| b.head && !b.remote)
+            .map(|b| b.name.as_str());
         section(ui, "local", "Local", local.len(), true, |ui| {
             let nodes = branch_tree(&local);
-            tree(ui, "local", &nodes, filtering, tab.layout, actions);
+            tree(ui, "local", &nodes, filtering, tab.layout, current, actions);
         });
         let remote: Vec<_> = tab
             .branches
@@ -186,7 +201,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
         section(ui, "remote", "Remote", remote.len(), true, |ui| {
             // `origin/feat/x`: the remote is the first folder level.
             let nodes = branch_tree(&remote);
-            tree(ui, "remote", &nodes, filtering, tab.layout, actions);
+            tree(
+                ui, "remote", &nodes, filtering, tab.layout, current, actions,
+            );
         });
         let worktrees: Vec<_> = tab
             .worktrees
@@ -249,7 +266,26 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
     });
 }
 
-fn branch_menu(r: &egui::Response, layout: Layout, b: &Branch, actions: &mut Vec<Action>) {
+/// "Merge…" / "Rebase…" menu labels for `branch`; None for the checked-out branch itself.
+/// With HEAD detached (`current` None) they still show, disabled.
+pub fn merge_labels(current: Option<&str>, branch: &str) -> Option<(String, String)> {
+    match current {
+        Some(c) if c == branch => None,
+        Some(c) => Some((
+            format!("Merge {branch} into {c}…"),
+            format!("Rebase {c} onto {branch}…"),
+        )),
+        None => Some((format!("Merge {branch}…"), format!("Rebase onto {branch}…"))),
+    }
+}
+
+fn branch_menu(
+    r: &egui::Response,
+    layout: Layout,
+    b: &Branch,
+    current: Option<&str>,
+    actions: &mut Vec<Action>,
+) {
     let name = b.name.as_str();
     r.context_menu(|ui| {
         if ui.button("Checkout").clicked() {
@@ -269,6 +305,22 @@ fn branch_menu(r: &egui::Response, layout: Layout, b: &Branch, actions: &mut Vec
         if r.clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));
             ui.close();
+        }
+        if let Some((merge, rebase)) = merge_labels(current, name) {
+            ui.separator();
+            let items = [
+                (merge, Action::AskMerge(name.to_string())),
+                (rebase, Action::AskRebase(name.to_string())),
+            ];
+            for (label, action) in items {
+                let r = ui
+                    .add_enabled(current.is_some(), egui::Button::new(label))
+                    .on_disabled_hover_text("Check out a branch first");
+                if r.clicked() {
+                    actions.push(action);
+                    ui.close();
+                }
+            }
         }
         ui.separator();
         let (label, action) = if b.remote {
@@ -370,6 +422,23 @@ mod tests {
                 "upstream/",
                 "  upstream/main"
             ]
+        );
+    }
+
+    #[test]
+    fn merge_items_hidden_for_the_checked_out_branch() {
+        assert_eq!(merge_labels(Some("main"), "main"), None);
+        assert_eq!(
+            merge_labels(Some("main"), "origin/main"),
+            Some((
+                "Merge origin/main into main…".into(),
+                "Rebase main onto origin/main…".into()
+            ))
+        );
+        let (merge, rebase) = merge_labels(None, "feat/x").unwrap();
+        assert_eq!(
+            (merge.as_str(), rebase.as_str()),
+            ("Merge feat/x…", "Rebase onto feat/x…")
         );
     }
 
