@@ -50,17 +50,17 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
                     ("Author name", &mut e.author_name),
                     ("Author email", &mut e.author_email),
                 ] {
-                    ui.label(label);
+                    ui.label(theme::caption(label));
                     ui.text_edit_singleline(value);
                     ui.end_row();
                 }
-                ui.label("Default clone folder");
+                ui.label(theme::caption("Default clone folder"));
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut e.clone_dir);
                     browse = ui.button("Browse").clicked();
                 });
                 ui.end_row();
-                ui.label("Personal access token");
+                ui.label(theme::caption("Personal access token"));
                 let hint = if e.id.is_some() {
                     "unchanged"
                 } else {
@@ -73,9 +73,9 @@ pub fn editor(ctx: &egui::Context, e: &mut SpaceEdit) -> Option<bool> {
                 );
                 ui.end_row();
             });
-            ui.weak(SCOPE_HINT);
+            ui.label(theme::caption(SCOPE_HINT));
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.add(theme::primary("Save")).clicked() {
                     result = Some(true);
                 }
                 if ui.button("Cancel").clicked() {

@@ -1,65 +1,79 @@
 //! GitKraken-style New Tab page: Open / Clone / Create and the space's recent projects.
 
-use super::{paths, Action};
+use super::{paths, theme, Action};
 use crate::config::Space;
-use eframe::egui;
+use eframe::egui::{self, Color32, RichText, Stroke};
 use std::path::Path;
 
 pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut Vec<Action>) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.add_space(16.0);
-        ui.heading("Repositories");
-        ui.add_space(8.0);
+        ui.set_max_width(640.0);
+        ui.add_space(20.0);
+        ui.heading(RichText::new("Repositories").color(Color32::WHITE));
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
             for (label, hint, action) in [
                 ("Open", "Open a project folder", Action::OpenFolder),
                 ("Clone", "Clone a repository", Action::CloneUrl),
                 ("Create", "Create a new repository", Action::CreateRepo),
             ] {
-                if ui.button(label).on_hover_text(hint).clicked() {
+                let card = egui::Button::new((
+                    RichText::new(label)
+                        .strong()
+                        .size(14.0)
+                        .color(Color32::WHITE),
+                    RichText::new(hint).size(11.5).color(theme::MUTED),
+                ))
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(theme::CARD_R)
+                .min_size(egui::vec2(0.0, 44.0));
+                if ui.add(card).clicked() {
                     actions.push(action);
                 }
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(14.0);
         ui.add(
             egui::TextEdit::singleline(search)
                 .hint_text("Search")
-                .desired_width(360.0),
+                .desired_width(f32::INFINITY),
         );
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Recent").strong());
-        let home = paths::home();
-        let mut any = false;
-        for root in &space.projects {
-            let name = folder_name(root);
-            let shown = paths::abbreviate_home(root, home.as_deref());
-            if !matches(search, &name, &shown) {
-                continue;
-            }
-            any = true;
-            let row = egui::Button::selectable(
-                false,
-                (egui::RichText::new(name), egui::RichText::new(shown).weak()),
-            );
-            let r = ui.add(row);
-            if r.clicked() {
-                actions.push(Action::OpenProject(root.clone()));
-            }
-            r.context_menu(|ui| {
-                if ui.button("Remove from Recent").clicked() {
-                    actions.push(Action::RemoveRecent(root.clone()));
-                    ui.close();
+        ui.add_space(10.0);
+        ui.label(theme::section("Recent"));
+        theme::card().show(ui, |ui| {
+            let home = paths::home();
+            let mut any = false;
+            for root in &space.projects {
+                let name = folder_name(root);
+                let shown = paths::abbreviate_home(root, home.as_deref());
+                if !matches(search, &name, &shown) {
+                    continue;
                 }
-            });
-        }
-        if !any {
-            ui.weak(if space.projects.is_empty() {
-                "No projects yet"
-            } else {
-                "No matches"
-            });
-        }
+                any = true;
+                let row = egui::Button::selectable(false, RichText::new(name))
+                    .right_text(RichText::new(shown).color(theme::MUTED))
+                    .min_size(egui::vec2(ui.available_width(), 0.0));
+                let r = ui.add(row);
+                if r.clicked() {
+                    actions.push(Action::OpenProject(root.clone()));
+                }
+                r.context_menu(|ui| {
+                    if ui.button("Remove from Recent").clicked() {
+                        actions.push(Action::RemoveRecent(root.clone()));
+                        ui.close();
+                    }
+                });
+            }
+            if !any {
+                ui.weak(if space.projects.is_empty() {
+                    "No projects yet"
+                } else {
+                    "No matches"
+                });
+            }
+        });
     });
 }
 

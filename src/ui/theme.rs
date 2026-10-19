@@ -135,6 +135,11 @@ pub fn section(text: &str) -> RichText {
         .color(MUTED)
 }
 
+/// Muted form-field caption.
+pub fn caption(text: &str) -> RichText {
+    RichText::new(text).size(12.0).color(MUTED)
+}
+
 /// Teal call-to-action button.
 pub fn primary(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.into()).color(ON_ACCENT).strong())

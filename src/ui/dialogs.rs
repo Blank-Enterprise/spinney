@@ -1,7 +1,8 @@
 //! Modal dialogs: clone, create, new worktree, confirm worktree removal.
 
 use super::{
-    actions, add_project, checkout, paths, project, repo_name_from_url, spaces, JobKind, SpinneyApp,
+    actions, add_project, checkout, paths, project, repo_name_from_url, spaces, theme, JobKind,
+    SpinneyApp,
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -164,10 +165,10 @@ impl SpinneyApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!("New branch from {}:", d.base));
+                    ui.label(theme::caption(&format!("New branch from {}", d.base)));
                     ui.text_edit_singleline(&mut d.branch);
                     ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() {
+                        if ui.add(theme::primary("Create")).clicked() {
                             result = Some(true);
                         }
                         if ui.button("Cancel").clicked() {
@@ -189,7 +190,13 @@ impl SpinneyApp {
                     path.display()
                 ));
                 ui.horizontal(|ui| {
-                    if ui.button("Remove").clicked() {
+                    let remove = egui::Button::new(
+                        egui::RichText::new("Remove")
+                            .color(theme::ON_ACCENT)
+                            .strong(),
+                    )
+                    .fill(theme::DELETED);
+                    if ui.add(remove).clicked() {
                         result = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -291,29 +298,38 @@ fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(170.0);
-                let _ = ui.selectable_label(true, "Clone with URL");
-                ui.add_enabled(false, egui::Button::selectable(false, d.github.as_str()))
-                    .on_disabled_hover_text("Repository browser comes in a later version");
+                ui.label(theme::section("Source"));
+                let active = egui::Button::selectable(true, "Clone with URL")
+                    .min_size(egui::vec2(170.0, 0.0))
+                    .right_text("");
+                let _ = ui.add(active);
+                ui.add_enabled(
+                    false,
+                    egui::Button::selectable(false, d.github.as_str())
+                        .min_size(egui::vec2(170.0, 0.0))
+                        .right_text(""),
+                )
+                .on_disabled_hover_text("Repository browser comes in a later version");
             });
             ui.separator();
             ui.vertical(|ui| {
-                ui.label("Where to clone to");
+                ui.label(theme::caption("Where to clone to"));
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut d.where_dir).desired_width(320.0));
                     browse = ui.button("Browse").clicked();
                 });
-                ui.label("URL");
+                ui.label(theme::caption("URL"));
                 let url = ui.add(egui::TextEdit::singleline(&mut d.url).desired_width(390.0));
                 if url.changed() && !d.name_edited {
                     d.name = repo_name_from_url(d.url.trim());
                 }
-                ui.label("Name");
+                ui.label(theme::caption("Name"));
                 let name = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(390.0));
                 if name.changed() {
                     d.name_edited = true;
                 }
                 ui.add_space(6.0);
-                ui.label("Full path");
+                ui.label(theme::caption("Full path"));
                 let home = paths::home();
                 let full = paths::expand_tilde(&d.where_dir, home.as_deref()).join(d.name.trim());
                 ui.monospace(format!("{}/", full.display()));
@@ -323,7 +339,7 @@ fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
                     ui.colored_label(ui.visuals().error_fg_color, reason);
                 }
                 ui.horizontal(|ui| {
-                    let clone = egui::Button::new("Clone the repo!");
+                    let clone = theme::primary("Clone the repo!");
                     if ui.add_enabled(target.is_ok(), clone).clicked() {
                         result = Some(true);
                     }
@@ -357,17 +373,17 @@ fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
     let modal = egui::Modal::new(egui::Id::unique("create_dialog")).show(ctx, |ui| {
         ui.heading("Create a Repository");
         ui.add_space(6.0);
-        ui.label("Name");
+        ui.label(theme::caption("Name"));
         ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(390.0));
-        ui.label("Initialize in");
+        ui.label(theme::caption("Initialize in"));
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut d.dir).desired_width(320.0));
             browse = ui.button("Browse").clicked();
         });
-        ui.label("Default branch");
+        ui.label(theme::caption("Default branch"));
         ui.add(egui::TextEdit::singleline(&mut d.branch).desired_width(390.0));
         ui.add_space(6.0);
-        ui.label("Full path");
+        ui.label(theme::caption("Full path"));
         let home = paths::home();
         let root = paths::expand_tilde(&d.dir, home.as_deref()).join(d.name.trim());
         ui.monospace(format!("{}/", root.display()));
@@ -378,7 +394,7 @@ fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
             ui.colored_label(ui.visuals().error_fg_color, reason);
         }
         ui.horizontal(|ui| {
-            let create = egui::Button::new("Create Repository");
+            let create = theme::primary("Create Repository");
             if ui.add_enabled(target.is_ok(), create).clicked() {
                 result = Some(true);
             }

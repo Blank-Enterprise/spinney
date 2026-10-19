@@ -840,7 +840,7 @@ impl eframe::App for SpinneyApp {
                 Some(space) => new_tab::show(ui, space, &mut self.recent_search, &mut actions),
                 None => {
                     ui.label("Create a space to get started.");
-                    if ui.button("New space…").clicked() {
+                    if ui.add(theme::primary("New space…")).clicked() {
                         actions.push(Action::NewSpace);
                     }
                 }
