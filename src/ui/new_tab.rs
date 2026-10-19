@@ -42,9 +42,16 @@ pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut
                 false,
                 (egui::RichText::new(name), egui::RichText::new(shown).weak()),
             );
-            if ui.add(row).clicked() {
+            let r = ui.add(row);
+            if r.clicked() {
                 actions.push(Action::OpenProject(root.clone()));
             }
+            r.context_menu(|ui| {
+                if ui.button("Remove from Recent").clicked() {
+                    actions.push(Action::RemoveRecent(root.clone()));
+                    ui.close();
+                }
+            });
         }
         if !any {
             ui.weak(if space.projects.is_empty() {

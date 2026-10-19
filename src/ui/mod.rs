@@ -320,6 +320,8 @@ pub enum Action {
     CreateRepo,
     /// Open a known project, or focus its tab.
     OpenProject(PathBuf),
+    /// Drop a project from the space (closing its tab if open).
+    RemoveRecent(PathBuf),
     Fetch,
     Pull,
     Push,
@@ -509,15 +511,15 @@ impl SpinneyApp {
                     tab.reload_changes(&mut errors);
                 }
             }
-            Action::CloseTab(i) => {
-                if i < self.tabs.len() {
-                    let tab = self.tabs.remove(i);
-                    if let Some(space) = self.space() {
-                        if remove_project(&mut self.config, &space.id, &tab.root) {
-                            self.save_config();
-                        }
+            Action::CloseTab(i) => self.close_tab(i), // the project stays in Recent
+            Action::RemoveRecent(root) => {
+                if let Some(space) = self.space() {
+                    if remove_project(&mut self.config, &space.id, &root) {
+                        self.save_config();
                     }
-                    self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+                }
+                if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
+                    self.close_tab(i);
                 }
             }
             Action::NewTab => {
@@ -588,6 +590,13 @@ impl SpinneyApp {
         self.errors.extend(errors);
     }
 
+    fn close_tab(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.tabs.remove(i);
+            self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        }
+    }
+
     fn remove_worktree(&mut self, path: &Path, force: bool, errors: &mut Vec<String>) {
         let ctx = self.ctx.clone();
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -645,7 +654,8 @@ impl SpinneyApp {
             }
             if self.new_tab {
                 let _ = ui.selectable_label(true, "New Tab");
-                if ui.small_button("×").on_hover_text("Close tab").clicked() {
+                let closable = !self.tabs.is_empty(); // with no tabs the page shows anyway
+                if closable && ui.small_button("×").on_hover_text("Close tab").clicked() {
                     actions.push(Action::CloseNewTab);
                 }
             }
@@ -1002,14 +1012,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clone_success_adds_project_even_if_commit_graph_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_path = tmp.path().join("config.toml");
+    fn test_app(config: Config, cfg_path: &Path) -> SpinneyApp {
         let ctx = egui::Context::default();
-        let mut app = SpinneyApp {
-            config: cfg(),
-            config_path: Some(cfg_path.clone()),
+        SpinneyApp {
+            config,
+            config_path: Some(cfg_path.to_path_buf()),
             tabs: vec![],
             active_tab: 0,
             jobs: Jobs::new(ctx.clone()),
@@ -1019,7 +1026,47 @@ mod tests {
             recent_search: String::new(),
             ctx,
             focused: true,
-        };
+        }
+    }
+
+    #[test]
+    fn close_tab_keeps_recent_and_remove_drops_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let proj = repo(1);
+        let root = proj.path().to_path_buf();
+        let mut c = cfg();
+        c.spaces[0].projects.push(root.clone());
+        let mut app = test_app(c, &cfg_path);
+        let space = app.space().unwrap();
+        app.open_tab(&root, &space);
+        assert_eq!(app.tabs.len(), 1, "{:?}", app.errors);
+
+        app.apply(Action::CloseTab(0));
+        assert!(app.tabs.is_empty());
+        assert!(
+            app.config.spaces[0].projects.contains(&root),
+            "still recent"
+        );
+
+        app.apply(Action::OpenProject(root.clone()));
+        assert_eq!(app.tabs.len(), 1);
+        app.apply(Action::RemoveRecent(root.clone()));
+        assert!(app.tabs.is_empty(), "open tab closed");
+        assert!(!app.config.spaces[0].projects.contains(&root));
+        let saved = Config::load_from(&cfg_path).unwrap();
+        assert!(!saved.spaces[0].projects.contains(&root), "saved");
+        assert_eq!(
+            saved.spaces[0].projects,
+            [PathBuf::from("/tmp/p1"), PathBuf::from("/tmp/p2")]
+        );
+    }
+
+    #[test]
+    fn clone_success_adds_project_even_if_commit_graph_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut app = test_app(cfg(), &cfg_path);
         // Not a repo, so the follow-up commit-graph job is bound to fail.
         let root = tmp.path().join("cloned");
         app.job_done(JobDone {

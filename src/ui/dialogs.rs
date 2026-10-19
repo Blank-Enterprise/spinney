@@ -317,7 +317,8 @@ fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
             });
         });
     });
-    if result.is_none() && modal.should_close() {
+    // The click that closed the native picker must not count as a backdrop click.
+    if result.is_none() && !browse && modal.should_close() {
         result = Some(false);
     }
     if browse {
@@ -369,7 +370,8 @@ fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
             }
         });
     });
-    if result.is_none() && modal.should_close() {
+    // The click that closed the native picker must not count as a backdrop click.
+    if result.is_none() && !browse && modal.should_close() {
         result = Some(false);
     }
     if browse {
