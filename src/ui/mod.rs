@@ -1,17 +1,21 @@
+mod changes;
 mod dialogs;
+mod diff_view;
 mod graph_view;
 mod sidebar;
 mod spaces;
 
 use crate::actions::{self, CheckoutOutcome};
 use crate::config::{Config, Space};
+use crate::diff::FileDiff;
 use crate::graph::{LogStream, Row};
 use crate::project::{self, Layout, Worktree};
 use crate::refs::{self, Branch};
+use crate::stage::Direction;
+use crate::status::{FileStatus, Status};
 use crate::{creds, git};
 use dialogs::{CloneDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
@@ -89,19 +93,13 @@ impl LogPager {
     }
 }
 
-/// What the centre panel shows. Diff and CommitFile are rendered by Task 10.
-#[allow(dead_code)] // ponytail: Diff/CommitFile fields are read once Task 10 lands
+/// What the centre panel shows.
 pub enum Center {
     Graph,
-    Diff {
-        path: String,
-        staged: bool,
-        sel: HashSet<(usize, usize)>,
-    },
-    CommitFile {
-        sha: String,
-        path: String,
-    },
+    /// One side (unstaged or staged) of a working-copy file, with line selection.
+    Diff(Box<diff_view::WorkDiff>),
+    /// A file of the selected commit, read-only.
+    CommitFile(Box<FileDiff>),
 }
 
 pub struct ProjectTab {
@@ -113,7 +111,11 @@ pub struct ProjectTab {
     log: LogPager,
     rows: Vec<Row>,
     selected_commit: Option<usize>,
+    /// Files changed by `selected_commit`.
+    commit_files: Vec<FileDiff>,
     center: Center,
+    status: Status,
+    commit_msg: String,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -167,10 +169,14 @@ impl ProjectTab {
             branches: vec![],
             rows: vec![],
             selected_commit: None,
+            commit_files: vec![],
             center: Center::Graph,
+            status: Status::default(),
+            commit_msg: String::new(),
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
+        tab.reload_changes(errors);
         Ok(tab)
     }
 
@@ -201,6 +207,8 @@ impl ProjectTab {
         self.log.request(PAGE);
         self.rows.clear();
         self.selected_commit = None;
+        self.commit_files.clear();
+        self.reload_changes(errors);
     }
 
     fn load_branches(&mut self, errors: &mut Vec<String>) {
@@ -311,6 +319,15 @@ pub enum Action {
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
     SelectCommit(usize),
+    DeselectCommit,
+    OpenDiff(FileStatus, bool),
+    OpenCommitFile(usize),
+    /// Stage the file, or unstage it when the flag is set.
+    StageFile(FileStatus, bool),
+    ApplyPatch(String, Direction),
+    Commit,
+    ToggleInline,
+    CloseDiff,
 }
 
 pub struct SpinneyApp {
@@ -323,6 +340,8 @@ pub struct SpinneyApp {
     errors: Vec<String>,
     dialogs: Dialogs,
     ctx: egui::Context,
+    /// Window focus last frame; status reloads when it is regained.
+    focused: bool,
 }
 
 impl SpinneyApp {
@@ -345,6 +364,7 @@ impl SpinneyApp {
             errors,
             dialogs: Dialogs::default(),
             ctx,
+            focused: true,
         };
         app.open_visible_tabs();
         app
@@ -466,7 +486,12 @@ impl SpinneyApp {
             Action::EditSpace => {
                 self.dialogs.space = self.space().as_ref().map(spaces::SpaceEdit::from_space)
             }
-            Action::SelectTab(i) => self.active_tab = i,
+            Action::SelectTab(i) => {
+                self.active_tab = i;
+                if let Some(tab) = self.tabs.get_mut(i) {
+                    tab.reload_changes(&mut errors);
+                }
+            }
             Action::CloseTab(i) => {
                 if i < self.tabs.len() {
                     let tab = self.tabs.remove(i);
@@ -495,9 +520,20 @@ impl SpinneyApp {
             Action::Fetch => self.network(JobKind::Fetch),
             Action::Pull => self.network(JobKind::Pull),
             Action::Push => self.network(JobKind::Push),
-            Action::SelectCommit(i) => {
+            Action::ToggleInline => {
+                self.config.diff_inline = !self.config.diff_inline;
+                self.save_config();
+            }
+            Action::SelectCommit(_)
+            | Action::DeselectCommit
+            | Action::OpenDiff(..)
+            | Action::OpenCommitFile(_)
+            | Action::StageFile(..)
+            | Action::ApplyPatch(..)
+            | Action::Commit
+            | Action::CloseDiff => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    tab.selected_commit = Some(i);
+                    tab_action(tab, action, &ctx, &mut errors);
                 }
             }
             Action::NewWorktreeFrom(base) => {
@@ -634,6 +670,24 @@ impl SpinneyApp {
     }
 }
 
+/// Changes-panel and diff-view actions on the active tab.
+fn tab_action(tab: &mut ProjectTab, action: Action, ctx: &egui::Context, errors: &mut Vec<String>) {
+    match action {
+        Action::SelectCommit(i) => tab.select_commit(i, errors),
+        Action::DeselectCommit => {
+            tab.selected_commit = None;
+            tab.commit_files.clear();
+        }
+        Action::OpenDiff(f, staged) => tab.open_diff(f, staged, errors),
+        Action::OpenCommitFile(k) => tab.open_commit_file(k),
+        Action::StageFile(f, unstage) => tab.stage_file(&f, unstage, errors),
+        Action::ApplyPatch(p, dir) => tab.apply_patch(&p, dir, errors),
+        Action::Commit => tab.commit(ctx, errors),
+        Action::CloseDiff => tab.center = Center::Graph,
+        _ => {}
+    }
+}
+
 /// Check out `name` (local, or `remote/branch`) in the tab, jumping to or creating its worktree.
 fn checkout(tab: &mut ProjectTab, name: &str, errors: &mut Vec<String>) {
     let remote = tab.branches.iter().any(|b| b.remote && b.name == name);
@@ -659,6 +713,13 @@ impl eframe::App for SpinneyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        let focused = ui.input(|i| i.focused);
+        if focused && !self.focused {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.reload_changes(&mut self.errors);
+            }
+        }
+        self.focused = focused;
         let mut actions = vec![];
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui, &mut actions));
         if !self.errors.is_empty() {
@@ -672,21 +733,18 @@ impl eframe::App for SpinneyApp {
             egui::Panel::right("changes")
                 .resizable(true)
                 .default_size(260.0)
-                .show(ui, |ui| {
-                    ui.weak("Working-copy changes appear here.");
-                });
-            egui::CentralPanel::default().show(ui, |ui| match &tab.center {
-                Center::Graph => {
-                    let out = graph_view::show(ui, &tab.rows, tab.selected_commit);
-                    if let Some(i) = out.clicked {
-                        actions.push(Action::SelectCommit(i));
-                    }
-                    if out.near_end {
-                        tab.log.request(PAGE);
-                    }
+                .show(ui, |ui| changes::show(ui, tab, &mut actions));
+            let inline = self.config.diff_inline;
+            egui::CentralPanel::default().show(ui, |ui| {
+                if !matches!(tab.center, Center::Graph) {
+                    return diff_view::show(ui, &mut tab.center, inline, &mut actions);
                 }
-                Center::Diff { path, .. } | Center::CommitFile { path, .. } => {
-                    ui.label(path);
+                let out = graph_view::show(ui, &tab.rows, tab.selected_commit);
+                if let Some(i) = out.clicked {
+                    actions.push(Action::SelectCommit(i));
+                }
+                if out.near_end {
+                    tab.log.request(PAGE);
                 }
             });
         } else {
@@ -931,6 +989,7 @@ mod tests {
             errors: vec![],
             dialogs: Dialogs::default(),
             ctx,
+            focused: true,
         };
         // Not a repo, so the follow-up commit-graph job is bound to fail.
         let root = tmp.path().join("cloned");
