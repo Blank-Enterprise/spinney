@@ -91,14 +91,15 @@ fn helper_value(space: &Space) -> Result<String> {
 /// `git_dir` is a bare repo or a `.git` directory.
 pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
     let helper = helper_value(space)?;
-    git::run(
-        git_dir,
-        &["config", "--local", "user.name", &space.author_name],
-    )?;
-    git::run(
-        git_dir,
-        &["config", "--local", "user.email", &space.author_email],
-    )?;
+    // A blank identity would make every commit fail ("empty ident name"); leave it unset.
+    for (key, value) in [
+        ("user.name", &space.author_name),
+        ("user.email", &space.author_email),
+    ] {
+        if !value.trim().is_empty() {
+            git::run(git_dir, &["config", "--local", key, value])?;
+        }
+    }
     // The empty value resets helpers inherited from system/global config.
     git::run(
         git_dir,
@@ -211,6 +212,25 @@ mod tests {
         assert!(lines[1].starts_with("!'") && lines[1].ends_with("' credential test-space"));
         let email = git::run(dir, &["config", "--local", "user.email"]).unwrap();
         assert_eq!(email.trim(), "test@example.com");
+    }
+
+    #[test]
+    fn configure_repo_skips_blank_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git::run(dir, &["init", "-q", "--bare"]).unwrap();
+        let blank = Space {
+            author_name: " ".into(),
+            author_email: String::new(),
+            ..space()
+        };
+        configure_repo(dir, &blank).unwrap();
+        for key in ["user.name", "user.email"] {
+            assert!(
+                git::run(dir, &["config", "--local", key]).is_err(),
+                "{key} set"
+            );
+        }
     }
 
     #[test]

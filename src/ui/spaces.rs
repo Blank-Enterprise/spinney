@@ -114,19 +114,29 @@ impl SpaceEdit {
         }
     }
 
+    /// The entered PAT, trimmed (pasted tokens often carry a newline); `None` if blank.
+    pub fn token(&self) -> Option<&str> {
+        Some(self.pat.trim()).filter(|t| !t.is_empty())
+    }
+
     /// Validate and write into `cfg` (new spaces become active); returns the space id.
     pub fn apply(&self, cfg: &mut Config) -> Result<String, String> {
         let name = self.name.trim();
-        let host = self.host.trim();
+        let host = normalize_host(&self.host);
         if name.is_empty() || host.is_empty() {
             return Err("space needs a name and a host".into());
+        }
+        let author_name = self.author_name.trim();
+        let author_email = self.author_email.trim();
+        if author_name.is_empty() || author_email.is_empty() {
+            return Err("space needs an author name and email".into());
         }
         let dir = self.clone_dir.trim();
         let fill = |s: &mut Space| {
             s.name = name.to_string();
-            s.host = host.to_string();
-            s.author_name = self.author_name.trim().to_string();
-            s.author_email = self.author_email.trim().to_string();
+            s.host = host.clone();
+            s.author_name = author_name.to_string();
+            s.author_email = author_email.to_string();
             s.default_clone_dir = (!dir.is_empty()).then(|| PathBuf::from(dir));
         };
         match &self.id {
@@ -154,6 +164,16 @@ impl SpaceEdit {
     }
 }
 
+/// Bare lowercase host: `https://GitHub.com/` becomes `github.com`.
+pub fn normalize_host(input: &str) -> String {
+    let h = input.trim();
+    let h = h
+        .strip_prefix("https://")
+        .or_else(|| h.strip_prefix("http://"))
+        .unwrap_or(h);
+    h.trim_end_matches('/').to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +185,56 @@ mod tests {
         let mut cfg = Config::default();
         assert!(e.apply(&mut cfg).is_err(), "name required");
         assert!(cfg.spaces.is_empty());
+    }
+
+    #[test]
+    fn apply_requires_author_identity() {
+        let mut cfg = Config::default();
+        let mut e = SpaceEdit::new_space();
+        e.name = "Work".into();
+        e.author_email = "test@example.com".into();
+        e.author_name = "  ".into();
+        assert!(e.apply(&mut cfg).is_err(), "author name required");
+        e.author_name = "Test User".into();
+        e.author_email = "".into();
+        assert!(e.apply(&mut cfg).is_err(), "author email required");
+        assert!(cfg.spaces.is_empty());
+        e.author_email = "test@example.com".into();
+        assert!(e.apply(&mut cfg).is_ok());
+    }
+
+    #[test]
+    fn host_is_normalized() {
+        for raw in [
+            "github.com",
+            " https://GitHub.com/ ",
+            "http://github.com",
+            "https://github.com//",
+        ] {
+            assert_eq!(normalize_host(raw), "github.com", "{raw:?}");
+        }
+        assert_eq!(
+            normalize_host("ghe.example.com:8443"),
+            "ghe.example.com:8443"
+        );
+        let mut cfg = Config::default();
+        let mut e = SpaceEdit::new_space();
+        e.name = "Work".into();
+        e.host = "https://GHE.example.com/".into();
+        e.author_name = "Test User".into();
+        e.author_email = "test@example.com".into();
+        e.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.spaces[0].host, "ghe.example.com");
+    }
+
+    #[test]
+    fn token_is_trimmed() {
+        let mut e = SpaceEdit::new_space();
+        assert_eq!(e.token(), None);
+        e.pat = " \n".into();
+        assert_eq!(e.token(), None);
+        e.pat = "ghp_x\n".into();
+        assert_eq!(e.token(), Some("ghp_x"));
     }
 
     #[test]

@@ -588,8 +588,8 @@ impl SpinneyApp {
                 return;
             }
         };
-        if !edit.pat.is_empty() {
-            if let Err(e) = creds::set_token(&id, &edit.pat) {
+        if let Some(token) = edit.token() {
+            if let Err(e) = creds::set_token(&id, token) {
                 self.errors.push(format!("saving token: {e}"));
             }
         }
