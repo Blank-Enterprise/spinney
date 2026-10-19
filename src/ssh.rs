@@ -215,11 +215,8 @@ mod tests {
 
     #[test]
     fn command_quotes_the_key_and_is_recognised() {
-        let c = ssh_command(Path::new("/Users/me/Library/Application Support/it's/k"));
-        assert_eq!(
-            c,
-            format!("ssh -i '/Users/me/Library/Application Support/it'\\''s/k' {OPTIONS}")
-        );
+        let c = ssh_command(Path::new("/opt/app support/it's/k"));
+        assert_eq!(c, format!("ssh -i '/opt/app support/it'\\''s/k' {OPTIONS}"));
         assert!(is_ours(&c));
         assert!(!is_ours("ssh -i ~/.ssh/work_key"));
         assert!(!is_ours("/usr/local/bin/my-ssh"));
