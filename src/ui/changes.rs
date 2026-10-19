@@ -152,37 +152,40 @@ fn file_list(
         }
     });
     for f in files {
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            let b = egui::Button::new(RichText::new(button).size(11.5)).small();
-            if ui.add(b).clicked() {
-                actions.push(Action::StageFile(f.clone(), staged));
-            }
-            let is_open =
-                list != List::Conflicted && open.as_ref() == Some(&(f.path.clone(), staged));
-            let (letter, color) = badge(&f.change);
-            let row = egui::Button::selectable(
-                is_open,
-                (
-                    RichText::new(format!(" {letter} "))
-                        .size(10.5)
-                        .strong()
-                        .color(color)
-                        .background_color(color.gamma_multiply(0.2)),
-                    RichText::new(&f.path).size(12.5),
-                ),
-            )
-            .right_text("") // grows, keeping the content left-aligned
-            .truncate()
-            .min_size(egui::vec2(ui.available_width(), 0.0));
-            let r = ui.add(row);
-            let r = match &f.change {
-                Change::Renamed { from } => r.on_hover_text(format!("renamed from {from}")),
-                _ => r,
-            };
-            // Conflicted files have a combined diff the parser does not read.
-            if r.clicked() && list != List::Conflicted {
-                actions.push(Action::OpenDiff(f.clone(), staged));
-            }
+        // `horizontal` bounds the row height; a bare centred right-to-left layout fills it all.
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let b = egui::Button::new(RichText::new(button).size(11.5)).small();
+                if ui.add(b).clicked() {
+                    actions.push(Action::StageFile(f.clone(), staged));
+                }
+                let is_open =
+                    list != List::Conflicted && open.as_ref() == Some(&(f.path.clone(), staged));
+                let (letter, color) = badge(&f.change);
+                let row = egui::Button::selectable(
+                    is_open,
+                    (
+                        RichText::new(format!(" {letter} "))
+                            .size(10.5)
+                            .strong()
+                            .color(color)
+                            .background_color(color.gamma_multiply(0.2)),
+                        RichText::new(&f.path).size(12.5),
+                    ),
+                )
+                .right_text("") // grows, keeping the content left-aligned
+                .truncate()
+                .min_size(egui::vec2(ui.available_width(), 0.0));
+                let r = ui.add(row);
+                let r = match &f.change {
+                    Change::Renamed { from } => r.on_hover_text(format!("renamed from {from}")),
+                    _ => r,
+                };
+                // Conflicted files have a combined diff the parser does not read.
+                if r.clicked() && list != List::Conflicted {
+                    actions.push(Action::OpenDiff(f.clone(), staged));
+                }
+            })
         });
     }
     ui.add_space(8.0);

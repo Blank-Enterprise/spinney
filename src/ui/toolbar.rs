@@ -143,6 +143,12 @@ pub(super) fn toolbar(
             }
         });
         let branch = branch_label(tab);
+        // A detached HEAD has no branch name to start from.
+        let base = if branch == "detached" {
+            "HEAD".to_string()
+        } else {
+            branch.clone()
+        };
         picker(ui, "worktree · branch", &branch, |ui| match tab.layout {
             Layout::WorktreeRoot => {
                 for wt in &tab.worktrees {
@@ -173,10 +179,10 @@ pub(super) fn toolbar(
                 "Converting normal clones to the worktree layout comes in a later version"
             };
             if tool_button(ui, "⊞", "Worktree", worktrees, false, hint) {
-                actions.push(Action::NewWorktreeFrom(branch.clone()));
+                actions.push(Action::NewWorktreeFrom(base.clone()));
             }
             if tool_button(ui, "⎇", "Branch", true, false, "New branch") {
-                actions.push(Action::NewBranch(branch.clone()));
+                actions.push(Action::NewBranch(base));
             }
             for (icon, label, kind, action) in [
                 ("↑", "Push", JobKind::Push, Action::Push),
