@@ -3,7 +3,7 @@
 use crate::config::Space;
 use crate::{creds, git};
 use anyhow::{bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Worktree folder name for a branch: `/` becomes `-`.
 pub fn worktree_dir_name(branch: &str) -> String {
@@ -35,12 +35,28 @@ pub fn detect(root: &Path) -> Result<Layout> {
     }
 }
 
-/// Clone `url` as `<parent>/<name>/.bare` plus a worktree for the default branch.
-pub fn clone_into(url: &str, parent: &Path, name: &str, space: &Space) -> Result<PathBuf> {
+/// Create `<parent>/<name>` for a new project. `name` must be one plain path segment (so
+/// the cleanup's recursive delete can never reach outside it) and nothing may be there yet,
+/// not even a dangling symlink. Only a root claimed here may be cleaned up.
+fn claim_root(parent: &Path, name: &str) -> Result<PathBuf> {
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        bail!("{name:?} is not a valid folder name");
+    }
     let root = parent.join(name);
-    if root.exists() {
+    if std::fs::symlink_metadata(&root).is_ok() {
         bail!("{} already exists", root.display());
     }
+    std::fs::create_dir(&root).with_context(|| format!("creating {}", root.display()))?;
+    Ok(root)
+}
+
+/// Clone `url` as `<parent>/<name>/.bare` plus a worktree for the default branch.
+pub fn clone_into(url: &str, parent: &Path, name: &str, space: &Space) -> Result<PathBuf> {
+    let root = claim_root(parent, name)?;
     let result = clone_steps(url, parent, &root, space);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&root); // we created it, so clean it up
@@ -114,10 +130,7 @@ pub fn check_branch_name(branch: &str) -> Result<()> {
 /// New empty project at `<parent>/<name>`: `.bare` plus an orphan worktree for `branch`.
 /// No remote and no commit.
 pub fn create_new(parent: &Path, name: &str, branch: &str, space: &Space) -> Result<PathBuf> {
-    let root = parent.join(name);
-    if root.exists() {
-        bail!("{} already exists", root.display());
-    }
+    let root = claim_root(parent, name)?;
     let result = create_steps(parent, &root, branch, space);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&root); // we created it, so clean it up
@@ -409,5 +422,67 @@ mod tests {
         for bad in ["", "a..b", "-x", "a b", "x.lock"] {
             assert!(check_branch_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Parent with a marker file; every bad name must leave both untouched.
+    fn guarded_parent() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("marker.txt"), "keep").unwrap();
+        (tmp, parent)
+    }
+
+    fn assert_intact(parent: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(parent.join("marker.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn create_new_rejects_escaping_names() {
+        let (tmp, parent) = guarded_parent();
+        let abs = tmp.path().join("abs").display().to_string();
+        for bad in ["a/..", "..", ".", "", "a/b", abs.as_str()] {
+            for branch in ["main", "a..b"] {
+                assert!(
+                    create_new(&parent, bad, branch, &space()).is_err(),
+                    "{bad:?}"
+                );
+                assert_intact(&parent);
+            }
+        }
+        assert!(!parent.join("a").exists());
+        assert!(!tmp.path().join("abs").exists());
+    }
+
+    #[test]
+    fn clone_rejects_escaping_names() {
+        let (tmp, url, parent) = fixture();
+        std::fs::write(parent.join("marker.txt"), "keep").unwrap();
+        let bad_url = format!("file://{}", tmp.path().join("missing").display());
+        let abs = tmp.path().join("abs").display().to_string();
+        for bad in ["a/..", "..", abs.as_str()] {
+            assert!(
+                clone_into(&bad_url, &parent, bad, &space()).is_err(),
+                "{bad:?}"
+            );
+            assert!(clone_into(&url, &parent, bad, &space()).is_err(), "{bad:?}");
+            assert_intact(&parent);
+        }
+        assert!(!tmp.path().join("abs").exists());
+    }
+
+    #[test]
+    fn dangling_symlink_counts_as_existing() {
+        let (tmp, url, parent) = fixture();
+        let link = parent.join("proj");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+        assert!(create_new(&parent, "proj", "main", &space()).is_err());
+        assert!(clone_into(&url, &parent, "proj", &space()).is_err());
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "symlink untouched");
+        assert!(!tmp.path().join("nowhere").exists());
     }
 }
