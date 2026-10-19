@@ -27,6 +27,20 @@ pub struct Status {
     pub conflicted: Vec<FileStatus>,
 }
 
+impl Status {
+    /// Distinct paths with any change (a file changed on both sides counts once).
+    pub fn changed_files(&self) -> usize {
+        let all = self
+            .staged
+            .iter()
+            .chain(&self.unstaged)
+            .chain(&self.conflicted);
+        all.map(|f| f.path.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+}
+
 fn change_of(code: char, from: Option<&str>) -> Change {
     match code {
         'A' => Change::Added,
@@ -98,6 +112,17 @@ mod tests {
             path: path.into(),
             change,
         }
+    }
+
+    #[test]
+    fn changed_files_counts_each_path_once() {
+        let mut st = Status::default();
+        assert_eq!(st.changed_files(), 0);
+        st.staged.push(fs_("a", Change::Modified));
+        st.unstaged.push(fs_("a", Change::Modified)); // both sides: one file
+        st.unstaged.push(fs_("b", Change::Untracked));
+        st.conflicted.push(fs_("c", Change::Conflicted));
+        assert_eq!(st.changed_files(), 3);
     }
 
     #[test]

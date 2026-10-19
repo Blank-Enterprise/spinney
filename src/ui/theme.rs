@@ -27,6 +27,8 @@ pub const TEXT: Color32 = rgb(0xcfd6e4);
 pub const MUTED: Color32 = rgba(0xcfd6e4, 140);
 pub const ACCENT: Color32 = rgb(0x2ec4b6);
 pub const ACCENT_TEXT: Color32 = rgb(0x5fe0d3);
+/// Selected row background.
+pub const SEL_BG: Color32 = rgba(0x2ec4b6, 0x1a);
 /// Selected item background (sidebar, buttons).
 pub const SEL_STRONG: Color32 = rgba(0x2ec4b6, 0x22);
 pub const HOVER: Color32 = rgba(0xffffff, 0x0a);
@@ -151,5 +153,6 @@ mod tests {
         assert_eq!(LANES[0], ACCENT);
         assert_eq!(LANES[7], Color32::from_rgb(0xff, 0xd1, 0x66));
         assert_eq!(MUTED.a(), 140);
+        assert_eq!(SEL_BG.a(), 0x1a);
     }
 }

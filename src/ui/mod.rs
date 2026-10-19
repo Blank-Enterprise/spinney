@@ -809,9 +809,19 @@ impl eframe::App for SpinneyApp {
                 if !matches!(tab.center, Center::Graph) {
                     return diff_view::show(ui, &mut tab.center, inline, &mut actions);
                 }
-                let out = graph_view::show(ui, &tab.rows, tab.selected_commit);
+                let wip = Some(tab.status.changed_files()).filter(|&n| n > 0);
+                let remotes = tab
+                    .branches
+                    .iter()
+                    .filter(|b| b.remote)
+                    .map(|b| b.name.as_str())
+                    .collect();
+                let out = graph_view::show(ui, &tab.rows, tab.selected_commit, wip, &remotes);
                 if let Some(i) = out.clicked {
                     actions.push(Action::SelectCommit(i));
+                }
+                if out.wip_clicked {
+                    actions.push(Action::DeselectCommit);
                 }
                 if out.near_end {
                     tab.log.request(PAGE);
