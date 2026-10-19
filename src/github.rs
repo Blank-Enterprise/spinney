@@ -1,7 +1,5 @@
 //! GitHub REST: list the repositories a space's token can see.
 
-#![allow(dead_code)]
-
 use anyhow::{bail, Result};
 use serde::{Deserialize, Deserializer};
 use std::time::Duration;

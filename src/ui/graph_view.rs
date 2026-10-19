@@ -145,7 +145,7 @@ fn lane_x(rect: Rect, lane: usize) -> f32 {
 }
 
 /// Pill with `text` at `x`, vertically centred on `mid`; returns its right edge.
-fn pill(
+pub(super) fn pill(
     painter: &egui::Painter,
     x: f32,
     mid: f32,

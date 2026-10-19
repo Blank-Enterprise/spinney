@@ -1,29 +1,62 @@
 //! Modal dialogs: clone, create, new worktree, confirm worktree removal.
 
 use super::{
-    actions, add_project, checkout, paths, project, repo_name_from_url, spaces, theme, JobKind,
-    SpinneyApp,
+    actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
+    JobKind, SpinneyApp,
 };
-use eframe::egui;
+use crate::{creds, github};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+/// Where the Clone dialog takes its repository from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Source {
+    Url,
+    GitHub,
+}
+
+/// Outcome of listing the space's repositories.
+pub(super) enum Listing {
+    NoToken,
+    Failed(String),
+    Repos(Vec<github::Repo>),
+}
+
+/// Repository list for the dialog session; fetched once, refetched on ↻.
+pub(super) enum Browse {
+    NotLoaded,
+    Loading(Receiver<Listing>),
+    Done(Listing),
+}
 
 pub(super) struct CloneDialog {
+    source: Source,
     /// "Where to clone to", as typed or picked.
     where_dir: String,
     url: String,
     name: String,
-    /// Once the user types a name, the URL stops overwriting it.
+    /// Once the user types a name, the URL (or picked repo) stops overwriting it.
     name_edited: bool,
     /// The space's default clone folder: prefill and Browse fallback.
     default_dir: Option<PathBuf>,
     /// Label for the space's GitHub source.
     github: String,
+    space_id: String,
+    api_base: String,
+    browse: Browse,
+    query: String,
+    /// Focus the search field the next time it shows.
+    focus_search: bool,
+    /// "Edit space" was clicked: close and open the space editor.
+    edit_space: bool,
 }
 
 impl CloneDialog {
     pub(super) fn new(space: &crate::config::Space) -> Self {
         let default_dir = space.default_clone_dir.clone();
         CloneDialog {
+            source: Source::Url,
             where_dir: default_dir
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -33,6 +66,12 @@ impl CloneDialog {
             name_edited: false,
             default_dir,
             github: github_label(&space.host),
+            space_id: space.id.clone(),
+            api_base: space.api_base(),
+            browse: Browse::NotLoaded,
+            query: String::new(),
+            focus_search: false,
+            edit_space: false,
         }
     }
 
@@ -40,7 +79,10 @@ impl CloneDialog {
     fn target(&self, home: Option<&Path>) -> Result<(PathBuf, String), String> {
         let parent = paths::existing_dir(&self.where_dir, home)?;
         if self.url.trim().is_empty() {
-            return Err("Enter a URL".into());
+            return Err(match self.source {
+                Source::Url => "Enter a URL".into(),
+                Source::GitHub => "Select a repository".into(),
+            });
         }
         paths::check_name(&self.name)?;
         let name = self.name.trim().to_string();
@@ -49,6 +91,61 @@ impl CloneDialog {
             return Err(format!("{} already exists", root.display()));
         }
         Ok((parent, name))
+    }
+
+    /// Switch source; the URL (and a name that followed it) belong to the old source.
+    fn set_source(&mut self, source: Source) {
+        if source == self.source {
+            return;
+        }
+        self.source = source;
+        self.url.clear();
+        if !self.name_edited {
+            self.name.clear();
+        }
+        self.focus_search = source == Source::GitHub;
+    }
+
+    fn select_repo(&mut self, repo: &github::Repo) {
+        self.url = repo.clone_url.clone();
+        if !self.name_edited {
+            self.name = repo.name.clone();
+        }
+    }
+
+    /// List the space's repos on a worker thread; it wakes the UI once, when done.
+    fn load(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        let (id, base, ctx) = (self.space_id.clone(), self.api_base.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let listing = match creds::get_token(&id) {
+                Ok(Some(token)) if !token.trim().is_empty() => {
+                    match github::list_repos(&base, &token) {
+                        Ok(repos) => Listing::Repos(repos),
+                        Err(e) => Listing::Failed(format!("{e:#}")),
+                    }
+                }
+                Ok(_) => Listing::NoToken,
+                Err(e) => Listing::Failed(format!("reading the token: {e:#}")),
+            };
+            let _ = tx.send(listing);
+            ctx.request_repaint();
+        });
+        self.browse = Browse::Loading(rx);
+    }
+
+    /// Take a finished listing, if any.
+    fn poll(&mut self) {
+        let Browse::Loading(rx) = &self.browse else {
+            return;
+        };
+        let listing = match rx.try_recv() {
+            Ok(l) => l,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Listing::Failed("listing stopped".into()),
+        };
+        self.focus_search |= matches!(listing, Listing::Repos(_));
+        self.browse = Browse::Done(listing);
     }
 }
 
@@ -154,6 +251,9 @@ impl SpinneyApp {
         if let Some(mut d) = self.dialogs.clone.take() {
             match clone_dialog(ctx, &mut d) {
                 Some(true) => self.start_clone(d),
+                Some(false) if d.edit_space => {
+                    self.dialogs.space = self.space().as_ref().map(spaces::SpaceEdit::from_space)
+                }
                 Some(false) => {}
                 None => self.dialogs.clone = Some(d),
             }
@@ -298,9 +398,18 @@ impl SpinneyApp {
     }
 }
 
-/// GitKraken-style "Clone a Repository" modal; `Some(true)` = clone, `Some(false)` = cancel,
-/// `None` = still open.
+/// Height of a repository row: name line plus description line.
+const REPO_ROW_H: f32 = 40.0;
+/// Width of the dialog's right pane.
+const PANE_W: f32 = 390.0;
+
+/// GitKraken-style "Clone a Repository" modal; `Some(true)` = clone, `Some(false)` = cancel
+/// (or `edit_space`), `None` = still open.
 fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
+    d.poll();
+    if d.source == Source::GitHub && matches!(d.browse, Browse::NotLoaded) {
+        d.load(ctx);
+    }
     let (mut result, mut browse) = (None, false);
     let target = d.target(paths::home().as_deref());
     let modal = egui::Modal::new(egui::Id::unique("clone_dialog")).show(ctx, |ui| {
@@ -310,54 +419,38 @@ fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
             ui.vertical(|ui| {
                 ui.set_width(170.0);
                 ui.label(theme::section("Source"));
-                let active = egui::Button::selectable(true, "Clone with URL")
-                    .min_size(egui::vec2(170.0, 0.0))
-                    .right_text("");
-                let _ = ui.add(active);
-                ui.add_enabled(
-                    false,
-                    egui::Button::selectable(false, d.github.as_str())
+                let github = d.github.clone();
+                for (source, label) in [(Source::Url, "Clone with URL"), (Source::GitHub, &github)]
+                {
+                    let item = egui::Button::selectable(d.source == source, label)
                         .min_size(egui::vec2(170.0, 0.0))
-                        .right_text(""),
-                )
-                .on_disabled_hover_text("Repository browser comes in a later version");
+                        .right_text("");
+                    if ui.add(item).clicked() {
+                        d.set_source(source);
+                    }
+                }
             });
             ui.separator();
             ui.vertical(|ui| {
-                ui.label(theme::caption("Where to clone to"));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut d.where_dir).desired_width(320.0));
-                    browse = ui.button("Browse").clicked();
-                });
-                ui.label(theme::caption("URL"));
-                let url = ui.add(egui::TextEdit::singleline(&mut d.url).desired_width(390.0));
-                if url.changed() && !d.name_edited {
-                    d.name = repo_name_from_url(d.url.trim());
-                }
-                ui.label(theme::caption("Name"));
-                let name = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(390.0));
-                if name.changed() {
-                    d.name_edited = true;
-                }
-                ui.add_space(6.0);
-                ui.label(theme::caption("Full path"));
-                let home = paths::home();
-                let full = paths::expand_tilde(&d.where_dir, home.as_deref()).join(d.name.trim());
-                ui.monospace(format!("{}/", full.display()));
-                ui.weak("worktrees go in folders inside this one");
-                ui.add_space(6.0);
-                if let Err(reason) = &target {
-                    ui.colored_label(ui.visuals().error_fg_color, reason);
-                }
-                ui.horizontal(|ui| {
-                    let clone = theme::primary("Clone the repo!");
-                    if ui.add_enabled(target.is_ok(), clone).clicked() {
-                        result = Some(true);
+                browse = where_to_clone(ui, &mut d.where_dir);
+                match d.source {
+                    Source::Url => {
+                        ui.label(theme::caption("URL"));
+                        let url =
+                            ui.add(egui::TextEdit::singleline(&mut d.url).desired_width(PANE_W));
+                        if url.changed() && !d.name_edited {
+                            d.name = repo_name_from_url(d.url.trim());
+                        }
                     }
-                    if ui.button("Cancel").clicked() {
-                        result = Some(false);
+                    Source::GitHub => {
+                        if repo_browser(ui, d) && d.target(paths::home().as_deref()).is_ok() {
+                            result = Some(true);
+                        }
                     }
-                });
+                }
+                if let Some(r) = name_and_clone(ui, d, &target) {
+                    result = result.or(Some(r));
+                }
             });
         });
     });
@@ -373,9 +466,184 @@ fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
             ctx.request_repaint(); // show the pick now, not on the next input
         }
     }
+    if d.edit_space {
+        result = Some(false);
+    }
     result
 }
 
+/// "Where to clone to" [path][Browse]; true when Browse was clicked.
+fn where_to_clone(ui: &mut egui::Ui, where_dir: &mut String) -> bool {
+    ui.label(theme::caption("Where to clone to"));
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(where_dir).desired_width(PANE_W - 70.0));
+        ui.button("Browse").clicked()
+    })
+    .inner
+}
+
+/// Name, full-path preview, validation and the Clone / Cancel buttons.
+fn name_and_clone(
+    ui: &mut egui::Ui,
+    d: &mut CloneDialog,
+    target: &Result<(PathBuf, String), String>,
+) -> Option<bool> {
+    let mut result = None;
+    ui.label(theme::caption("Name"));
+    let name = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(PANE_W));
+    if name.changed() {
+        d.name_edited = true;
+    }
+    ui.add_space(6.0);
+    ui.label(theme::caption("Full path"));
+    let home = paths::home();
+    let full = paths::expand_tilde(&d.where_dir, home.as_deref()).join(d.name.trim());
+    ui.monospace(format!("{}/", full.display()));
+    ui.weak("worktrees go in folders inside this one");
+    ui.add_space(6.0);
+    if let Err(reason) = target {
+        ui.colored_label(ui.visuals().error_fg_color, reason);
+    }
+    ui.horizontal(|ui| {
+        let clone = theme::primary("Clone the repo!");
+        if ui.add_enabled(target.is_ok(), clone).clicked() {
+            result = Some(true);
+        }
+        if ui.button("Cancel").clicked() {
+            result = Some(false);
+        }
+    });
+    result
+}
+
+/// Search field and repository list of the space's GitHub; true on a double-click.
+fn repo_browser(ui: &mut egui::Ui, d: &mut CloneDialog) -> bool {
+    let mut picked: Option<(github::Repo, bool)> = None;
+    let mut refresh = false;
+    ui.label(theme::caption("Repository"));
+    match &d.browse {
+        Browse::NotLoaded | Browse::Loading(_) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading repositories…");
+            });
+        }
+        Browse::Done(Listing::NoToken) => {
+            ui.label("Add a personal access token to this space to browse repositories");
+            d.edit_space = ui.button("Edit space").clicked();
+        }
+        Browse::Done(Listing::Failed(e)) => {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+            refresh = ui.button("↻ Retry").clicked();
+        }
+        Browse::Done(Listing::Repos(repos)) => {
+            ui.horizontal(|ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut d.query)
+                        .hint_text("Search repositories")
+                        .desired_width(PANE_W - 34.0),
+                );
+                if std::mem::take(&mut d.focus_search) {
+                    search.request_focus();
+                }
+                refresh = ui.button("↻").on_hover_text("Refresh").clicked();
+            });
+            let shown = github::filter(repos, &d.query);
+            if shown.is_empty() {
+                ui.weak(if repos.is_empty() {
+                    "No repositories found"
+                } else {
+                    "No repositories match"
+                });
+            } else {
+                picked = repo_list(ui, &shown, &d.url);
+            }
+        }
+    }
+    if refresh {
+        d.load(ui.ctx());
+    }
+    let Some((repo, double)) = picked else {
+        return false;
+    };
+    d.select_repo(&repo);
+    double
+}
+
+/// Scrollable repository rows; the clicked repo and whether it was a double-click.
+fn repo_list(
+    ui: &mut egui::Ui,
+    repos: &[&github::Repo],
+    selected_url: &str,
+) -> Option<(github::Repo, bool)> {
+    let mut picked = None;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::ScrollArea::vertical()
+            .max_height(REPO_ROW_H * 6.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, REPO_ROW_H, repos.len(), |ui, range| {
+                for repo in &repos[range] {
+                    let size = Vec2::new(PANE_W, REPO_ROW_H);
+                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                    let selected = repo.clone_url == selected_url;
+                    paint_repo_row(ui, rect, repo, selected, resp.hovered());
+                    if resp.clicked() || resp.double_clicked() {
+                        picked = Some(((*repo).clone(), resp.double_clicked()));
+                    }
+                }
+            });
+    });
+    picked
+}
+
+fn paint_repo_row(ui: &egui::Ui, rect: Rect, repo: &github::Repo, selected: bool, hovered: bool) {
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let bg = if selected {
+        theme::SEL_BG
+    } else if hovered {
+        theme::HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 4.0, bg);
+    if selected {
+        let edge = Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height()));
+        painter.rect_filled(edge, 1.0, theme::ACCENT);
+    }
+    let x = rect.left() + 8.0;
+    let top = rect.top() + REPO_ROW_H * 0.3;
+    let name = painter.layout_no_wrap(
+        repo.full_name.clone(),
+        FontId::proportional(13.5),
+        theme::TEXT,
+    );
+    let at = Pos2::new(x, top - name.size().y / 2.0);
+    let right = at.x + name.size().x;
+    painter.galley(at, name.clone(), theme::TEXT);
+    // Faux bold: the bundled proportional font has a single weight.
+    painter.galley(at + Vec2::new(0.6, 0.0), name, theme::TEXT);
+    if repo.private {
+        graph_view::pill(
+            &painter,
+            right + 8.0,
+            top,
+            "private",
+            theme::BORDER,
+            theme::MUTED,
+            false,
+        );
+    }
+    if let Some(desc) = repo.description.as_deref().filter(|d| !d.is_empty()) {
+        painter.text(
+            Pos2::new(x, rect.top() + REPO_ROW_H * 0.72),
+            Align2::LEFT_CENTER,
+            desc.lines().next().unwrap_or_default(),
+            FontId::proportional(12.0),
+            theme::MUTED,
+        );
+    }
+}
 /// GitKraken-style "Create a Repository" modal; `Some(true)` = create, `Some(false)` = cancel,
 /// `None` = still open.
 fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
@@ -494,6 +762,70 @@ mod tests {
         assert_eq!(d.where_dir, "/tmp/code");
         assert_eq!(d.github, "GitHub Enterprise (ghe.example.com)");
         assert_eq!(github_label("github.com"), "GitHub.com");
+    }
+
+    fn repo(name: &str) -> github::Repo {
+        github::Repo {
+            full_name: format!("octo-org/{name}"),
+            name: name.into(),
+            owner: "octo-org".into(),
+            private: false,
+            description: None,
+            clone_url: format!("https://example.com/octo-org/{name}.git"),
+            pushed_at: None,
+        }
+    }
+
+    #[test]
+    fn selecting_a_repo_sets_url_and_name_until_edited() {
+        let mut d = CloneDialog::new(&Space::default());
+        d.set_source(Source::GitHub);
+        d.select_repo(&repo("widget"));
+        assert_eq!(d.url, "https://example.com/octo-org/widget.git");
+        assert_eq!(d.name, "widget");
+        d.select_repo(&repo("gadget"));
+        assert_eq!(d.name, "gadget");
+        d.name = "mine".into();
+        d.name_edited = true;
+        d.select_repo(&repo("widget"));
+        assert_eq!(d.url, "https://example.com/octo-org/widget.git");
+        assert_eq!(d.name, "mine");
+    }
+
+    #[test]
+    fn switching_source_clears_an_unedited_pick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut d = dialog(tmp.path(), "https://example.com/a/typed.git", "typed");
+        d.set_source(Source::GitHub);
+        assert!(d.focus_search);
+        assert_eq!((d.url.as_str(), d.name.as_str()), ("", ""));
+        assert_eq!(d.target(None).unwrap_err(), "Select a repository");
+        d.select_repo(&repo("widget"));
+        d.set_source(Source::Url);
+        assert_eq!(d.url, "");
+        assert_eq!(d.target(None).unwrap_err(), "Enter a URL");
+        d.name = "kept".into();
+        d.name_edited = true;
+        d.set_source(Source::GitHub);
+        assert_eq!(d.name, "kept");
+    }
+
+    #[test]
+    fn listing_arrives_through_poll() {
+        let mut d = CloneDialog::new(&Space::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        d.browse = Browse::Loading(rx);
+        d.poll();
+        assert!(matches!(d.browse, Browse::Loading(_)));
+        tx.send(Listing::Repos(vec![repo("widget")])).unwrap();
+        d.poll();
+        assert!(matches!(&d.browse, Browse::Done(Listing::Repos(r)) if r.len() == 1));
+        assert!(d.focus_search);
+        let (tx, rx) = std::sync::mpsc::channel::<Listing>();
+        d.browse = Browse::Loading(rx);
+        drop(tx);
+        d.poll();
+        assert!(matches!(d.browse, Browse::Done(Listing::Failed(_))));
     }
 
     #[test]
