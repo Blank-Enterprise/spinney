@@ -216,6 +216,8 @@ pub fn commit_diff(worktree: &Path, sha: &str) -> Result<Vec<FileDiff>> {
             "core.quotepath=off",
             "show",
             "--format=",
+            // A merge shows `diff --cc` by default, which `parse` does not read.
+            "--diff-merges=first-parent",
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
@@ -344,6 +346,31 @@ mod tests {
         assert_eq!(fd.hunks[0].lines.len(), 2);
         let all = parse(&git::run(d, &["diff", "--src-prefix=a/", "--dst-prefix=b/"]).unwrap());
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn commit_diff_shows_merge_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let g = |args: &[&str]| git::run(d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        g(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "side"]);
+        g(&["checkout", "-q", "main"]);
+        std::fs::write(d.join("a.txt"), "a2\n").unwrap();
+        g(&["commit", "-q", "-am", "main"]);
+        g(&["merge", "-q", "--no-edit", "side"]);
+        let files = commit_diff(d, "HEAD").unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt"]);
+        assert_eq!(files[0].hunks.len(), 1);
     }
 
     #[test]
