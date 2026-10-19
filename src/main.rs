@@ -9,6 +9,7 @@ mod project;
 mod refs;
 mod ssh;
 mod stage;
+mod stash;
 mod status;
 mod ui;
 

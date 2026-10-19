@@ -226,6 +226,8 @@ pub(super) struct Dialogs {
     pub(super) new_worktree: Option<NewWorktreeDialog>,
     /// Dirty worktree awaiting a forced-removal confirmation.
     pub(super) confirm_remove: Option<PathBuf>,
+    /// Index of the stash awaiting a drop confirmation.
+    pub(super) confirm_drop_stash: Option<usize>,
 }
 
 impl Dialogs {
@@ -236,6 +238,7 @@ impl Dialogs {
             || self.create.is_some()
             || self.new_worktree.is_some()
             || self.confirm_remove.is_some()
+            || self.confirm_drop_stash.is_some()
     }
 }
 
@@ -323,6 +326,38 @@ impl SpinneyApp {
                 }
                 Some(false) => {}
                 None => self.dialogs.confirm_remove = Some(path),
+            }
+        }
+        if let Some(i) = self.dialogs.confirm_drop_stash.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("confirm_drop_stash")).show(ctx, |ui| {
+                ui.label(format!(
+                    "Drop stash@{{{i}}}? Its saved changes will be lost permanently."
+                ));
+                ui.horizontal(|ui| {
+                    let drop = egui::Button::new(
+                        egui::RichText::new("Drop").color(theme::ON_ACCENT).strong(),
+                    )
+                    .fill(theme::DELETED);
+                    if ui.add(drop).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => {
+                    let ctx = self.ctx.clone();
+                    let mut errors = vec![];
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        tab.stash_action(super::Action::DropStash(i), &ctx, &mut errors);
+                    }
+                    self.errors.extend(errors);
+                }
+                Some(false) => {}
+                None => self.dialogs.confirm_drop_stash = Some(i),
             }
         }
     }
@@ -740,6 +775,9 @@ mod tests {
         assert!(d.any_open());
         d.new_worktree = None;
         d.confirm_remove = Some(PathBuf::from("/tmp/wt"));
+        assert!(d.any_open());
+        d.confirm_remove = None;
+        d.confirm_drop_stash = Some(0);
         assert!(d.any_open());
     }
 

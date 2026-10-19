@@ -218,6 +218,30 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
+        section(ui, "stashes", "Stashes", tab.stashes.len(), true, |ui| {
+            for st in &tab.stashes {
+                let r = row(
+                    ui,
+                    false,
+                    st.message.clone(),
+                    st.branch.clone().unwrap_or_default(),
+                );
+                r.context_menu(|ui| {
+                    if ui.button("Apply").clicked() {
+                        actions.push(Action::ApplyStash(st.index));
+                        ui.close();
+                    }
+                    if ui.button("Pop").clicked() {
+                        actions.push(Action::PopStash(st.index));
+                        ui.close();
+                    }
+                    if ui.button("Drop").clicked() {
+                        actions.push(Action::DropStash(st.index));
+                        ui.close();
+                    }
+                });
+            }
+        });
     });
 }
 

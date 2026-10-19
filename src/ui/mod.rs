@@ -16,6 +16,7 @@ use crate::graph::{LogStream, Row};
 use crate::project::{self, Layout, Worktree};
 use crate::refs::{self, Branch};
 use crate::stage::Direction;
+use crate::stash::{self, Stash};
 use crate::status::{FileStatus, Status};
 use crate::{creds, git};
 use dialogs::{CloneDialog, CreateDialog, Dialogs, NewWorktreeDialog};
@@ -112,6 +113,7 @@ pub struct ProjectTab {
     worktrees: Vec<Worktree>,
     active_worktree: PathBuf,
     branches: Vec<Branch>,
+    stashes: Vec<Stash>,
     log: LogPager,
     rows: Vec<Row>,
     selected_commit: Option<usize>,
@@ -174,6 +176,7 @@ impl ProjectTab {
             log: LogPager::start(active_worktree.clone(), ctx.clone()),
             active_worktree,
             branches: vec![],
+            stashes: vec![],
             rows: vec![],
             selected_commit: None,
             commit_files: vec![],
@@ -185,6 +188,7 @@ impl ProjectTab {
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
+        tab.load_stashes(errors);
         tab.reload_changes(errors);
         Ok(tab)
     }
@@ -212,6 +216,7 @@ impl ProjectTab {
             }
         }
         self.load_branches(errors);
+        self.load_stashes(errors);
         self.log = LogPager::start(self.active_worktree.clone(), ctx.clone());
         self.log.request(PAGE);
         self.rows.clear();
@@ -225,6 +230,52 @@ impl ProjectTab {
             Ok(b) => self.branches = b,
             Err(e) => errors.push(format!("branches: {e:#}")),
         }
+    }
+
+    fn load_stashes(&mut self, errors: &mut Vec<String>) {
+        match stash::list(&self.active_worktree) {
+            Ok(s) => self.stashes = s,
+            Err(e) => errors.push(format!("stashes: {e:#}")),
+        }
+    }
+
+    /// Run a stash action, refresh, and return a notice to show (if any).
+    fn stash_action(
+        &mut self,
+        action: Action,
+        ctx: &egui::Context,
+        errors: &mut Vec<String>,
+    ) -> Option<String> {
+        let wt = self.active_worktree.clone();
+        let mut notice = None;
+        let mut applies = false;
+        let res = match action {
+            Action::Stash => stash::save(&wt, None).map(|saved| {
+                if !saved {
+                    notice = Some("Nothing to stash".to_string());
+                }
+            }),
+            Action::ApplyStash(i) => {
+                applies = true;
+                stash::apply(&wt, i)
+            }
+            Action::PopStash(i) => {
+                applies = true;
+                stash::pop(&wt, i)
+            }
+            Action::DropStash(i) => stash::drop(&wt, i),
+            _ => return None,
+        };
+        self.refresh(ctx, errors);
+        if let Err(e) = res {
+            // A conflicted apply/pop exits non-zero; the Conflicted list shows the files.
+            if applies && !self.status.conflicted.is_empty() {
+                notice = Some("Stash applied with conflicts".to_string());
+            } else {
+                errors.push(format!("{e:#}"));
+            }
+        }
+        notice
     }
 
     /// Append any page that arrived; returns an error message from the worker.
@@ -354,6 +405,12 @@ pub enum Action {
     Fetch,
     Pull,
     Push,
+    /// Stash all changes (untracked included).
+    Stash,
+    ApplyStash(usize),
+    PopStash(usize),
+    /// Ask to drop the stash (confirm dialog).
+    DropStash(usize),
     Checkout(String),
     NewWorktreeFrom(String),
     /// New branch from the given base: a worktree in the worktree layout, else a switch.
@@ -388,6 +445,8 @@ pub struct SpinneyApp {
     active_tab: usize,
     jobs: Jobs,
     errors: Vec<String>,
+    /// Non-error banner messages.
+    notices: Vec<String>,
     dialogs: Dialogs,
     /// The New Tab page is showing over the open tabs (it always shows when there are none).
     new_tab: bool,
@@ -419,6 +478,7 @@ impl SpinneyApp {
             active_tab: 0,
             jobs: Jobs::new(ctx.clone()),
             errors,
+            notices: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
@@ -586,6 +646,13 @@ impl SpinneyApp {
             Action::Fetch => self.network(JobKind::Fetch),
             Action::Pull => self.network(JobKind::Pull),
             Action::Push => self.network(JobKind::Push),
+            Action::Stash | Action::ApplyStash(_) | Action::PopStash(_) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    let notice = tab.stash_action(action, &ctx, &mut errors);
+                    self.notices.extend(notice);
+                }
+            }
+            Action::DropStash(i) => self.dialogs.confirm_drop_stash = Some(i),
             Action::ToggleInline => {
                 self.config.diff_inline = !self.config.diff_inline;
                 self.save_config();
@@ -778,6 +845,18 @@ impl SpinneyApp {
         if let Some(i) = dismiss {
             self.errors.remove(i);
         }
+        let mut dismiss = None;
+        for (i, n) in self.notices.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::ACCENT_TEXT, n);
+                if ui.small_button("Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
+        if let Some(i) = dismiss {
+            self.notices.remove(i);
+        }
     }
 }
 
@@ -870,7 +949,7 @@ impl eframe::App for SpinneyApp {
                     .show(ui, |ui| Self::discard_bar(ui, n, &mut actions));
             }
         }
-        if !self.errors.is_empty() {
+        if !self.errors.is_empty() || !self.notices.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
         let shortcuts = !self.dialogs.any_open();
@@ -1152,6 +1231,7 @@ mod tests {
             active_tab: 0,
             jobs: Jobs::new(ctx.clone()),
             errors: vec![],
+            notices: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
