@@ -64,10 +64,14 @@ fn branch_menu(r: &egui::Response, layout: Layout, name: &str, actions: &mut Vec
             ui.close();
         }
         // Worktrees live beside `.bare`; in a normal clone they would nest in the working tree.
-        let r = ui.add_enabled(
-            layout == Layout::WorktreeRoot,
-            egui::Button::new("New worktree from here"),
-        );
+        let r = ui
+            .add_enabled(
+                layout == Layout::WorktreeRoot,
+                egui::Button::new("New worktree from here"),
+            )
+            .on_disabled_hover_text(
+                "Converting normal clones to the worktree layout comes in a later version",
+            );
         if r.clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));
             ui.close();
