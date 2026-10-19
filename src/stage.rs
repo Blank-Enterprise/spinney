@@ -150,10 +150,14 @@ pub fn stage_file(worktree: &Path, path: &str) -> Result<()> {
 }
 
 pub fn unstage_file(worktree: &Path, path: &str) -> Result<()> {
-    git::run(
-        worktree,
-        &["--literal-pathspecs", "restore", "--staged", "--", path],
-    )?;
+    // `restore --staged` needs HEAD; before the first commit, drop the path from the index.
+    let unborn = git::run(worktree, &["rev-parse", "--verify", "-q", "HEAD"]).is_err();
+    let args: &[&str] = if unborn {
+        &["--literal-pathspecs", "rm", "--cached", "-q", "--", path]
+    } else {
+        &["--literal-pathspecs", "restore", "--staged", "--", path]
+    };
+    git::run(worktree, args)?;
     Ok(())
 }
 
@@ -421,6 +425,19 @@ mod tests {
         assert_eq!(git::run_bytes(d, &["show", ":f.txt"], &[0]).unwrap(), work);
         let utf8 = repo("g.txt", BASE, WORK);
         assert!(!file_diff(utf8.path(), "g.txt", false).unwrap().lossy);
+    }
+
+    #[test]
+    fn unstage_before_first_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        g(d, &["init", "-q"]);
+        fs::write(d.join("new.txt"), "x\n").unwrap();
+        stage_file(d, "new.txt").unwrap();
+        assert_eq!(g(d, &["ls-files"]), "new.txt\n");
+        unstage_file(d, "new.txt").unwrap();
+        assert!(g(d, &["ls-files"]).is_empty());
+        assert!(d.join("new.txt").exists(), "worktree file kept");
     }
 
     #[test]
