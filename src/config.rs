@@ -28,6 +28,39 @@ pub struct Config {
     pub convert_dismissed: Vec<PathBuf>,
     /// External tool behind a conflicted file's "Open in merge tool".
     pub merge_tool: MergeTool,
+    /// What the Pull button does; `None` follows the repo's `pull.rebase` / `pull.ff`.
+    /// Config-only until the Preferences window (#84).
+    pub pull_strategy: Option<PullStrategy>,
+}
+
+/// `pull_strategy` in config.toml: how a pull brings in the upstream's commits.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullStrategy {
+    /// Only move the branch forward; a diverged branch is refused.
+    #[default]
+    #[serde(rename = "ff-only")]
+    FastForwardOnly,
+    /// Merge the upstream in, with a merge commit when the branches diverged.
+    Merge,
+    /// Replay the branch's own commits on top of the upstream.
+    Rebase,
+}
+
+impl PullStrategy {
+    pub const ALL: [PullStrategy; 3] = [
+        PullStrategy::FastForwardOnly,
+        PullStrategy::Merge,
+        PullStrategy::Rebase,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PullStrategy::FastForwardOnly => "Fast-forward only",
+            PullStrategy::Merge => "Merge",
+            PullStrategy::Rebase => "Rebase",
+        }
+    }
 }
 
 /// `merge_tool` in config.toml. Each named tool is a fixed command (see `mergetool.rs`),
@@ -124,6 +157,7 @@ mod tests {
             diff_inline: true,
             convert_dismissed: vec![PathBuf::from("/tmp/code/p")],
             merge_tool: MergeTool::Kaleidoscope,
+            pull_strategy: Some(PullStrategy::Rebase),
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), cfg);
@@ -151,6 +185,31 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.diff_inline);
         assert_eq!(cfg.merge_tool, MergeTool::None);
+        assert_eq!(cfg.pull_strategy, None, "follows git config");
+    }
+
+    #[test]
+    fn pull_strategy_is_a_kebab_case_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        for (text, want) in [
+            ("ff-only", PullStrategy::FastForwardOnly),
+            ("merge", PullStrategy::Merge),
+            ("rebase", PullStrategy::Rebase),
+        ] {
+            std::fs::write(&path, format!("pull_strategy = \"{text}\"\n")).unwrap();
+            assert_eq!(Config::load_from(&path).unwrap().pull_strategy, Some(want));
+            let cfg = Config {
+                pull_strategy: Some(want),
+                ..Default::default()
+            };
+            cfg.save_to(&path).unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                saved.contains(&format!("pull_strategy = \"{text}\"")),
+                "{saved}"
+            );
+        }
     }
 
     #[test]

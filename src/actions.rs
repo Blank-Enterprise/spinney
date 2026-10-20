@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::config::PullStrategy;
 use crate::project::{list_worktrees, Layout};
 use crate::{git, refs};
 use anyhow::{bail, Result};
@@ -600,10 +601,125 @@ pub fn fetch(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fast-forward only; a diverged branch surfaces git's error (merge/rebase come later).
-pub fn pull(worktree: &Path) -> Result<()> {
-    git::run(worktree, &["pull", "--ff-only"])?;
-    Ok(())
+/// `git pull` arguments for `strategy`, all explicit so the user's `pull.rebase`,
+/// `pull.ff` or `branch.<name>.rebase` cannot turn it into a different kind of pull.
+pub fn pull_args(strategy: PullStrategy) -> &'static [&'static str] {
+    match strategy {
+        PullStrategy::FastForwardOnly => &["pull", "--no-rebase", "--ff-only"],
+        PullStrategy::Merge => &["pull", "--no-rebase", "--ff", "--no-edit"],
+        PullStrategy::Rebase => &["pull", "--rebase=true"],
+    }
+}
+
+/// The strategy the user's git config asks for: `branch.<name>.rebase` over `pull.rebase`,
+/// then `pull.ff`. With neither set it stays fast-forward only, as Spinney always pulled,
+/// rather than git's merge: a pull never makes a merge commit nobody asked for.
+pub fn strategy_from_git(
+    branch_rebase: Option<&str>,
+    pull_rebase: Option<&str>,
+    pull_ff: Option<&str>,
+) -> PullStrategy {
+    let truthy = |v: &str| {
+        let v = v.trim().to_ascii_lowercase();
+        // `merges` and `interactive` rebase too; Spinney replays plainly, without an editor.
+        [
+            "true",
+            "yes",
+            "on",
+            "1",
+            "merges",
+            "m",
+            "interactive",
+            "i",
+            "preserve",
+            "p",
+        ]
+        .contains(&v.as_str())
+    };
+    let ff = pull_ff.map(|v| v.trim().to_ascii_lowercase());
+    match branch_rebase.or(pull_rebase) {
+        Some(v) if truthy(v) => PullStrategy::Rebase,
+        _ if ff.as_deref() == Some("only") => PullStrategy::FastForwardOnly,
+        // An explicit `rebase = false` or a `pull.ff` other than `only` means merge.
+        Some(_) => PullStrategy::Merge,
+        None if ff.is_some() => PullStrategy::Merge,
+        None => PullStrategy::FastForwardOnly,
+    }
+}
+
+/// `strategy_from_git` for the branch checked out in `worktree`.
+pub fn git_pull_strategy(worktree: &Path) -> Result<PullStrategy> {
+    // Exit 1 is an unset key.
+    let get = |key: &str| -> Result<Option<String>> {
+        let v = git::run_ok_codes(worktree, &["config", "--get", key], &[0, 1])?;
+        Ok(Some(v.trim().to_string()).filter(|v| !v.is_empty()))
+    };
+    let branch_rebase = match refs::current_branch(worktree)? {
+        Some(b) => get(&format!("branch.{b}.rebase"))?,
+        None => None,
+    };
+    let (pull_rebase, pull_ff) = (get("pull.rebase")?, get("pull.ff")?);
+    Ok(strategy_from_git(
+        branch_rebase.as_deref(),
+        pull_rebase.as_deref(),
+        pull_ff.as_deref(),
+    ))
+}
+
+/// A merge or rebase pull that stopped on conflicts, left in place for the in-progress
+/// banner. An error so it can come back from a background job, like `PushRejected`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PullConflicts {
+    pub strategy: PullStrategy,
+    pub files: Vec<String>,
+}
+
+impl std::fmt::Display for PullConflicts {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "pull stopped on conflicts in {}", self.files.join(", "))
+    }
+}
+
+impl std::error::Error for PullConflicts {}
+
+/// Pull the current branch's upstream with `strategy`. A merge or rebase that conflicts is
+/// left in progress (`MergeOutcome::Conflicts`); anything else that stops it is undone.
+/// Fast-forward only refuses a diverged branch and changes nothing.
+pub fn pull(worktree: &Path, strategy: PullStrategy) -> Result<MergeOutcome> {
+    if strategy != PullStrategy::FastForwardOnly {
+        // As for merge and rebase: never on top of another operation or local changes.
+        ensure_clean(worktree)?;
+    }
+    let before = rev_parse(worktree, "HEAD")?;
+    if let Err(e) = git::run(worktree, pull_args(strategy)) {
+        if strategy == PullStrategy::FastForwardOnly {
+            // It never starts an operation, so one in progress is the user's: leave it.
+            if format!("{e:#}").contains("fast-forward") && diverged(worktree) {
+                bail!("The branch and its upstream have diverged; pull with Merge or Rebase (▾)");
+            }
+            return Err(e);
+        }
+        return stopped(worktree, e, false, &before);
+    }
+    Ok(if rev_parse(worktree, "HEAD")? == before {
+        MergeOutcome::UpToDate
+    } else {
+        MergeOutcome::Done
+    })
+}
+
+/// HEAD and its upstream each have commits the other lacks.
+fn diverged(worktree: &Path) -> bool {
+    let counts = git::run(
+        worktree,
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+    );
+    counts.is_ok_and(|c| {
+        let mut n = c
+            .split_whitespace()
+            .map(|n| n.parse::<usize>().unwrap_or(0));
+        n.next().unwrap_or(0) > 0 && n.next().unwrap_or(0) > 0
+    })
 }
 
 /// A push the remote turned down because it has commits this branch lacks.
@@ -1285,8 +1401,15 @@ mod tests {
         git::run(&remote, &["config", "user.name", "Test User"]).unwrap();
         write_commit(&remote, "r.txt");
         fetch(&main).unwrap();
-        pull(&main).unwrap();
+        assert_eq!(
+            pull(&main, PullStrategy::FastForwardOnly).unwrap(),
+            MergeOutcome::Done
+        );
         assert!(main.join("r.txt").exists());
+        assert_eq!(
+            pull(&main, PullStrategy::FastForwardOnly).unwrap(),
+            MergeOutcome::UpToDate
+        );
     }
 
     #[test]
@@ -1341,6 +1464,166 @@ mod tests {
 
     fn rejected(err: anyhow::Error) -> PushRejected {
         err.downcast::<PushRejected>().expect("non-fast-forward")
+    }
+
+    /// `ours` and the remote each have a commit the other lacks: o.txt and t.txt, or with
+    /// `clash`, different edits to a.txt.
+    fn diverged_clones(clash: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, _remote, ours, theirs) = two_clones();
+        let edit = |dir: &Path, file: &str, text: &str| {
+            std::fs::write(dir.join(file), text).unwrap();
+            git::run(dir, &["add", "."]).unwrap();
+            commit(dir, &format!("edit {file}")).unwrap();
+        };
+        if clash {
+            edit(&theirs, "a.txt", "theirs\n");
+            edit(&ours, "a.txt", "ours\n");
+        } else {
+            edit(&theirs, "t.txt", "t\n");
+            edit(&ours, "o.txt", "o\n");
+        }
+        push(&theirs).unwrap();
+        (tmp, ours, theirs)
+    }
+
+    #[test]
+    fn pull_args_are_explicit() {
+        assert_eq!(
+            pull_args(PullStrategy::FastForwardOnly),
+            ["pull", "--no-rebase", "--ff-only"]
+        );
+        assert_eq!(
+            pull_args(PullStrategy::Merge),
+            ["pull", "--no-rebase", "--ff", "--no-edit"]
+        );
+        assert_eq!(pull_args(PullStrategy::Rebase), ["pull", "--rebase=true"]);
+    }
+
+    #[test]
+    fn strategy_from_git_config() {
+        use PullStrategy::*;
+        let s = strategy_from_git;
+        assert_eq!(s(None, None, None), FastForwardOnly, "nothing set");
+        assert_eq!(s(None, Some("true"), None), Rebase);
+        assert_eq!(s(None, Some("merges"), None), Rebase);
+        assert_eq!(s(None, Some("Interactive"), Some("only")), Rebase);
+        assert_eq!(s(None, Some("false"), None), Merge);
+        assert_eq!(s(None, Some("false"), Some("only")), FastForwardOnly);
+        assert_eq!(s(None, None, Some("only")), FastForwardOnly);
+        assert_eq!(s(None, None, Some("true")), Merge);
+        assert_eq!(s(None, None, Some("false")), Merge);
+        assert_eq!(s(Some("false"), Some("true"), None), Merge, "branch wins");
+        assert_eq!(s(Some("yes"), Some("false"), None), Rebase, "branch wins");
+    }
+
+    #[test]
+    fn git_pull_strategy_reads_repo_config() {
+        let (_tmp, _remote, ours, _theirs) = two_clones();
+        let strategy = || git_pull_strategy(&ours).unwrap();
+        assert_eq!(strategy(), PullStrategy::FastForwardOnly);
+        git::run(&ours, &["config", "pull.rebase", "false"]).unwrap();
+        assert_eq!(strategy(), PullStrategy::Merge);
+        git::run(&ours, &["config", "branch.main.rebase", "true"]).unwrap();
+        assert_eq!(strategy(), PullStrategy::Rebase);
+    }
+
+    #[test]
+    fn pull_ff_only_refuses_diverged_branch() {
+        let (_tmp, ours, _theirs) = diverged_clones(false);
+        let before = head(&ours, "HEAD");
+        let err = pull(&ours, PullStrategy::FastForwardOnly).unwrap_err();
+        assert!(err.to_string().contains("diverged"), "{err}");
+        assert_eq!(head(&ours, "HEAD"), before);
+        assert_eq!(in_progress(&ours).unwrap(), None);
+    }
+
+    #[test]
+    fn pull_merge_on_diverged_branch_makes_merge_commit() {
+        let (_tmp, ours, _theirs) = diverged_clones(false);
+        let mine = head(&ours, "HEAD");
+        // A user's `pull.rebase` must not turn the chosen merge into a rebase.
+        git::run(&ours, &["config", "pull.rebase", "true"]).unwrap();
+        git::run(&ours, &["config", "pull.ff", "only"]).unwrap();
+        assert_eq!(
+            pull(&ours, PullStrategy::Merge).unwrap(),
+            MergeOutcome::Done
+        );
+        assert_eq!(parents(&ours, "HEAD").unwrap().len(), 2);
+        assert_eq!(head(&ours, "HEAD^1"), mine);
+        assert_eq!(head(&ours, "HEAD^2"), head(&ours, "origin/main"));
+        assert!(ours.join("o.txt").exists() && ours.join("t.txt").exists());
+    }
+
+    #[test]
+    fn pull_rebase_on_diverged_branch_replays_on_upstream() {
+        let (_tmp, ours, _theirs) = diverged_clones(false);
+        // A user's `pull.ff = only` must not refuse the chosen rebase.
+        git::run(&ours, &["config", "pull.ff", "only"]).unwrap();
+        git::run(&ours, &["config", "pull.rebase", "false"]).unwrap();
+        assert_eq!(
+            pull(&ours, PullStrategy::Rebase).unwrap(),
+            MergeOutcome::Done
+        );
+        assert_eq!(parents(&ours, "HEAD").unwrap().len(), 1);
+        assert_eq!(head(&ours, "HEAD~1"), head(&ours, "origin/main"));
+        assert_eq!(head_message(&ours).unwrap(), "edit o.txt");
+        assert!(ours.join("o.txt").exists() && ours.join("t.txt").exists());
+    }
+
+    #[test]
+    fn pull_merge_conflict_is_left_in_progress() {
+        let (_tmp, ours, _theirs) = diverged_clones(true);
+        let outcome = pull(&ours, PullStrategy::Merge).unwrap();
+        assert_eq!(outcome, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(in_progress(&ours).unwrap(), Some(Operation::Merge));
+        abort_op(&ours, Operation::Merge).unwrap();
+        assert_eq!(in_progress(&ours).unwrap(), None);
+    }
+
+    #[test]
+    fn pull_rebase_conflict_is_left_in_progress() {
+        let (_tmp, ours, _theirs) = diverged_clones(true);
+        let outcome = pull(&ours, PullStrategy::Rebase).unwrap();
+        assert_eq!(outcome, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(in_progress(&ours).unwrap(), Some(Operation::Rebase));
+        // Resolve and continue: the rebase finishes on top of the upstream.
+        std::fs::write(ours.join("a.txt"), "both\n").unwrap();
+        assert!(mark_resolved(&ours, "a.txt", false).unwrap());
+        assert_eq!(
+            continue_op(&ours, Operation::Rebase).unwrap(),
+            MergeOutcome::Done
+        );
+        assert_eq!(head(&ours, "HEAD~1"), head(&ours, "origin/main"));
+    }
+
+    #[test]
+    fn pull_ff_only_never_aborts_an_operation_in_progress() {
+        let (_tmp, ours, _theirs) = diverged_clones(true);
+        let outcome = pull(&ours, PullStrategy::Merge).unwrap();
+        assert_eq!(outcome, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        // Conflicted, then resolved but not continued: both times git refuses the pull.
+        pull(&ours, PullStrategy::FastForwardOnly).unwrap_err();
+        assert_eq!(in_progress(&ours).unwrap(), Some(Operation::Merge));
+        std::fs::write(ours.join("a.txt"), "both\n").unwrap();
+        assert!(mark_resolved(&ours, "a.txt", false).unwrap());
+        pull(&ours, PullStrategy::FastForwardOnly).unwrap_err();
+        assert_eq!(in_progress(&ours).unwrap(), Some(Operation::Merge));
+        assert_eq!(
+            std::fs::read_to_string(ours.join("a.txt")).unwrap(),
+            "both\n"
+        );
+    }
+
+    #[test]
+    fn pull_merge_or_rebase_refuses_local_changes() {
+        let (_tmp, ours, _theirs) = diverged_clones(false);
+        std::fs::write(ours.join("a.txt"), "dirty\n").unwrap();
+        let before = head(&ours, "HEAD");
+        for strategy in [PullStrategy::Merge, PullStrategy::Rebase] {
+            let err = pull(&ours, strategy).unwrap_err();
+            assert!(err.to_string().contains("Commit or stash"), "{err}");
+        }
+        assert_eq!(head(&ours, "HEAD"), before);
     }
 
     #[test]
