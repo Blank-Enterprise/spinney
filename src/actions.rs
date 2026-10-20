@@ -1007,6 +1007,51 @@ pub fn delete_branch(worktree: &Path, branch: &str, force: bool) -> Result<Delet
     }
 }
 
+/// What deleting several local branches did, branch by branch.
+#[derive(Debug, Default, PartialEq)]
+pub struct BulkDelete {
+    pub deleted: Vec<String>,
+    /// Left alone: `-d` refused them, so they can be asked about again with force.
+    pub not_merged: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// `delete_branch` for each of `branches`, carrying on past the ones that fail.
+pub fn delete_branches(worktree: &Path, branches: &[String], force: bool) -> BulkDelete {
+    let mut out = BulkDelete::default();
+    for b in branches {
+        match delete_branch(worktree, b, force) {
+            Ok(DeleteOutcome::Deleted) => out.deleted.push(b.clone()),
+            Ok(DeleteOutcome::NotMerged) => out.not_merged.push(b.clone()),
+            Err(e) => out.errors.push(format!("{b}: {e:#}")),
+        }
+    }
+    out
+}
+
+/// One atomic `git push <remote> --delete` per remote for `remote_branches`
+/// (`origin/feat/a`, …): a remote either drops them all or none.
+pub fn delete_remote_branches(worktree: &Path, remote_branches: &[String]) -> Result<()> {
+    let mut by_remote: Vec<(&str, Vec<String>)> = vec![];
+    for rb in remote_branches {
+        let Some((remote, name)) = rb.split_once('/') else {
+            bail!("{rb} is not a remote branch");
+        };
+        // Full refs, so a tag with the same name is never the one deleted.
+        let full = format!("refs/heads/{name}");
+        match by_remote.iter_mut().find(|(r, _)| *r == remote) {
+            Some((_, refs)) => refs.push(full),
+            None => by_remote.push((remote, vec![full])),
+        }
+    }
+    for (remote, refs) in by_remote {
+        let mut args = vec!["push", "--atomic", remote, "--delete"];
+        args.extend(refs.iter().map(String::as_str));
+        git::run(worktree, &args)?;
+    }
+    Ok(())
+}
+
 /// `git push <remote> --delete <name>` for `remote_branch` (`origin/feature/x`); the push
 /// also drops the remote-tracking ref.
 pub fn delete_remote_branch(worktree: &Path, remote_branch: &str) -> Result<()> {
@@ -2147,6 +2192,47 @@ mod tests {
         let out = delete_branch(&main, "topic", true).unwrap();
         assert_eq!(out, DeleteOutcome::Deleted);
         assert!(git::run(&main, &["rev-parse", "--verify", "topic"]).is_err());
+    }
+
+    #[test]
+    fn delete_branches_reports_each() {
+        let (_tmp, root, main) = cloned();
+        create_branch(&main, "feat/done", "main").unwrap();
+        git::run(
+            &main,
+            &["branch", "--no-track", "feat/topic", "origin/feature/x"],
+        )
+        .unwrap();
+        create_branch(&main, "feat/out", "main").unwrap();
+        add_worktree_existing(&root, "feat/out").unwrap();
+        let names = ["feat/done", "feat/topic", "feat/out"].map(String::from);
+        let out = delete_branches(&main, &names, false);
+        assert_eq!(out.deleted, ["feat/done"]);
+        assert_eq!(out.not_merged, ["feat/topic"]);
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(out.errors[0].starts_with("feat/out: "), "{:?}", out.errors);
+        let out = delete_branches(&main, &out.not_merged, true);
+        assert_eq!(out.deleted, ["feat/topic"]);
+        assert!(git::run(&main, &["rev-parse", "--verify", "feat/topic"]).is_err());
+        git::run(&main, &["rev-parse", "--verify", "feat/out"]).unwrap();
+    }
+
+    #[test]
+    fn delete_remote_branches_in_one_push() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        for b in ["feat/a", "feat/b"] {
+            create_branch(&main, b, "main").unwrap();
+            git::run(&main, &["push", "-q", "origin", b]).unwrap();
+        }
+        let names = ["origin/feat/a", "origin/feat/b"].map(String::from);
+        delete_remote_branches(&main, &names).unwrap();
+        for b in ["feat/a", "feat/b"] {
+            assert!(git::run(&remote, &["rev-parse", "--verify", b]).is_err());
+        }
+        git::run(&remote, &["rev-parse", "--verify", "feature/x"]).unwrap();
+        git::run(&main, &["rev-parse", "--verify", "feat/a"]).unwrap();
+        assert!(delete_remote_branches(&main, &["nope".into()]).is_err());
     }
 
     #[test]

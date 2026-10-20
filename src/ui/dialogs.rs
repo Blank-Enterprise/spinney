@@ -263,6 +263,50 @@ pub(super) struct DeleteBranchDialog {
     pub(super) not_merged: bool,
 }
 
+/// Confirm deleting a sidebar folder's branches, naming each one; asked again with
+/// `not_merged` for the ones `-d` refuses.
+pub(super) struct DeleteFolderDialog {
+    pub(super) folder: String,
+    /// On the remote (`origin/feat/a`, …) rather than local branches.
+    pub(super) remote: bool,
+    pub(super) branches: Vec<String>,
+    /// Checked out in a worktree, so left alone.
+    pub(super) kept: Vec<String>,
+    /// `origin/<branch>` for those of `branches` that have one.
+    pub(super) remotes: Vec<String>,
+    /// Also delete `remotes` once their local branches are gone.
+    pub(super) also_remote: bool,
+    pub(super) not_merged: bool,
+}
+
+impl DeleteFolderDialog {
+    /// The modal's question.
+    pub(super) fn question(&self) -> String {
+        let n = self.branches.len();
+        let s = if n == 1 { "" } else { "es" };
+        if self.remote {
+            format!("Delete {n} branch{s} in {} on the remote?", self.folder)
+        } else if self.not_merged {
+            let are = if n == 1 { "is" } else { "are" };
+            format!(
+                "{n} branch{s} in {} {are} not fully merged. Delete anyway?",
+                self.folder
+            )
+        } else {
+            format!("Delete {n} branch{s} in {}?", self.folder)
+        }
+    }
+}
+
+/// `origin/<b>` for each local branch `b` in `names` that has one in `branches`.
+pub(super) fn folder_remotes(branches: &[refs::Branch], names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|b| format!("origin/{b}"))
+        .filter(|r| branches.iter().any(|b| b.remote && &b.name == r))
+        .collect()
+}
+
 /// Rename local `branch` (asked in `worktree`) to `name`, and maybe on its remote too.
 pub(super) struct RenameBranchDialog {
     pub(super) root: PathBuf,
@@ -457,6 +501,7 @@ pub(super) struct Dialogs {
     /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
     pub(super) delete_remote: Option<String>,
     pub(super) delete_tag: Option<DeleteTagDialog>,
+    pub(super) delete_folder: Option<DeleteFolderDialog>,
     pub(super) rename_branch: Option<RenameBranchDialog>,
     pub(super) confirm_drop_stash: Option<DropStash>,
     pub(super) convert: Option<ConvertDialog>,
@@ -655,6 +700,7 @@ impl Dialogs {
             || self.delete_branch.is_some()
             || self.delete_remote.is_some()
             || self.delete_tag.is_some()
+            || self.delete_folder.is_some()
             || self.rename_branch.is_some()
             || self.merge.is_some()
             || self.rebase.is_some()
@@ -984,6 +1030,49 @@ impl SpinneyApp {
                 Some(true) => self.delete_branch(d),
                 Some(false) => {}
                 None => self.dialogs.delete_branch = Some(d),
+            }
+        }
+        if let Some(mut d) = self.dialogs.delete_folder.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("delete_folder")).show(ctx, |ui| {
+                ui.label(d.question());
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for b in &d.branches {
+                            ui.label(egui::RichText::new(b).monospace());
+                        }
+                    });
+                if !d.kept.is_empty() {
+                    let kept = d.kept.join(", ");
+                    let text = format!("Kept, checked out in a worktree: {kept}");
+                    ui.label(egui::RichText::new(text).color(theme::MUTED));
+                }
+                if !d.remotes.is_empty() {
+                    let n = d.remotes.len();
+                    let s = if n == 1 { "" } else { "es" };
+                    let label = format!("Also delete {n} matching branch{s} on origin");
+                    ui.checkbox(&mut d.also_remote, label)
+                        .on_hover_text(d.remotes.join("\n"));
+                }
+                ui.horizontal(|ui| {
+                    let label = if d.not_merged {
+                        "Delete anyway"
+                    } else {
+                        "Delete"
+                    };
+                    if ui.add(danger(label)).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.delete_folder(d),
+                Some(false) => {}
+                None => self.dialogs.delete_folder = Some(d),
             }
         }
         if let Some(name) = self.dialogs.delete_remote.take() {
@@ -1817,6 +1906,94 @@ impl SpinneyApp {
         self.errors.extend(errors);
     }
 
+    /// Open the folder dialog, leaving out (and naming) branches a worktree has checked out.
+    pub(super) fn ask_delete_folder(
+        &mut self,
+        folder: String,
+        branches: Vec<String>,
+        remote: bool,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let (branches, kept) = if remote {
+            (branches, vec![])
+        } else {
+            match project::list_worktrees(&tab.active_worktree) {
+                Ok(wts) => branches
+                    .into_iter()
+                    .partition(|b| !wts.iter().any(|w| w.branch.as_ref() == Some(b))),
+                Err(e) => return errors.push(format!("{e:#}")),
+            }
+        };
+        if branches.is_empty() {
+            return errors.push(format!(
+                "Every branch in {folder} is checked out in a worktree"
+            ));
+        }
+        let remotes = if remote {
+            vec![]
+        } else {
+            folder_remotes(&tab.branches, &branches)
+        };
+        self.dialogs.delete_folder = Some(DeleteFolderDialog {
+            folder,
+            remote,
+            branches,
+            kept,
+            remotes,
+            also_remote: false,
+            not_merged: false,
+        });
+    }
+
+    /// Remote: one push job. Local: `-d` each now (`-D` once confirmed unmerged), the
+    /// unmerged ones asked about again, then their remote branches as a job.
+    fn delete_folder(&mut self, mut d: DeleteFolderDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+        let mut remote = vec![];
+        if d.remote {
+            remote = d.branches;
+        } else {
+            let out = actions::delete_branches(&wt, &d.branches, d.not_merged);
+            tab.refresh(&ctx, &mut errors);
+            errors.extend(out.errors);
+            let names = |list: &[String]| -> Vec<String> {
+                list.iter().map(|b| format!("origin/{b}")).collect()
+            };
+            if d.also_remote {
+                let gone = names(&out.deleted);
+                remote = d
+                    .remotes
+                    .iter()
+                    .filter(|r| gone.contains(r))
+                    .cloned()
+                    .collect();
+            }
+            if !out.not_merged.is_empty() {
+                let left = names(&out.not_merged);
+                d.remotes.retain(|r| left.contains(r));
+                d.branches = out.not_merged;
+                d.kept.clear();
+                d.not_merged = true;
+                self.dialogs.delete_folder = Some(d);
+            }
+        }
+        if !remote.is_empty() {
+            self.jobs
+                .spawn(JobKind::DeleteRemote, root, String::new(), move || {
+                    actions::delete_remote_branches(&wt, &remote)
+                });
+        }
+        self.errors.extend(errors);
+    }
+
     /// `git push <remote> --delete` on a worker, like a push.
     fn delete_remote(&mut self, name: String) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
@@ -2501,6 +2678,17 @@ mod tests {
         });
         assert!(d.any_open());
         d.delete_tag = None;
+        d.delete_folder = Some(DeleteFolderDialog {
+            folder: "feat".into(),
+            remote: true,
+            branches: vec!["origin/feat/a".into()],
+            kept: vec![],
+            remotes: vec![],
+            also_remote: false,
+            not_merged: false,
+        });
+        assert!(d.any_open());
+        d.delete_folder = None;
         d.rename_branch = Some(RenameBranchDialog::new(
             PathBuf::from("/tmp/r"),
             PathBuf::from("/tmp/r"),
@@ -3225,6 +3413,82 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("{kind:?} did not finish");
+    }
+
+    #[test]
+    fn folder_delete_keeps_checked_out_and_asks_again_for_unmerged() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let remote = tmp.path().join("remote.git");
+        let d = tmp.path().join("repo");
+        std::fs::create_dir(&d).unwrap();
+        crate::git::run(tmp.path(), &["init", "-q", "--bare", "remote.git"]).unwrap();
+        let g = |args: &[&str]| crate::git::run(&d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        g(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", remote.display()),
+        ]);
+        g(&["branch", "feat/a"]);
+        g(&["push", "-q", "origin", "feat/a"]);
+        g(&["branch", "feat/b"]);
+        g(&["branch", "feat/c"]);
+        // feat/b gets a commit main lacks; feat/c is out in another worktree.
+        g(&["switch", "-q", "feat/b"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "wip"]);
+        g(&["switch", "-q", "main"]);
+        let wt = tmp.path().join("wt");
+        g(&["worktree", "add", "-q", wt.to_str().unwrap(), "feat/c"]);
+        let space = app.space().unwrap();
+        app.open_tab(&d, &space);
+        let has = |r: &str| crate::git::run(&d, &["rev-parse", "--verify", "-q", r]).is_ok();
+
+        let branches = ["feat/a", "feat/b", "feat/c"].map(String::from).to_vec();
+        app.apply(Action::AskDeleteFolder {
+            folder: "feat".into(),
+            branches,
+            remote: false,
+        });
+        let mut del = app.dialogs.delete_folder.take().expect("asks first");
+        assert_eq!(del.branches, ["feat/a", "feat/b"]);
+        assert_eq!(del.kept, ["feat/c"]);
+        assert_eq!(del.remotes, ["origin/feat/a"]);
+        assert_eq!(del.question(), "Delete 2 branches in feat?");
+        del.also_remote = true;
+        app.delete_folder(del);
+        assert!(!has("refs/heads/feat/a"));
+        assert!(has("refs/heads/feat/b") && has("refs/heads/feat/c"));
+        finish_job(&mut app, JobKind::DeleteRemote);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let on_remote = crate::git::run(&remote, &["rev-parse", "--verify", "-q", "feat/a"]);
+        assert!(on_remote.is_err());
+
+        let del = app
+            .dialogs
+            .delete_folder
+            .take()
+            .expect("asks about the unmerged one");
+        assert!(del.not_merged);
+        assert_eq!(del.branches, ["feat/b"]);
+        assert!(del.kept.is_empty() && del.remotes.is_empty());
+        assert_eq!(
+            del.question(),
+            "1 branch in feat is not fully merged. Delete anyway?"
+        );
+        app.delete_folder(del);
+        assert!(!has("refs/heads/feat/b"));
+        assert!(has("refs/heads/feat/c"));
+        assert!(app.dialogs.delete_folder.is_none());
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 
     #[test]

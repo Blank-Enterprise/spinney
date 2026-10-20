@@ -567,6 +567,12 @@ pub enum Action {
     AskDeleteBranch(String),
     /// Ask before deleting `remote/branch` on its remote.
     AskDeleteRemote(String),
+    /// Ask before deleting the branches shown in a sidebar folder (local, or on the remote).
+    AskDeleteFolder {
+        folder: String,
+        branches: Vec<String>,
+        remote: bool,
+    },
     /// Ask for a new name for a local branch (refused when another worktree has it out).
     AskRename(String),
     /// Move a local branch checked out nowhere up to its upstream (fast-forward only).
@@ -1207,6 +1213,11 @@ impl SpinneyApp {
                 }
             }
             Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
+            Action::AskDeleteFolder {
+                folder,
+                branches,
+                remote,
+            } => self.ask_delete_folder(folder, branches, remote, &mut errors),
             Action::PushTag(name) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
