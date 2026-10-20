@@ -14,6 +14,8 @@ const DOT_R: f32 = 5.0;
 /// Right-hand columns: author, then relative time.
 const AUTHOR_W: f32 = 140.0;
 const TIME_W: f32 = 70.0;
+/// Room kept for the subject before remote branch labels collapse into "+N".
+const MIN_SUBJECT_W: f32 = 120.0;
 /// Fetch the next page once the view is this close to the end.
 const PREFETCH: usize = 100;
 /// Text on a lane-coloured pill.
@@ -38,12 +40,15 @@ pub struct Names<'a> {
     pub branches: &'a HashSet<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// In the order labels are laid out (see `order_pills`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PillKind {
     /// The checked-out branch (or a detached HEAD).
     Head,
-    /// Local branch or tag: lane colour.
+    /// Local branch: lane colour.
     Local,
+    /// Tag: lane colour.
+    Tag,
     /// Remote-tracking branch: neutral.
     Remote,
 }
@@ -74,15 +79,50 @@ pub fn parse_refs<'a>(refs: &'a str, remotes: &HashSet<&str>) -> Vec<Pill<'a>> {
                     text: r,
                     kind: PillKind::Remote,
                 }
-            } else {
-                let text = r.strip_prefix("tag: ").unwrap_or(r);
+            } else if let Some(t) = r.strip_prefix("tag: ") {
                 Pill {
-                    text,
+                    text: t,
+                    kind: PillKind::Tag,
+                }
+            } else {
+                Pill {
+                    text: r,
                     kind: PillKind::Local,
                 }
             }
         })
         .collect()
+}
+
+/// Lay labels out as the checked-out branch, other local branches, tags, then remote
+/// branches, so a long row cuts off remotes and never the local branch. Stable, so each
+/// group keeps git's order.
+pub fn order_pills(pills: &mut [Pill]) {
+    pills.sort_by_key(|p| p.kind);
+}
+
+/// How many of the ordered pills to draw in `budget`, given their `widths` and the width
+/// `more(n)` of a "+n" pill for the rest. Only remote branches collapse into "+n".
+pub fn fit_pills(
+    kinds: &[PillKind],
+    widths: &[f32],
+    budget: f32,
+    more: impl Fn(usize) -> f32,
+) -> usize {
+    let n = widths.len();
+    if widths.iter().sum::<f32>() <= budget {
+        return n;
+    }
+    let mut shown = kinds
+        .iter()
+        .position(|k| *k == PillKind::Remote)
+        .unwrap_or(n);
+    let mut used: f32 = widths[..shown].iter().sum();
+    while shown < n && used + widths[shown] + more(n - shown - 1) <= budget {
+        used += widths[shown];
+        shown += 1;
+    }
+    shown
 }
 
 /// What the commit menu needs to know about the tab.
@@ -446,6 +486,12 @@ fn lane_x(rect: Rect, lane: usize) -> f32 {
     rect.left() + LANE_W * lane as f32 + LANE_W / 2.0
 }
 
+/// How far `pill` moves x for `text`: the pill and the gap after it.
+fn pill_width(painter: &egui::Painter, text: &str) -> f32 {
+    let galley = painter.layout_no_wrap(text.to_string(), FontId::proportional(11.0), theme::TEXT);
+    galley.size().x + 14.0 + 6.0
+}
+
 /// Pill with `text` at `x`, vertically centred on `mid`; returns its right edge.
 pub(super) fn pill(
     painter: &egui::Painter,
@@ -548,7 +594,16 @@ fn paint_row<'a>(
     );
     let mut cx = rect.left() + text_x;
     let mut labels = vec![];
-    for p in parse_refs(&row.commit.refs, names.remotes) {
+    let mut pills = parse_refs(&row.commit.refs, names.remotes);
+    order_pills(&mut pills);
+    let kinds: Vec<PillKind> = pills.iter().map(|p| p.kind).collect();
+    let widths: Vec<f32> = pills.iter().map(|p| pill_width(&main, p.text)).collect();
+    let budget = author_left - 12.0 - cx - MIN_SUBJECT_W;
+    let shown = fit_pills(&kinds, &widths, budget, |n| {
+        pill_width(&main, &format!("+{n}"))
+    });
+    let hidden = pills.split_off(shown);
+    for p in pills {
         let (fill, fg) = match p.kind {
             PillKind::Remote => (theme::BORDER, theme::TEXT),
             _ => (color(row.lane), ON_PILL),
@@ -560,6 +615,22 @@ fn paint_row<'a>(
         // Tags and a detached HEAD aren't branches.
         if names.branches.contains(p.text) && r.is_positive() {
             labels.push((r, p.text));
+        }
+    }
+    if !hidden.is_empty() {
+        let left = cx;
+        let text = format!("+{}", hidden.len());
+        cx = pill(&main, cx, mid, &text, theme::BORDER, theme::TEXT, false);
+        let r = Rect::from_min_max(Pos2::new(left, top), Pos2::new(cx - 6.0, bottom));
+        let r = r.intersect(main.clip_rect());
+        if r.is_positive() {
+            let list: Vec<&str> = hidden.iter().map(|p| p.text).collect();
+            ui.interact(
+                r,
+                egui::Id::unique(("more_refs", &row.commit.sha)),
+                Sense::hover(),
+            )
+            .on_hover_text(list.join("\n"));
         }
     }
     main.text(
@@ -649,12 +720,54 @@ mod tests {
                 ("main", Head),
                 ("origin/main", Remote),
                 ("origin/HEAD", Remote),
-                ("v1", Local),
+                ("v1", Tag),
                 ("feat/x", Local),
             ]
         );
         assert_eq!(parse_refs("HEAD", &remotes)[0].kind, Head, "detached");
         assert!(parse_refs("", &remotes).is_empty());
+    }
+
+    #[test]
+    fn labels_put_local_branches_before_tags_and_remotes() {
+        let remotes: HashSet<&str> = ["origin/main", "origin/a", "origin/b"]
+            .into_iter()
+            .collect();
+        let mut pills = parse_refs(
+            "origin/a, tag: v0.2, HEAD -> main, origin/main, feat/x, origin/HEAD, origin/b, wip",
+            &remotes,
+        );
+        order_pills(&mut pills);
+        let got: Vec<_> = pills.iter().map(|p| p.text).collect();
+        assert_eq!(
+            got,
+            [
+                "main",
+                "feat/x",
+                "wip",
+                "v0.2",
+                "origin/a",
+                "origin/main",
+                "origin/HEAD",
+                "origin/b"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_remote_labels_collapse_to_fit() {
+        use PillKind::*;
+        let kinds = [Head, Local, Tag, Remote, Remote, Remote];
+        let widths = [50.0; 6];
+        let more = |_| 20.0;
+        assert_eq!(fit_pills(&kinds, &widths, 300.0, more), 6, "all fit");
+        // 3 locals (150) + 2 remotes (100) + "+1" (20) fits in 290; the third remote doesn't.
+        assert_eq!(fit_pills(&kinds, &widths, 290.0, more), 5);
+        assert_eq!(fit_pills(&kinds, &widths, 200.0, more), 3);
+        // Local branches and tags stay even when nothing fits.
+        assert_eq!(fit_pills(&kinds, &widths, 0.0, more), 3);
+        assert_eq!(fit_pills(&kinds[..3], &widths[..3], 0.0, more), 3);
+        assert_eq!(fit_pills(&[], &[], -10.0, more), 0);
     }
 
     fn fs(path: &str, change: Change) -> crate::status::FileStatus {

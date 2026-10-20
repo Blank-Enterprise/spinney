@@ -602,11 +602,12 @@ pub fn fetch(dir: &Path) -> Result<()> {
 
 /// `git pull` arguments for `strategy`, all explicit so the user's `pull.rebase`,
 /// `pull.ff` or `branch.<name>.rebase` cannot turn it into a different kind of pull.
+/// `--prune` drops remote branches deleted on the remote, as Fetch does; tags stay.
 pub fn pull_args(strategy: PullStrategy) -> &'static [&'static str] {
     match strategy {
-        PullStrategy::FastForwardOnly => &["pull", "--no-rebase", "--ff-only"],
-        PullStrategy::Merge => &["pull", "--no-rebase", "--ff", "--no-edit"],
-        PullStrategy::Rebase => &["pull", "--rebase=true"],
+        PullStrategy::FastForwardOnly => &["pull", "--prune", "--no-rebase", "--ff-only"],
+        PullStrategy::Merge => &["pull", "--prune", "--no-rebase", "--ff", "--no-edit"],
+        PullStrategy::Rebase => &["pull", "--prune", "--rebase=true"],
     }
 }
 
@@ -749,7 +750,12 @@ pub struct Lease {
     pub expect: String,
     /// Commits at `expect` that are not on the branch: what the force push drops.
     pub lost: usize,
+    /// The newest `LOST_SHOWN` of them as "<short sha> <subject>", for the confirmation.
+    pub lost_commits: Vec<String>,
 }
+
+/// Lost commits a force push confirmation names; the rest are counted.
+pub const LOST_SHOWN: usize = 5;
 
 /// A non-fast-forward rejection fails with `PushRejected`.
 pub fn push(worktree: &Path) -> Result<()> {
@@ -799,6 +805,8 @@ pub fn lease(worktree: &Path) -> Result<Lease> {
     let expect = expect.trim().to_string();
     let range = format!("HEAD..{expect}");
     let lost = git::run(worktree, &["rev-list", "--count", &range])?;
+    let shown = format!("-{LOST_SHOWN}");
+    let log = git::run(worktree, &["log", &shown, "--format=%h %s", &range])?;
     Ok(Lease {
         worktree: worktree.to_path_buf(),
         branch,
@@ -807,6 +815,7 @@ pub fn lease(worktree: &Path) -> Result<Lease> {
         tracking,
         expect,
         lost: lost.trim().parse()?,
+        lost_commits: log.lines().map(str::to_string).collect(),
     })
 }
 
@@ -1727,13 +1736,16 @@ mod tests {
     fn pull_args_are_explicit() {
         assert_eq!(
             pull_args(PullStrategy::FastForwardOnly),
-            ["pull", "--no-rebase", "--ff-only"]
+            ["pull", "--prune", "--no-rebase", "--ff-only"]
         );
         assert_eq!(
             pull_args(PullStrategy::Merge),
-            ["pull", "--no-rebase", "--ff", "--no-edit"]
+            ["pull", "--prune", "--no-rebase", "--ff", "--no-edit"]
         );
-        assert_eq!(pull_args(PullStrategy::Rebase), ["pull", "--rebase=true"]);
+        assert_eq!(
+            pull_args(PullStrategy::Rebase),
+            ["pull", "--prune", "--rebase=true"]
+        );
     }
 
     #[test]
@@ -1878,6 +1890,58 @@ mod tests {
     }
 
     #[test]
+    fn fetch_prunes_branches_deleted_on_the_remote() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        let g = |dir: &Path, args: &[&str]| git::run(dir, args).unwrap();
+        g(
+            &theirs,
+            &["push", "-q", "origin", "main:refs/heads/feature/gone"],
+        );
+        g(&theirs, &["tag", "v1"]);
+        g(&theirs, &["push", "-q", "origin", "v1"]);
+        // The app fetches in the common dir; packed refs must be pruned too.
+        let common = ours.join(".git");
+        fetch(&common).unwrap();
+        g(&ours, &["pack-refs", "--all"]);
+        let has = |r: &str| git::run(&ours, &["rev-parse", "--verify", "--quiet", r]).is_ok();
+        assert!(has("refs/remotes/origin/feature/gone"));
+        assert!(has("refs/tags/v1"));
+
+        g(
+            &theirs,
+            &["push", "-q", "origin", "--delete", "feature/gone", "v1"],
+        );
+        fetch(&common).unwrap();
+        assert!(!has("refs/remotes/origin/feature/gone"));
+        assert!(has("refs/remotes/origin/main"));
+        // Tags are left alone: one deleted on the remote stays here.
+        assert!(has("refs/tags/v1"));
+    }
+
+    #[test]
+    fn pull_prunes_branches_deleted_on_the_remote() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        let g = |dir: &Path, args: &[&str]| git::run(dir, args).unwrap();
+        g(
+            &theirs,
+            &["push", "-q", "origin", "main:refs/heads/feature/gone"],
+        );
+        g(&theirs, &["tag", "v1"]);
+        g(&theirs, &["push", "-q", "origin", "v1"]);
+        fetch(&ours.join(".git")).unwrap();
+        let has = |r: &str| git::run(&ours, &["rev-parse", "--verify", "--quiet", r]).is_ok();
+        assert!(has("refs/remotes/origin/feature/gone"));
+
+        g(
+            &theirs,
+            &["push", "-q", "origin", "--delete", "feature/gone", "v1"],
+        );
+        pull(&ours, PullStrategy::FastForwardOnly).unwrap();
+        assert!(!has("refs/remotes/origin/feature/gone"));
+        assert!(has("refs/tags/v1"));
+    }
+
+    #[test]
     fn push_other_failure_is_not_rejection() {
         let (_tmp, _remote, ours, _theirs) = two_clones();
         git::run(&ours, &["remote", "set-url", "origin", "/nonexistent/repo"]).unwrap();
@@ -1904,11 +1968,32 @@ mod tests {
     }
 
     #[test]
+    fn lease_names_the_commits_a_force_push_drops() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        for i in 0..7 {
+            std::fs::write(theirs.join(format!("t{i}.txt")), "x\n").unwrap();
+            git::run(&theirs, &["add", "."]).unwrap();
+            commit(&theirs, &format!("theirs {i}")).unwrap();
+        }
+        push(&theirs).unwrap();
+        fetch(&ours).unwrap();
+        write_commit(&ours, "o.txt");
+
+        let lease = lease(&ours).unwrap();
+        assert_eq!(lease.lost, 7);
+        let short = git::run(&theirs, &["rev-parse", "--short", "HEAD"]).unwrap();
+        assert_eq!(lease.lost_commits.len(), LOST_SHOWN);
+        assert_eq!(lease.lost_commits[0], format!("{} theirs 6", short.trim()));
+        assert!(lease.lost_commits[4].ends_with(" theirs 2"));
+    }
+
+    #[test]
     fn force_push_with_lease_refuses_when_remote_moved_after_fetch() {
         let (_tmp, remote, ours, theirs) = two_clones();
         write_commit(&ours, "o.txt");
         let lease = lease(&ours).unwrap();
         assert_eq!(lease.lost, 0);
+        assert!(lease.lost_commits.is_empty());
         write_commit(&theirs, "t.txt");
         push(&theirs).unwrap();
         // A fetch after the lease was taken must not let us drop their commit unseen.
