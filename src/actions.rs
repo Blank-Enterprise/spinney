@@ -93,18 +93,54 @@ pub enum MergeOutcome {
     Done,
     /// Nothing to bring in: HEAD and the index are unchanged.
     UpToDate,
-    /// Stopped on conflicts in these paths and was aborted, so nothing changed.
+    /// Stopped on conflicts in these paths, left in place to resolve and continue.
     Conflicts(Vec<String>),
+    /// A squash stopped on conflicts in these paths and was undone, so nothing changed: it
+    /// records no MERGE_HEAD, so there is no merge in progress to continue or abort.
+    SquashConflicts(Vec<String>),
+}
+
+/// A merge, rebase, cherry-pick or revert that stopped partway, waiting for the user.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Operation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl Operation {
+    /// The git command, which takes `--continue` and `--abort` (and maybe `--skip`).
+    pub fn command(self) -> &'static str {
+        match self {
+            Operation::Merge => "merge",
+            Operation::Rebase => "rebase",
+            Operation::CherryPick => "cherry-pick",
+            Operation::Revert => "revert",
+        }
+    }
+
+    /// Skip drops the commit being applied; a merge has no commit to drop. `git revert
+    /// --skip` exists too, but skipping a revert just keeps the commit, so it isn't offered.
+    pub fn can_skip(self) -> bool {
+        matches!(self, Operation::Rebase | Operation::CherryPick)
+    }
+}
+
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.command())
+    }
 }
 
 /// The merge, rebase, cherry-pick or revert already under way in `worktree`, if any.
-pub fn in_progress(worktree: &Path) -> Result<Option<&'static str>> {
+pub fn in_progress(worktree: &Path) -> Result<Option<Operation>> {
     let states = [
-        ("MERGE_HEAD", "merge"),
-        ("rebase-merge", "rebase"),
-        ("rebase-apply", "rebase"),
-        ("CHERRY_PICK_HEAD", "cherry-pick"),
-        ("REVERT_HEAD", "revert"),
+        ("MERGE_HEAD", Operation::Merge),
+        ("rebase-merge", Operation::Rebase),
+        ("rebase-apply", Operation::Rebase),
+        ("CHERRY_PICK_HEAD", Operation::CherryPick),
+        ("REVERT_HEAD", Operation::Revert),
     ];
     let mut args = vec!["rev-parse"];
     for (file, _) in &states {
@@ -153,7 +189,8 @@ fn rev_parse(worktree: &Path, rev: &str) -> Result<String> {
 }
 
 /// Merge `branch` (local or remote-tracking) into the current branch. A squash stages the
-/// result without committing. Conflicts abort the merge: see `MergeOutcome::Conflicts`.
+/// result without committing. Conflicts are left to resolve, except a squash's: see
+/// `MergeOutcome`.
 pub fn merge(worktree: &Path, branch: &str, mode: MergeMode) -> Result<MergeOutcome> {
     current_for(worktree, branch)?;
     ensure_clean(worktree)?;
@@ -165,12 +202,7 @@ pub fn merge(worktree: &Path, branch: &str, mode: MergeMode) -> Result<MergeOutc
         MergeMode::Squash => "--squash",
     };
     if let Err(e) = git::run(worktree, &["merge", flag, "--no-edit", branch]) {
-        // A squash records no MERGE_HEAD, so there is no merge for `--abort` to find.
-        let abort: &[&str] = match mode {
-            MergeMode::Squash => &["reset", "--merge"],
-            _ => &["merge", "--abort"],
-        };
-        return stopped(worktree, e, abort, &before, None);
+        return stopped(worktree, e, mode == MergeMode::Squash, &before);
     }
     let unchanged = match mode {
         MergeMode::Squash => !has_staged(worktree)?,
@@ -184,14 +216,13 @@ pub fn merge(worktree: &Path, branch: &str, mode: MergeMode) -> Result<MergeOutc
 }
 
 /// Replay the current branch's commits on top of `onto` (local or remote-tracking).
-/// Conflicts abort the rebase: see `MergeOutcome::Conflicts`.
+/// Conflicts are left to resolve: see `MergeOutcome::Conflicts`.
 pub fn rebase(worktree: &Path, onto: &str) -> Result<MergeOutcome> {
-    let current = current_for(worktree, onto)?;
+    current_for(worktree, onto)?;
     ensure_clean(worktree)?;
     let before = rev_parse(worktree, "HEAD")?;
     if let Err(e) = git::run(worktree, &["rebase", onto]) {
-        let abort = &["rebase", "--abort"];
-        return stopped(worktree, e, abort, &before, Some(&current));
+        return stopped(worktree, e, false, &before);
     }
     Ok(if rev_parse(worktree, "HEAD")? == before {
         MergeOutcome::UpToDate
@@ -210,16 +241,8 @@ fn has_staged(worktree: &Path) -> Result<bool> {
     }
 }
 
-/// After a failed merge or rebase: without conflicts, git's own error. With conflicts, run
-/// `abort` and make sure HEAD (on `branch` again, for a rebase) and the tracked files are
-/// back where they started.
-fn stopped(
-    worktree: &Path,
-    err: anyhow::Error,
-    abort: &[&str],
-    before: &str,
-    branch: Option<&str>,
-) -> Result<MergeOutcome> {
+/// Conflicted (unmerged) paths in `worktree`.
+pub fn unmerged(worktree: &Path) -> Result<Vec<String>> {
     let args = [
         "-c",
         "core.quotepath=off",
@@ -227,35 +250,83 @@ fn stopped(
         "--name-only",
         "--diff-filter=U",
     ];
-    let conflicts: Vec<String> = git::run(worktree, &args)?
+    Ok(git::run(worktree, &args)?
         .lines()
         .map(str::to_string)
-        .collect();
+        .collect())
+}
+
+/// After a failed merge or rebase: with conflicts, leave them for the in-progress banner,
+/// except a squash's, which is undone and checked to be back at `before`. Without
+/// conflicts (e.g. an untracked file in the way, which can stop a rebase partway), abort
+/// whatever was started and return git's own error.
+fn stopped(
+    worktree: &Path,
+    err: anyhow::Error,
+    squash: bool,
+    before: &str,
+) -> Result<MergeOutcome> {
+    let conflicts = unmerged(worktree)?;
     if conflicts.is_empty() {
-        // E.g. an untracked file in the way; a rebase can stop on it partway through.
-        if in_progress(worktree)?.is_some() {
-            git::run(worktree, abort)?;
+        if let Some(op) = in_progress(worktree)? {
+            git::run(worktree, &[op.command(), "--abort"])?;
         }
         return Err(err);
     }
-    // Until #53/#58: nothing can resolve conflicts and continue yet, so never leave the
-    // operation half done; abort it and report the conflicted files instead.
-    git::run(worktree, abort)?;
-    let on_branch = match branch {
-        Some(b) => refs::current_branch(worktree)?.as_deref() == Some(b),
-        None => true,
-    };
-    let restored = on_branch
-        && rev_parse(worktree, "HEAD")? == before
-        && !is_dirty(worktree)?
-        && in_progress(worktree)?.is_none();
-    if !restored {
+    if !squash {
+        return Ok(MergeOutcome::Conflicts(conflicts));
+    }
+    // A squash records no MERGE_HEAD, so there is no merge for `--abort` to find.
+    git::run(worktree, &["reset", "--merge"])?;
+    if rev_parse(worktree, "HEAD")? != before || is_dirty(worktree)? {
         bail!(
-            "conflicts in {}, and aborting did not restore {before}; check the repository",
+            "conflicts in {}, and undoing the squash did not restore {before}; check the repository",
             conflicts.join(", ")
         );
     }
-    Ok(MergeOutcome::Conflicts(conflicts))
+    Ok(MergeOutcome::SquashConflicts(conflicts))
+}
+
+/// Run `git <op> <flag>` for the operation in progress. It may stop again on the next
+/// commit's conflicts, which are left in place like the first ones.
+fn step(worktree: &Path, op: Operation, flag: &str) -> Result<MergeOutcome> {
+    if in_progress(worktree)? != Some(op) {
+        bail!("No {op} is in progress any more");
+    }
+    let Err(e) = git::run(worktree, &[op.command(), flag]) else {
+        return Ok(MergeOutcome::Done);
+    };
+    let conflicts = unmerged(worktree)?;
+    if !conflicts.is_empty() && in_progress(worktree)? == Some(op) {
+        return Ok(MergeOutcome::Conflicts(conflicts));
+    }
+    Err(e)
+}
+
+/// Finish the step that stopped (committing a merge with git's default message) and go
+/// on. Refused while any file is still conflicted.
+pub fn continue_op(worktree: &Path, op: Operation) -> Result<MergeOutcome> {
+    if !unmerged(worktree)?.is_empty() {
+        bail!("Resolve the conflicted files first");
+    }
+    step(worktree, op, "--continue")
+}
+
+/// Drop the commit a rebase or cherry-pick stopped on, and go on with the next one.
+pub fn skip_op(worktree: &Path, op: Operation) -> Result<MergeOutcome> {
+    if !op.can_skip() {
+        bail!("A {op} can't skip");
+    }
+    step(worktree, op, "--skip")
+}
+
+/// Undo the whole operation: back to the branch and commit it started from.
+pub fn abort_op(worktree: &Path, op: Operation) -> Result<()> {
+    if in_progress(worktree)? != Some(op) {
+        bail!("No {op} is in progress any more");
+    }
+    git::run(worktree, &[op.command(), "--abort"])?;
+    Ok(())
 }
 
 pub fn fetch(dir: &Path) -> Result<()> {
@@ -928,25 +999,33 @@ mod tests {
     }
 
     #[test]
-    fn merge_conflict_aborts_and_reports_files() {
-        let (_tmp, _root, main) = conflicting();
-        std::fs::write(main.join("untracked.txt"), "u\n").unwrap();
-        let before = snapshot(&main);
-        for mode in [MergeMode::FastForward, MergeMode::NoFf, MergeMode::Squash] {
+    fn merge_conflict_is_left_in_progress() {
+        for mode in [MergeMode::FastForward, MergeMode::NoFf] {
+            let (_tmp, _root, main) = conflicting();
             let out = merge(&main, "other", mode).unwrap();
             assert_eq!(
                 out,
                 MergeOutcome::Conflicts(vec!["a.txt".into()]),
                 "{mode:?}"
             );
-            assert_eq!(snapshot(&main), before, "{mode:?}");
-            assert_eq!(in_progress(&main).unwrap(), None, "{mode:?}");
-            assert_eq!(
-                std::fs::read_to_string(main.join("a.txt")).unwrap(),
-                "main\n"
-            );
-            assert!(g(&main, &["diff", "--cached", "--name-only"]).is_empty());
+            assert_eq!(in_progress(&main).unwrap(), Some(Operation::Merge));
+            assert_eq!(unmerged(&main).unwrap(), ["a.txt"]);
         }
+    }
+
+    #[test]
+    fn squash_conflict_is_undone() {
+        let (_tmp, _root, main) = conflicting();
+        std::fs::write(main.join("untracked.txt"), "u\n").unwrap();
+        let before = snapshot(&main);
+        let out = merge(&main, "other", MergeMode::Squash).unwrap();
+        assert_eq!(out, MergeOutcome::SquashConflicts(vec!["a.txt".into()]));
+        assert_eq!(snapshot(&main), before);
+        assert_eq!(in_progress(&main).unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(main.join("a.txt")).unwrap(),
+            "main\n"
+        );
     }
 
     #[test]
@@ -967,18 +1046,129 @@ mod tests {
     }
 
     #[test]
-    fn rebase_conflict_aborts_and_restores_head() {
+    fn abort_after_conflicting_rebase_restores_head_exactly() {
         let (_tmp, _root, main) = conflicting();
         std::fs::write(main.join("untracked.txt"), "u\n").unwrap();
         let before = snapshot(&main);
         let out = rebase(&main, "other").unwrap();
         assert_eq!(out, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(in_progress(&main).unwrap(), Some(Operation::Rebase));
+        assert_eq!(refs::current_branch(&main).unwrap(), None, "detached");
+        abort_op(&main, Operation::Rebase).unwrap();
         assert_eq!(snapshot(&main), before);
         assert_eq!(in_progress(&main).unwrap(), None);
         assert_eq!(
             std::fs::read_to_string(main.join("a.txt")).unwrap(),
             "main\n"
         );
+        let err = abort_op(&main, Operation::Rebase).unwrap_err();
+        assert!(err.to_string().contains("No rebase"), "{err}");
+    }
+
+    /// Start each kind of operation so it stops on a conflict in `a.txt` of `dir`, where
+    /// HEAD changed `a.txt` and `other` changed it differently.
+    fn stop_on_conflict(dir: &Path, op: Operation) {
+        let args: &[&str] = match op {
+            Operation::Merge => &["merge", "--no-edit", "other"],
+            Operation::Rebase => &["rebase", "other"],
+            Operation::CherryPick => &["cherry-pick", "other"],
+            Operation::Revert => {
+                // Reverting HEAD~1 conflicts with HEAD's later edit of the same line.
+                std::fs::write(dir.join("a.txt"), "later\n").unwrap();
+                g(dir, &["commit", "-qam", "later"]);
+                &["revert", "--no-edit", "HEAD~1"]
+            }
+        };
+        assert!(git::run(dir, args).is_err(), "{op} should stop");
+        assert_eq!(unmerged(dir).unwrap(), ["a.txt"], "{op}");
+    }
+
+    const OPERATIONS: [Operation; 4] = [
+        Operation::Merge,
+        Operation::Rebase,
+        Operation::CherryPick,
+        Operation::Revert,
+    ];
+
+    #[test]
+    fn detects_each_operation_in_a_linked_worktree() {
+        for op in OPERATIONS {
+            let (_tmp, root, main) = conflicting();
+            // `main` is a linked worktree: its state files live under `.bare/worktrees/`.
+            assert!(main.join(".git").is_file() && root.join(".bare").is_dir());
+            assert_eq!(in_progress(&main).unwrap(), None);
+            stop_on_conflict(&main, op);
+            assert_eq!(in_progress(&main).unwrap(), Some(op));
+            // Another worktree of the same repo has nothing in progress.
+            let x = add_worktree_existing(&root, "feature/x").unwrap();
+            assert_eq!(in_progress(&x).unwrap(), None, "{op}");
+            abort_op(&main, op).unwrap();
+            assert_eq!(in_progress(&main).unwrap(), None, "{op}");
+        }
+    }
+
+    #[test]
+    fn detects_each_operation_in_a_normal_clone() {
+        for op in OPERATIONS {
+            let (_tmp, _remote, ours, _theirs) = two_clones();
+            std::fs::write(ours.join("a.txt"), "main\n").unwrap();
+            g(&ours, &["commit", "-qam", "main edit"]);
+            g(&ours, &["switch", "-q", "-c", "other", "HEAD~1"]);
+            std::fs::write(ours.join("a.txt"), "other\n").unwrap();
+            g(&ours, &["commit", "-qam", "other edit"]);
+            g(&ours, &["switch", "-q", "main"]);
+            assert!(ours.join(".git").is_dir());
+            stop_on_conflict(&ours, op);
+            assert_eq!(in_progress(&ours).unwrap(), Some(op));
+        }
+    }
+
+    #[test]
+    fn continue_refuses_while_conflicted_then_finishes_a_merge() {
+        let (_tmp, _root, main) = conflicting();
+        let before = head(&main, "HEAD");
+        merge(&main, "other", MergeMode::NoFf).unwrap();
+        let err = continue_op(&main, Operation::Merge).unwrap_err();
+        assert!(err.to_string().contains("Resolve"), "{err}");
+        std::fs::write(main.join("a.txt"), "both\n").unwrap();
+        g(&main, &["add", "a.txt"]);
+        let out = continue_op(&main, Operation::Merge).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        assert_eq!(in_progress(&main).unwrap(), None);
+        let parents = g(&main, &["log", "-1", "--format=%P"]);
+        assert_eq!(parents, format!("{before} {}", head(&main, "other")));
+        assert!(g(&main, &["status", "--porcelain"]).is_empty());
+    }
+
+    #[test]
+    fn continue_and_skip_go_on_through_a_rebase() {
+        let (_tmp, _root, main) = conflicting();
+        // Two commits to replay, each conflicting with `other`.
+        std::fs::write(main.join("a.txt"), "main 2\n").unwrap();
+        g(&main, &["commit", "-qam", "main edit 2"]);
+        assert_eq!(
+            rebase(&main, "other").unwrap(),
+            MergeOutcome::Conflicts(vec!["a.txt".into()])
+        );
+        std::fs::write(main.join("a.txt"), "resolved\n").unwrap();
+        g(&main, &["add", "a.txt"]);
+        let out = continue_op(&main, Operation::Rebase).unwrap();
+        assert_eq!(
+            out,
+            MergeOutcome::Conflicts(vec!["a.txt".into()]),
+            "next one"
+        );
+        let out = skip_op(&main, Operation::Rebase).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        assert_eq!(in_progress(&main).unwrap(), None);
+        assert_eq!(
+            refs::current_branch(&main).unwrap().as_deref(),
+            Some("main")
+        );
+        assert_eq!(head(&main, "HEAD~1"), head(&main, "other"));
+        assert_eq!(head_message(&main).unwrap(), "main edit");
+        let err = skip_op(&main, Operation::Merge).unwrap_err();
+        assert!(err.to_string().contains("can't skip"), "{err}");
     }
 
     #[test]
@@ -1012,7 +1202,7 @@ mod tests {
     fn operation_in_progress_refuses() {
         let (_tmp, _root, main) = conflicting();
         assert!(git::run(&main, &["merge", "--no-edit", "other"]).is_err());
-        assert_eq!(in_progress(&main).unwrap(), Some("merge"));
+        assert_eq!(in_progress(&main).unwrap(), Some(Operation::Merge));
         let err = merge(&main, "origin/feature/x", MergeMode::NoFf).unwrap_err();
         assert!(
             err.to_string().contains("merge is already in progress"),

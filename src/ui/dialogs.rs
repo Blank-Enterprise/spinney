@@ -318,13 +318,25 @@ fn danger(label: &str) -> egui::Button<'_> {
 /// Conflicted files named in a stopped merge or rebase's message; the rest are counted.
 const CONFLICTS_SHOWN: usize = 5;
 
-/// "Merge stopped: conflicts in a.txt, b.txt. Nothing was changed."
-fn conflict_message(op: &str, files: &[String]) -> String {
+/// "a.txt, b.txt", or the first few "and 2 more".
+fn conflict_list(files: &[String]) -> String {
     let mut list = files[..files.len().min(CONFLICTS_SHOWN)].join(", ");
     if files.len() > CONFLICTS_SHOWN {
         list += &format!(" and {} more", files.len() - CONFLICTS_SHOWN);
     }
-    format!("{op} stopped: conflicts in {list}. Nothing was changed.")
+    list
+}
+
+/// "Merge stopped on conflicts in a.txt, b.txt. Resolve them, then Continue."
+pub(super) fn conflict_message(op: &str, files: &[String]) -> String {
+    let list = conflict_list(files);
+    format!("{op} stopped on conflicts in {list}. Resolve them, then Continue.")
+}
+
+/// "Squash stopped: conflicts in a.txt. Nothing was changed."
+fn squash_conflict_message(files: &[String]) -> String {
+    let list = conflict_list(files);
+    format!("Squash stopped: conflicts in {list}. Nothing was changed.")
 }
 
 /// The rebase confirmation's warning when it rewrites `pushed` commits of `current`.
@@ -668,7 +680,10 @@ impl SpinneyApp {
                     d.into, d.branch
                 ))
             }
-            Ok(MergeOutcome::Conflicts(files)) => errors.push(conflict_message("Merge", &files)),
+            Ok(MergeOutcome::Conflicts(files)) => notice = Some(conflict_message("Merge", &files)),
+            Ok(MergeOutcome::SquashConflicts(files)) => {
+                errors.push(squash_conflict_message(&files))
+            }
             Err(e) => errors.push(format!("{e:#}")),
         }
         self.notices.extend(notice);
@@ -691,7 +706,11 @@ impl SpinneyApp {
                 "{} is already up to date with {}",
                 d.current, d.onto
             )),
-            Ok(MergeOutcome::Conflicts(files)) => errors.push(conflict_message("Rebase", &files)),
+            Ok(MergeOutcome::Conflicts(files)) => {
+                self.notices.push(conflict_message("Rebase", &files))
+            }
+            // Only a squash merge undoes itself.
+            Ok(MergeOutcome::SquashConflicts(_)) => {}
             Err(e) => errors.push(format!("{e:#}")),
         }
         self.errors.extend(errors);
@@ -1439,11 +1458,15 @@ mod tests {
         let files = |n: usize| (0..n).map(|i| format!("f{i}")).collect::<Vec<_>>();
         assert_eq!(
             conflict_message("Merge", &files(2)),
-            "Merge stopped: conflicts in f0, f1. Nothing was changed."
+            "Merge stopped on conflicts in f0, f1. Resolve them, then Continue."
         );
         assert_eq!(
             conflict_message("Rebase", &files(7)),
-            "Rebase stopped: conflicts in f0, f1, f2, f3, f4 and 2 more. Nothing was changed."
+            "Rebase stopped on conflicts in f0, f1, f2, f3, f4 and 2 more. Resolve them, then Continue."
+        );
+        assert_eq!(
+            squash_conflict_message(&files(1)),
+            "Squash stopped: conflicts in f0. Nothing was changed."
         );
     }
 
@@ -1507,6 +1530,76 @@ mod tests {
         app.apply(Action::AskRebase("topic".into()));
         assert!(app.errors.iter().any(|e| e == "Check out a branch first"));
         assert!(app.dialogs.rebase.is_none());
+    }
+
+    #[test]
+    fn conflicted_merge_shows_the_banner_until_continued_or_aborted() {
+        use super::super::in_progress::Step;
+        use super::super::Action;
+        use crate::actions::Operation;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        g(&["switch", "-q", "-c", "topic"]);
+        std::fs::write(d.join("a.txt"), "topic\n").unwrap();
+        g(&["commit", "-qam", "topic"]);
+        g(&["switch", "-q", "main"]);
+        std::fs::write(d.join("a.txt"), "main\n").unwrap();
+        g(&["commit", "-qam", "main"]);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+        let merge = |app: &mut SpinneyApp| {
+            app.apply(Action::AskMerge("topic".into()));
+            let m = app.dialogs.merge.take().expect("dialog open");
+            app.merge(m);
+        };
+
+        merge(&mut app);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert!(app.notices.iter().any(|n| n.contains("Resolve them")));
+        assert_eq!(app.tabs[0].operation, Some(Operation::Merge));
+        assert_eq!(app.tabs[0].status.conflicted.len(), 1);
+
+        // Abort asks first, and the question goes when the tab is left.
+        app.apply(Action::AskOpStep(Step::Abort));
+        assert_eq!(app.confirm_op.as_ref().map(|p| p.step), Some(Step::Abort));
+        app.apply(Action::SelectTab(0));
+        assert!(app.confirm_op.is_none());
+        app.apply(Action::AskOpStep(Step::Abort));
+        app.apply(Action::ConfirmOpStep);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].operation, None);
+        assert!(app.tabs[0].status.conflicted.is_empty());
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "main\n");
+
+        // Continue is refused while conflicted, then finishes the merge.
+        merge(&mut app);
+        app.apply(Action::ContinueOp);
+        assert!(
+            app.errors.iter().any(|e| e.contains("Resolve")),
+            "{:?}",
+            app.errors
+        );
+        app.errors.clear();
+        std::fs::write(d.join("a.txt"), "both\n").unwrap();
+        let f = app.tabs[0].status.conflicted[0].clone();
+        app.apply(Action::StageFile(f, false));
+        assert_eq!(app.tabs[0].operation, Some(Operation::Merge));
+        app.apply(Action::ContinueOp);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].operation, None);
+        assert_eq!(g(&["log", "-1", "--format=%P"]).split(' ').count(), 2);
     }
 
     #[test]
