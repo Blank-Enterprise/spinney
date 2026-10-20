@@ -22,3 +22,16 @@ While the repo is private, the curl command can't reach it. Use the GitHub CLI
 (`gh auth login`) instead:
 
     gh api repos/SameetKeshav/spinney/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for
+inclusion in Spinney, as defined in the Apache-2.0 license, is dual licensed as above,
+without any additional terms or conditions.
