@@ -170,6 +170,14 @@ fn common_dir(root: &Path) -> anyhow::Result<PathBuf> {
     Ok(root.join(out.trim()))
 }
 
+/// An error's first line for the bar, and the rest (git's own text) for Details.
+fn error_lines(e: &str) -> (&str, Option<&str>) {
+    match e.split_once('\n') {
+        Some((line, rest)) if !rest.trim().is_empty() => (line, Some(rest.trim())),
+        _ => (e.trim_end(), None),
+    }
+}
+
 fn needs_commit_graph(common: &Path) -> bool {
     !common.join("objects/info/commit-graph").exists()
 }
@@ -876,7 +884,11 @@ impl SpinneyApp {
                         lease: None,
                     })
                 }
-                Err(e) => self.errors.push(format!("{kind:?} failed: {e:#}")),
+                // One line, with git's own text behind it for Details.
+                Err(e) => match e.downcast_ref::<actions::SyncError>() {
+                    Some(s) => self.errors.push(format!("{}\n{}", s.message, s.raw)),
+                    None => self.errors.push(format!("{kind:?} failed: {e:#}")),
+                },
             }
             return;
         }
@@ -948,10 +960,12 @@ impl SpinneyApp {
         let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
         let work: Box<dyn FnOnce() -> anyhow::Result<()> + Send> = match kind {
             JobKind::Fetch => match common_dir(&root) {
-                Ok(common) => Box::new(move || actions::fetch(&common)),
+                Ok(common) => Box::new(move || {
+                    actions::fetch(&common).map_err(|e| actions::explain_sync(&common, e))
+                }),
                 Err(e) => return self.errors.push(format!("{e:#}")),
             },
-            _ => Box::new(move || actions::push(&wt)),
+            _ => Box::new(move || actions::push(&wt).map_err(|e| actions::explain_sync(&wt, e))),
         };
         self.jobs.spawn(kind, root, String::new(), work);
     }
@@ -966,11 +980,12 @@ impl SpinneyApp {
             JobKind::Pull,
             root,
             String::new(),
-            move || match actions::pull(&wt, strategy)? {
-                MergeOutcome::Conflicts(files) => {
+            move || match actions::pull(&wt, strategy) {
+                Ok(MergeOutcome::Conflicts(files)) => {
                     Err(actions::PullConflicts { strategy, files }.into())
                 }
-                _ => Ok(()),
+                Ok(_) => Ok(()),
+                Err(e) => Err(actions::explain_sync(&wt, e)),
             },
         );
     }
@@ -1057,7 +1072,10 @@ impl SpinneyApp {
                     ..
                 }) = self.rejected_push.take()
                 {
-                    let work = move || actions::force_push(&lease);
+                    let work = move || {
+                        actions::force_push(&lease)
+                            .map_err(|e| actions::explain_sync(&lease.worktree, e))
+                    };
                     self.jobs.spawn(JobKind::Push, root, String::new(), work);
                 }
             }
@@ -1751,8 +1769,12 @@ impl SpinneyApp {
     fn error_banner(&mut self, ui: &mut egui::Ui) {
         let mut dismiss = None;
         for (i, e) in self.errors.iter().enumerate() {
+            let (line, details) = error_lines(e);
             ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().error_fg_color, e);
+                ui.colored_label(ui.visuals().error_fg_color, line);
+                if let Some(details) = details {
+                    ui.weak("Details").on_hover_text(details);
+                }
                 if ui.small_button("Dismiss").clicked() {
                     dismiss = Some(i);
                 }
@@ -2738,6 +2760,37 @@ mod tests {
             .iter()
             .any(|e| e.starts_with("CommitGraph failed")));
         assert!(app.config.spaces[1].projects.contains(&root), "still added");
+    }
+
+    #[test]
+    fn sync_error_is_one_line_with_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let raw = "git pull failed: There is no tracking information for the current branch.\n\
+                   Please specify which branch you want to merge with.";
+        let e = actions::SyncError {
+            message: "x has no upstream yet: Push it first, or pull from a branch".into(),
+            raw: raw.into(),
+        };
+        app.job_done(JobDone {
+            kind: JobKind::Pull,
+            root: tmp.path().to_path_buf(),
+            space_id: String::new(),
+            result: Err(e.clone().into()),
+        });
+        let (line, details) = error_lines(&app.errors[0]);
+        assert_eq!(line, e.message, "no \"Pull failed:\" in front");
+        assert_eq!(details, Some(raw));
+    }
+
+    #[test]
+    fn error_lines_split_off_details() {
+        assert_eq!(error_lines("one line"), ("one line", None));
+        assert_eq!(error_lines("one line\n"), ("one line", None));
+        assert_eq!(
+            error_lines("short\nraw\ntext\n"),
+            ("short", Some("raw\ntext"))
+        );
     }
 
     #[test]
