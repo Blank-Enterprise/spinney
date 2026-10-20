@@ -1,6 +1,7 @@
-//! The Worktrees view: every worktree of the project (Spinney's, agents', any tool's), the
-//! agents running in each, and how far each is from the default branch. The selected one's
-//! changes since it branched fill the right-hand panel, as the working copy's do in Git view.
+//! The Worktrees view, toggled at the top of the sidebar: the sidebar lists every worktree of
+//! the project (Spinney's, agents', any tool's) with the agents running in each and how far it
+//! is from the default branch. The selected one's changes since it branched fill the right
+//! panel, and its first file opens in the centre, as the working copy's do in Git view.
 
 use super::sidebar::{remove_blocked, worktree_hover, worktree_label};
 use super::toolbar::folder_name;
@@ -227,13 +228,48 @@ fn worktree_row(
     r
 }
 
-/// The centre: every worktree, selectable.
-pub fn show(ui: &mut egui::Ui, worktrees: &[Worktree], review: &Review, actions: &mut Vec<Action>) {
+/// Git | Worktrees, across the top of the sidebar. Returns the view clicked, when it isn't
+/// the current one.
+pub fn toggle(ui: &mut egui::Ui, current: View) -> Option<View> {
+    let mut picked = None;
+    egui::Frame::new()
+        .fill(theme::FIELD)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(theme::WIDGET_R)
+        .inner_margin(2)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let w = (ui.available_width() - 2.0) / 2.0;
+            ui.horizontal(|ui| {
+                for (label, view) in [("Git", View::Git), ("Worktrees", View::Worktrees)] {
+                    let b =
+                        egui::Button::selectable(current == view, RichText::new(label).size(12.5))
+                            .min_size(egui::vec2(w, 24.0));
+                    if ui.add(b).clicked() && current != view {
+                        picked = Some(view);
+                    }
+                }
+            });
+        });
+    picked
+}
+
+/// The sidebar in Worktrees view: every worktree (that the filter lets through), selectable.
+pub fn list(
+    ui: &mut egui::Ui,
+    worktrees: &[&Worktree],
+    review: &Review,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal(|ui| {
-        ui.label(theme::section(&format!("Worktrees · {}", worktrees.len())));
+        ui.label(theme::section(&format!("Worktrees · {}", worktrees.len())))
+            .on_hover_text(
+                "Agents are found by the folder their process runs in. One working here from a \
+                 session started elsewhere isn't shown.",
+            );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             let b = ui
-                .small_button("Refresh")
+                .small_button("↻")
                 .on_hover_text("Reload worktrees, their standing and the agents running in them");
             if b.clicked() {
                 actions.push(Action::RefreshWorktrees);
@@ -244,57 +280,72 @@ pub fn show(ui: &mut egui::Ui, worktrees: &[Worktree], review: &Review, actions:
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            theme::card().show(ui, |ui| {
-                for wt in worktrees {
-                    let (name, _) = worktree_label(wt);
-                    let detail = row_detail(wt, review.standing(&wt.path));
-                    let running = review
-                        .agents
-                        .get(&wt.path)
-                        .map(|a| agents::agents_text(a))
-                        .unwrap_or_default();
-                    let on = review.selected.as_deref() == Some(&wt.path);
-                    let r = worktree_row(ui, on, &name, &detail, &running).on_hover_ui(|ui| {
-                        if !running.is_empty() {
-                            ui.label(
-                                RichText::new(format!("Running here: {running}"))
-                                    .color(theme::ACCENT_TEXT),
-                            );
-                        }
-                        for line in worktree_hover(wt) {
-                            ui.label(line);
-                        }
-                    });
-                    if r.clicked() {
-                        actions.push(Action::ReviewWorktree(wt.path.clone()));
+            for wt in worktrees {
+                let (name, _) = worktree_label(wt);
+                let detail = row_detail(wt, review.standing(&wt.path));
+                let running = review
+                    .agents
+                    .get(&wt.path)
+                    .map(|a| agents::agents_text(a))
+                    .unwrap_or_default();
+                let on = review.selected.as_deref() == Some(&wt.path);
+                let r = worktree_row(ui, on, &name, &detail, &running).on_hover_ui(|ui| {
+                    if !running.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Running here: {running}"))
+                                .color(theme::ACCENT_TEXT),
+                        );
                     }
-                    r.context_menu(|ui| {
-                        if !wt.prunable && ui.button("Open in Git view").clicked() {
-                            actions.push(Action::OpenInGit(wt.path.clone()));
-                            ui.close();
-                        }
-                        if wt.prunable && ui.button("Locate…").clicked() {
-                            actions.push(Action::LocateWorktree(wt.path.clone()));
-                            ui.close();
-                        }
-                        let blocked = remove_blocked(wt);
-                        let remove = ui.add_enabled(blocked.is_none(), egui::Button::new("Remove"));
-                        if remove
-                            .on_disabled_hover_text(blocked.unwrap_or_default())
-                            .clicked()
-                        {
-                            actions.push(Action::RemoveWorktree(wt.path.clone()));
-                            ui.close();
-                        }
-                    });
+                    ui.label(&detail);
+                    for line in worktree_hover(wt) {
+                        ui.label(line);
+                    }
+                });
+                if r.clicked() {
+                    actions.push(Action::ReviewWorktree(wt.path.clone()));
                 }
-            });
-            ui.add_space(6.0);
-            ui.weak(
-                "Agents are found by the folder their process runs in. One working here from a \
-                 session started elsewhere isn't shown.",
-            );
+                r.context_menu(|ui| {
+                    if !wt.prunable && ui.button("Open in Git view").clicked() {
+                        actions.push(Action::OpenInGit(wt.path.clone()));
+                        ui.close();
+                    }
+                    if wt.prunable && ui.button("Locate…").clicked() {
+                        actions.push(Action::LocateWorktree(wt.path.clone()));
+                        ui.close();
+                    }
+                    let blocked = remove_blocked(wt);
+                    let remove = ui.add_enabled(blocked.is_none(), egui::Button::new("Remove"));
+                    if remove
+                        .on_disabled_hover_text(blocked.unwrap_or_default())
+                        .clicked()
+                    {
+                        actions.push(Action::RemoveWorktree(wt.path.clone()));
+                        ui.close();
+                    }
+                });
+            }
         });
+}
+
+/// The centre in Worktrees view when no file is open.
+pub fn center_hint(ui: &mut egui::Ui, worktrees: &[Worktree], review: &Review) {
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        let Some(selected) = &review.selected else {
+            ui.weak("Select a worktree on the left to see what it changed.");
+            return;
+        };
+        let name = worktrees
+            .iter()
+            .find(|w| &w.path == selected)
+            .map(|w| worktree_label(w).0)
+            .unwrap_or_default();
+        match (&review.error, review.changes.is_empty()) {
+            (Some(_), _) => ui.weak(format!("{name} can't be shown.")),
+            (None, true) => ui.weak(format!("{name} has no changes since it branched.")),
+            (None, false) => ui.weak("Pick a file on the right to see its diff."),
+        };
+    });
 }
 
 /// The right-hand panel: what the selected worktree changed since it branched.

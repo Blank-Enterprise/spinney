@@ -37,7 +37,7 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 | `src/creds.rs`, `src/ssh.rs`, `src/github.rs` | Keychain tokens and the credential helper; per-space SSH keys; the GitHub API and device-flow sign-in. |
 | `src/config.rs` | `config.toml`: spaces and settings. New fields need `#[serde(default)]`, so older configs still load. |
 | `src/ui/mod.rs` | `SpinneyApp`, the `Action` enum and `apply()`, background `Jobs`, and the top confirmation bars. |
-| `src/ui/*.rs` | Panels: `toolbar`, `sidebar`, `graph_view`, `changes`, `diff_view`, `conflict_view`, `merge_view` (built-in merge tool), `worktrees_view` (Git | Worktrees toggle: every worktree and its agents; the selected one's changes go in the right panel), `dialogs` (modals), `in_progress` (merge/rebase banner), `branch_drop` (drag a branch onto another), `spaces` (account editor), `new_tab`, `theme`. |
+| `src/ui/*.rs` | Panels: `toolbar`, `sidebar`, `graph_view`, `changes`, `diff_view`, `conflict_view`, `merge_view` (built-in merge tool), `worktrees_view` (the sidebar's Git | Worktrees toggle: every worktree and its agents in the sidebar, the selected one's changes in the right panel), `dialogs` (modals), `in_progress` (merge/rebase banner), `branch_drop` (drag a branch onto another), `spaces` (account editor), `new_tab`, `theme`. |
 
 ## Patterns to follow
 

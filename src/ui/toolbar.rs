@@ -1,6 +1,5 @@
 //! Top of the window: the project tab strip and the repository toolbar.
 
-use super::worktrees_view::View;
 use super::{active_space, spaces, theme, Action, JobKind, ProjectTab, SpinneyApp};
 use crate::config::PullStrategy;
 use eframe::egui::{
@@ -121,27 +120,6 @@ pub(super) fn folder_name(p: &Path) -> String {
     )
 }
 
-/// Git | Worktrees: the commit graph, or every worktree and what each changed. Returns the
-/// view clicked, when it isn't the current one.
-fn view_toggle(ui: &mut egui::Ui, current: View) -> Option<View> {
-    let mut picked = None;
-    egui::Frame::new()
-        .fill(theme::FIELD)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER))
-        .corner_radius(theme::WIDGET_R)
-        .inner_margin(2)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (label, view) in [("Git", View::Git), ("Worktrees", View::Worktrees)] {
-                let b = egui::Button::selectable(current == view, RichText::new(label).size(12.0));
-                if ui.add(b).clicked() && current != view {
-                    picked = Some(view);
-                }
-            }
-        });
-    picked
-}
-
 pub(super) fn toolbar(
     ui: &mut egui::Ui,
     tab: &ProjectTab,
@@ -177,9 +155,6 @@ pub(super) fn toolbar(
                 }
             }
         });
-        if let Some(view) = view_toggle(ui, tab.view) {
-            actions.push(Action::SetView(view));
-        }
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             // Right to left: the last button comes first.

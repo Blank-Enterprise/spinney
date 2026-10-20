@@ -295,6 +295,14 @@ impl ProjectTab {
         self.reload_changes(errors);
         if self.view == worktrees_view::View::Worktrees {
             self.review.load(&self.root, &self.worktrees);
+            // Re-read the open file, or close it if the worktree no longer changes it.
+            if let Center::Review(fd, _) = &self.center {
+                let path = fd.path.clone();
+                self.center = Center::Graph;
+                if let Some(i) = self.review.changes.iter().position(|c| c.path == path) {
+                    open_review_file(self, i, errors);
+                }
+            }
         }
     }
 
@@ -1763,6 +1771,29 @@ impl SpinneyApp {
 }
 
 /// Changes-panel and diff-view actions on the active tab.
+/// Show the selected worktree's `i`th change in the diff view.
+fn open_review_file(tab: &mut ProjectTab, i: usize, errors: &mut Vec<String>) {
+    let Some(change) = tab.review.changes.get(i).cloned() else {
+        return;
+    };
+    let Some((wt, base)) = tab.review.base() else {
+        return;
+    };
+    let name = tab
+        .worktrees
+        .iter()
+        .find(|w| w.path == wt)
+        .map(|w| sidebar::worktree_label(w).0)
+        .unwrap_or_default();
+    match crate::review::file_since(wt, base, &change) {
+        Ok(fd) => {
+            let label = worktrees_view::review_label(change.origin.label(), &name);
+            tab.center = Center::Review(Box::new(fd), label);
+        }
+        Err(e) => errors.push(format!("{e:#}")),
+    }
+}
+
 fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
     // Anything that would replace the merge editor asks first when it holds work.
     let replaces = matches!(
@@ -1847,28 +1878,12 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
         Action::ReviewWorktree(path) => {
             tab.center = Center::Graph;
             tab.review.select(path);
-        }
-        Action::ReviewFile(i) => {
-            let Some(change) = tab.review.changes.get(i).cloned() else {
-                return;
-            };
-            let Some((wt, base)) = tab.review.base() else {
-                return;
-            };
-            let name = tab
-                .worktrees
-                .iter()
-                .find(|w| w.path == wt)
-                .map(|w| sidebar::worktree_label(w).0)
-                .unwrap_or_default();
-            match crate::review::file_since(wt, base, &change) {
-                Ok(fd) => {
-                    let label = worktrees_view::review_label(change.origin.label(), &name);
-                    tab.center = Center::Review(Box::new(fd), label);
-                }
-                Err(e) => errors.push(format!("{e:#}")),
+            // Straight to the first file, as a commit's files would be read.
+            if !tab.review.changes.is_empty() {
+                open_review_file(tab, 0, errors);
             }
         }
+        Action::ReviewFile(i) => open_review_file(tab, i, errors),
         _ => {}
     }
 }
@@ -2157,7 +2172,7 @@ impl eframe::App for SpinneyApp {
                     return diff_view::show(ui, &mut tab.center, inline, &mut actions);
                 }
                 if tab.view == worktrees_view::View::Worktrees {
-                    return worktrees_view::show(ui, &tab.worktrees, &tab.review, &mut actions);
+                    return worktrees_view::center_hint(ui, &tab.worktrees, &tab.review);
                 }
                 let wip = Some(tab.status.changed_files()).filter(|&n| n > 0);
                 let remotes = tab
@@ -2558,6 +2573,17 @@ mod tests {
             .collect();
         assert_eq!(paths, [("done.txt", "committed"), ("wip.txt", "untracked")]);
 
+        let Center::Review(fd, _) = &app.tabs[0].center else {
+            panic!("selecting a worktree opens its first file")
+        };
+        assert_eq!(fd.path, "done.txt");
+        app.apply(Action::ReviewFile(1));
+        std::fs::write(agent.join("wip.txt"), "w\nmore\n").unwrap();
+        app.apply(Action::RefreshWorktrees);
+        let Center::Review(fd, _) = &app.tabs[0].center else {
+            panic!("the open file survives a refresh")
+        };
+        assert_eq!((fd.path.as_str(), fd.hunks[0].lines.len()), ("wip.txt", 2));
         app.apply(Action::ReviewFile(0));
         let Center::Review(fd, origin) = &app.tabs[0].center else {
             panic!("no review diff")
