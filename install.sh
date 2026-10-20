@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the latest Spinney release (or SPINNEY_VERSION, e.g. v1.1.0) into /Applications.
+# Install the latest Spinney release (or SPINNEY_VERSION, e.g. v1.0.0) into /Applications.
 #   curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | bash
 set -euo pipefail
 
@@ -15,7 +15,7 @@ main() {
     return 1
   fi
   if [ -n "$VERSION" ] && [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
-    echo "SPINNEY_VERSION must be a release tag like v1.1.0." >&2
+    echo "SPINNEY_VERSION must be a release tag like v1.0.0." >&2
     return 1
   fi
   if [ -n "$VERSION" ]; then
