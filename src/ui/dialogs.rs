@@ -7,6 +7,7 @@ use super::{
 };
 use crate::actions::{MergeMode, MergeOutcome, ResetMode, ResetPlan};
 use crate::convert::{self, Plan};
+use crate::todo::{self, TodoAction, TodoItem, TodoPlan};
 use crate::{creds, github, refs};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use std::path::{Path, PathBuf};
@@ -395,6 +396,47 @@ pub(super) struct Dialogs {
     pub(super) leave_detached: Option<LeaveDetached>,
     pub(super) reset: Option<ResetDialog>,
     pub(super) revert: Option<RevertDialog>,
+    pub(super) interactive: Option<InteractiveDialog>,
+}
+
+/// The interactive rebase editor: `plan` as listed, `items` as the user is editing them.
+pub(super) struct InteractiveDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) plan: TodoPlan,
+    pub(super) items: Vec<TodoItem>,
+    /// Commits it rewrites that are already on the upstream.
+    pub(super) pushed: usize,
+}
+
+/// What the editor changes, e.g. "3 commits: 1 reworded, 1 squashed, 1 dropped".
+pub(super) fn interactive_summary(plan: &TodoPlan, items: &[TodoItem]) -> String {
+    let count = |a: TodoAction| items.iter().filter(|i| i.action == a).count();
+    let moved = plan.items.iter().zip(items).any(|(p, i)| p.sha != i.sha);
+    let mut parts = vec![];
+    for (a, what) in [
+        (TodoAction::Reword, "reworded"),
+        (TodoAction::Squash, "squashed"),
+        (TodoAction::Fixup, "fixed up"),
+        (TodoAction::Drop, "dropped"),
+    ] {
+        let n = count(a);
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    }
+    if moved {
+        parts.push("reordered".into());
+    }
+    let commits = match items.len() {
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
+    };
+    if parts.is_empty() {
+        format!("{commits}, unchanged")
+    } else {
+        format!("{commits}: {}", parts.join(", "))
+    }
 }
 
 /// Revert merge commit `sha` in `worktree`, keeping the side of parent `mainline`.
@@ -524,6 +566,7 @@ impl Dialogs {
             || self.leave_detached.is_some()
             || self.reset.is_some()
             || self.revert.is_some()
+            || self.interactive.is_some()
     }
 }
 
@@ -532,6 +575,98 @@ enum LeaveChoice {
     Branch,
     Leave,
     Cancel,
+}
+
+/// The interactive rebase editor's body: one row per commit, oldest first, with its
+/// action, ↑/↓ to reorder, and a message box where one is needed.
+fn interactive_editor(ui: &mut egui::Ui, d: &mut InteractiveDialog, result: &mut Option<bool>) {
+    ui.label(format!(
+        "Interactive rebase of {} onto {}",
+        d.plan.branch,
+        &d.plan.base[..8]
+    ));
+    ui.label(theme::caption(
+        "Oldest first. Squash and fixup fold into the commit above.",
+    ));
+    ui.add_space(4.0);
+    let mut swap = None;
+    let mut set = None;
+    let n = d.items.len();
+    egui::ScrollArea::vertical()
+        .max_height(420.0)
+        .show(ui, |ui| {
+            for k in 0..n {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(k > 0, egui::Button::new("↑").small())
+                        .clicked()
+                    {
+                        swap = Some((k - 1, k));
+                    }
+                    if ui
+                        .add_enabled(k + 1 < n, egui::Button::new("↓").small())
+                        .clicked()
+                    {
+                        swap = Some((k, k + 1));
+                    }
+                    let current = d.items[k].action;
+                    egui::ComboBox::from_id_salt(("todo_action", k))
+                        .width(80.0)
+                        .selected_text(current.label())
+                        .show_ui(ui, |ui| {
+                            for a in TodoAction::ALL {
+                                if ui.selectable_label(a == current, a.label()).clicked() {
+                                    set = Some((k, a));
+                                }
+                            }
+                        });
+                    let item = &d.items[k];
+                    ui.label(theme::caption(&item.sha[..8]));
+                    let subject = egui::RichText::new(&item.subject);
+                    ui.label(if item.action == TodoAction::Drop {
+                        subject.strikethrough().color(theme::MUTED)
+                    } else {
+                        subject
+                    });
+                });
+                if todo::edits_message(&d.items, k) {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.items[k].message)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                }
+            }
+        });
+    if let Some((a, b)) = swap {
+        d.items.swap(a, b);
+    }
+    if let Some((k, a)) = set {
+        todo::set_action(&mut d.items, k, a);
+    }
+    ui.add_space(4.0);
+    ui.label(theme::caption(&interactive_summary(&d.plan, &d.items)));
+    let warning = rebase_warning(d.pushed, &d.plan.branch);
+    if let Some(w) = &warning {
+        ui.colored_label(theme::WARN, format!("⚠ {w}"));
+    }
+    let problem = todo::problem(&d.items);
+    if let Some(p) = &problem {
+        ui.colored_label(theme::DELETED, p);
+    }
+    ui.horizontal(|ui| {
+        let start = if warning.is_some() {
+            danger("Start")
+        } else {
+            theme::primary("Start")
+        };
+        if ui.add_enabled(problem.is_none(), start).clicked() {
+            *result = Some(true);
+        }
+        if ui.button("Cancel").clicked() {
+            *result = Some(false);
+        }
+    });
 }
 
 /// Red, bold button for a destructive confirmation.
@@ -853,6 +988,16 @@ impl SpinneyApp {
                 None => self.dialogs.merge = Some(d),
             }
         }
+        if let Some(mut d) = self.dialogs.interactive.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("interactive"))
+                .show(ctx, |ui| interactive_editor(ui, &mut d, &mut result));
+            match result {
+                Some(true) => self.interactive_rebase(d),
+                Some(false) => {}
+                None => self.dialogs.interactive = Some(d),
+            }
+        }
         if let Some(mut d) = self.dialogs.revert.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("revert")).show(ctx, |ui| {
@@ -980,6 +1125,68 @@ impl SpinneyApp {
                 None => self.dialogs.rebase = Some(d),
             }
         }
+    }
+
+    /// Open the interactive rebase editor for the commits after `base`.
+    pub(super) fn ask_interactive(&mut self, base: &str, errors: &mut Vec<String>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if self.jobs.network_busy(&tab.root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let wt = tab.active_worktree.clone();
+        if let Err(e) = actions::ensure_clean(&wt) {
+            return errors.push(format!("{e:#}"));
+        }
+        let plan = match todo::plan(&wt, base) {
+            Ok(p) => p,
+            Err(e) => return errors.push(format!("{e:#}")),
+        };
+        match actions::rebase_rewrites_pushed(&wt, &plan.base) {
+            Ok(pushed) => {
+                self.dialogs.interactive = Some(InteractiveDialog {
+                    root: tab.root.clone(),
+                    worktree: wt,
+                    items: plan.items.clone(),
+                    plan,
+                    pushed,
+                })
+            }
+            Err(e) => errors.push(format!("upstream: {e:#}")),
+        }
+    }
+
+    /// Run the edited list synchronously, like rebase; conflicts go to the banner.
+    pub(super) fn interactive_rebase(&mut self, d: InteractiveDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        if self.jobs.network_busy(&d.root) {
+            return self
+                .errors
+                .push("Wait for the running fetch, pull or push".into());
+        }
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.root == d.root && t.active_worktree == d.worktree);
+        let Some(tab) = tab else {
+            return self
+                .errors
+                .push("The project or worktree changed; try again".into());
+        };
+        let res = todo::start(&d.worktree, &d.plan, &d.items);
+        tab.refresh(&ctx, &mut errors);
+        match res {
+            Ok(MergeOutcome::Conflicts(files)) => {
+                self.notices.push(conflict_message("Rebase", &files))
+            }
+            Ok(_) => {}
+            Err(e) => {
+                errors.push(format!("{e:#}"));
+            }
+        }
+        self.errors.extend(errors);
     }
 
     /// Revert `sha` at once, or for a merge commit ask which parent to keep first.
@@ -2310,6 +2517,46 @@ mod tests {
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, Some(Operation::Revert));
         assert!(app.notices.iter().any(|n| n.starts_with("Revert stopped")));
+    }
+
+    #[test]
+    fn interactive_rebase_from_the_graph_edits_then_runs() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap().trim().to_string();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = g(&["rev-parse", "HEAD"]);
+        for name in ["one", "two", "three"] {
+            g(&["commit", "-q", "--allow-empty", "-m", name]);
+        }
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        app.apply(Action::AskInteractiveRebase(base));
+        let mut r = app.dialogs.interactive.take().expect("editor open");
+        assert_eq!(r.items.len(), 3);
+        assert_eq!(
+            interactive_summary(&r.plan, &r.items),
+            "3 commits, unchanged"
+        );
+        r.items.swap(0, 2);
+        todo::set_action(&mut r.items, 1, TodoAction::Drop);
+        assert_eq!(
+            interactive_summary(&r.plan, &r.items),
+            "3 commits: 1 dropped, reordered"
+        );
+        app.interactive_rebase(r);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(g(&["log", "--format=%s"]), "one\nthree\nbase");
     }
 
     #[test]

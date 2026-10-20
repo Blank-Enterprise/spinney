@@ -14,6 +14,7 @@ mod ssh;
 mod stage;
 mod stash;
 mod status;
+mod todo;
 mod ui;
 
 fn main() -> eframe::Result {

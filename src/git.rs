@@ -43,6 +43,18 @@ pub fn run_bytes(dir: &Path, args: &[&str], ok: &[i32]) -> Result<Vec<u8>> {
     exec(dir, args, &[], ok)
 }
 
+/// Like `run`, with extra environment variables for this one command.
+pub fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let child = command(dir, args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git")?;
+    finish(child, args, &[0]).map(lossy)
+}
+
 pub fn run_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Result<String> {
     exec(dir, args, stdin, &[0]).map(lossy)
 }
