@@ -1309,6 +1309,8 @@ pub struct RemoveWithBranch {
     pub branch: String,
     /// Uncommitted or untracked files in the worktree.
     pub dirty: bool,
+    /// Those files, for the confirmation to name (a nested repo makes it dirty unnamed).
+    pub dirty_files: Vec<String>,
     /// What `git branch -d` checks against: the upstream, else the project's HEAD.
     pub base: String,
     /// Commits on the branch that are not on `base`.
@@ -1343,6 +1345,11 @@ pub fn plan_remove_with_branch(root: &Path, path: &Path) -> Result<RemoveWithBra
     let dirty = !git::run(path, &["status", "--porcelain"])?
         .trim()
         .is_empty();
+    let dirty_files = if dirty {
+        crate::status::status(path)?.changed_paths()
+    } else {
+        vec![]
+    };
     let local = format!("refs/heads/{branch}");
     let up = git::run(
         root,
@@ -1360,6 +1367,7 @@ pub fn plan_remove_with_branch(root: &Path, path: &Path) -> Result<RemoveWithBra
         path: path.to_path_buf(),
         branch,
         dirty,
+        dirty_files,
         base,
         unmerged,
     })
@@ -2581,6 +2589,7 @@ mod tests {
         .unwrap();
         let plan = plan_remove_with_branch(&root, &wt).unwrap();
         assert_eq!((plan.dirty, plan.unmerged), (true, 1));
+        assert_eq!(plan.dirty_files, ["scratch.txt"]);
         // Asked about as clean and merged, nothing is forced: the worktree stays.
         let unconfirmed = RemoveWithBranch {
             dirty: false,

@@ -414,14 +414,16 @@ impl ProjectTab {
         };
         self.refresh(ctx, errors);
         if let Err(e) = res {
-            // A conflicted apply/pop exits non-zero; the Conflicted list shows the files.
-            let new_conflicts = self
+            // A conflicted apply/pop exits non-zero; name the files it conflicted.
+            let new_conflicts: Vec<String> = self
                 .status
                 .conflicted
                 .iter()
-                .any(|f| !before.contains(&f.path));
-            if applies && new_conflicts {
-                notice = Some("Stash applied with conflicts".to_string());
+                .filter(|f| !before.contains(&f.path))
+                .map(|f| f.path.clone())
+                .collect();
+            if applies && !new_conflicts.is_empty() {
+                notice = Some(dialogs::stash_conflict_notice(&new_conflicts));
             } else {
                 errors.push(format!("{e:#}"));
             }
@@ -1427,7 +1429,14 @@ impl SpinneyApp {
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
                 if ask {
-                    self.dialogs.confirm_remove = Some(path);
+                    // Named in the confirmation; a missing one has none to lose.
+                    let files = match path.is_dir() {
+                        true => status::status(&path)
+                            .map(|s| s.changed_paths())
+                            .unwrap_or_default(),
+                        false => vec![],
+                    };
+                    self.dialogs.confirm_remove = Some((path, files));
                 } else {
                     self.remove_worktree(&path, false, &mut errors);
                 }
@@ -2569,7 +2578,11 @@ mod tests {
         app.apply(Action::OpenProject(root.clone()));
         std::fs::rename(&wt, tmp.path().join("moved")).unwrap();
         app.apply(Action::RemoveWorktree(wt.clone()));
-        assert_eq!(app.dialogs.confirm_remove.as_ref(), Some(&wt), "asks");
+        assert_eq!(
+            app.dialogs.confirm_remove.as_ref(),
+            Some(&(wt.clone(), vec![])),
+            "asks"
+        );
         let listed = |app: &SpinneyApp| {
             project::list_worktrees(&app.tabs[0].root)
                 .unwrap()
@@ -2581,7 +2594,7 @@ mod tests {
         app.remove_worktree(&wt, true, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!listed(&app), "removed once confirmed");
-        let q = dialogs::remove_question(&wt, true);
+        let q = dialogs::remove_question(&wt, true, &[]);
         assert!(q.contains("is missing") && q.contains("Locate"), "{q}");
     }
 

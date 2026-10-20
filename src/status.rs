@@ -107,14 +107,20 @@ pub struct Status {
 impl Status {
     /// Distinct paths with any change (a file changed on both sides counts once).
     pub fn changed_files(&self) -> usize {
+        self.changed_paths().len()
+    }
+
+    /// Those paths, conflicted first, then staged, then unstaged and untracked.
+    pub fn changed_paths(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
         let all = self
-            .staged
+            .conflicted
             .iter()
-            .chain(&self.unstaged)
-            .chain(&self.conflicted);
-        all.map(|f| f.path.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .len()
+            .chain(&self.staged)
+            .chain(&self.unstaged);
+        all.filter(|f| seen.insert(f.path.as_str()))
+            .map(|f| f.path.clone())
+            .collect()
     }
 }
 
@@ -216,6 +222,7 @@ mod tests {
         st.unstaged.push(fs_("b", Change::Untracked));
         st.conflicted.push(fs_("c", Change::Conflicted(BOTH)));
         assert_eq!(st.changed_files(), 3);
+        assert_eq!(st.changed_paths(), ["c", "a", "b"]);
     }
 
     #[test]
