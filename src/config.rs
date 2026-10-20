@@ -24,8 +24,6 @@ pub struct Config {
     pub spaces: Vec<Space>,
     pub active_space: Option<String>,
     pub diff_inline: bool,
-    /// Normal clones whose "convert to the worktree layout" banner was dismissed.
-    pub convert_dismissed: Vec<PathBuf>,
     /// External tool behind a conflicted file's "Open in merge tool".
     pub merge_tool: MergeTool,
     /// What the Pull button does; `None` follows the repo's `pull.rebase` / `pull.ff`.
@@ -155,7 +153,6 @@ mod tests {
             }],
             active_space: Some("work-abc123".into()),
             diff_inline: true,
-            convert_dismissed: vec![PathBuf::from("/tmp/code/p")],
             merge_tool: MergeTool::Kaleidoscope,
             pull_strategy: Some(PullStrategy::Rebase),
         };

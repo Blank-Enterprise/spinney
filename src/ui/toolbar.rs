@@ -2,7 +2,6 @@
 
 use super::{active_space, spaces, theme, Action, JobKind, ProjectTab, SpinneyApp};
 use crate::config::PullStrategy;
-use crate::project::{Layout, Worktree};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Vec2,
 };
@@ -20,14 +19,6 @@ impl SpinneyApp {
                 let (label, close) = tab_button(ui, &tab.name(), active, true);
                 if label.clicked() {
                     actions.push(Action::SelectTab(i));
-                }
-                if tab.layout == Layout::NormalClone {
-                    label.context_menu(|ui| {
-                        if ui.button("Convert to worktree layout…").clicked() {
-                            actions.push(Action::RequestConvert(tab.root.clone()));
-                            ui.close();
-                        }
-                    });
                 }
                 if close {
                     actions.push(Action::CloseTab(i));
@@ -54,10 +45,6 @@ impl SpinneyApp {
                 if self.jobs.any(JobKind::Clone) {
                     ui.add(egui::Spinner::new().size(14.0))
                         .on_hover_text("Cloning…");
-                }
-                if self.jobs.any(JobKind::Convert) {
-                    ui.add(egui::Spinner::new().size(14.0))
-                        .on_hover_text("Converting to the worktree layout…");
                 }
             });
         });
@@ -133,15 +120,6 @@ pub(super) fn folder_name(p: &Path) -> String {
     )
 }
 
-fn worktree_label(wt: &Worktree) -> String {
-    let name = folder_name(&wt.path);
-    match &wt.branch {
-        Some(b) if *b != name => format!("{name} ({b})"),
-        Some(_) => name,
-        None => format!("{name} (detached)"),
-    }
-}
-
 pub(super) fn toolbar(
     ui: &mut egui::Ui,
     tab: &ProjectTab,
@@ -170,20 +148,10 @@ pub(super) fn toolbar(
         } else {
             branch.clone()
         };
-        picker(ui, "worktree · branch", &branch, |ui| match tab.layout {
-            Layout::WorktreeRoot => {
-                for wt in &tab.worktrees {
-                    let on = wt.path == tab.active_worktree;
-                    if ui.selectable_label(on, worktree_label(wt)).clicked() && !on {
-                        actions.push(Action::ActivateWorktree(wt.path.clone()));
-                    }
-                }
-            }
-            Layout::NormalClone => {
-                for b in tab.branches.iter().filter(|b| !b.remote) {
-                    if ui.selectable_label(b.head, &b.name).clicked() && !b.head {
-                        actions.push(Action::Checkout(b.name.clone()));
-                    }
+        picker(ui, "worktree · branch", &branch, |ui| {
+            for b in tab.branches.iter().filter(|b| !b.remote) {
+                if ui.selectable_label(b.head, &b.name).clicked() && !b.head {
+                    actions.push(Action::Checkout(b.name.clone()));
                 }
             }
         });
