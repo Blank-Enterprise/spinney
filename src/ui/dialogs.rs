@@ -1,12 +1,11 @@
 //! Modal dialogs: clone, create, new worktree, confirm worktree removal and branch deletion,
-//! convert, merge and rebase.
+//! merge and rebase.
 
 use super::{
     actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
-    toolbar::folder_name, visible_projects, JobKind, ProjectTab, SpinneyApp,
+    toolbar::folder_name, JobKind, ProjectTab, SpinneyApp,
 };
 use crate::actions::{MergeMode, MergeOutcome, ResetMode, ResetPlan};
-use crate::convert::{self, Plan};
 use crate::todo::{self, TodoAction, TodoItem, TodoPlan};
 use crate::{creds, github, refs};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
@@ -54,9 +53,6 @@ pub(super) struct CloneDialog {
     focus_search: bool,
     /// "Edit space" was clicked: close and open the space editor.
     edit_space: bool,
-    /// "Use the old worktree layout": `.bare` plus a folder per branch. Off: a normal clone,
-    /// with worktrees beside it. #160 removes the option.
-    worktrees: bool,
 }
 
 impl CloneDialog {
@@ -79,15 +75,6 @@ impl CloneDialog {
             query: String::new(),
             focus_search: false,
             edit_space: false,
-            worktrees: false,
-        }
-    }
-
-    fn layout(&self) -> project::Layout {
-        if self.worktrees {
-            project::Layout::WorktreeRoot
-        } else {
-            project::Layout::NormalClone
         }
     }
 
@@ -236,12 +223,10 @@ pub(super) struct NewWorktreeDialog {
 /// What the new-branch dialog does with the branch it creates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum BranchMode {
-    /// Create a worktree for it (worktree layout).
+    /// Create a worktree for it, beside the project.
     Worktree,
-    /// Create it and switch to it (normal clone).
+    /// Create it and switch to it.
     Switch,
-    /// Only create it (a commit's "Create branch here…" in the worktree layout).
-    Create,
 }
 
 /// The dialog's name for `base`: a full commit hash is shortened, a branch name kept.
@@ -505,7 +490,6 @@ pub(super) struct Dialogs {
     pub(super) delete_folder: Option<DeleteFolderDialog>,
     pub(super) rename_branch: Option<RenameBranchDialog>,
     pub(super) confirm_drop_stash: Option<DropStash>,
-    pub(super) convert: Option<ConvertDialog>,
     pub(super) merge: Option<MergeDialog>,
     pub(super) rebase: Option<RebaseDialog>,
     /// The menu shown after dropping one branch onto another.
@@ -650,12 +634,6 @@ pub(super) fn leave_question(lost: usize) -> String {
     )
 }
 
-/// Convert-to-worktree-layout confirm screen; `plan` holds the refusal when it cannot run.
-pub(super) struct ConvertDialog {
-    pub root: PathBuf,
-    pub plan: Result<Plan, String>,
-}
-
 /// A tag delete awaiting confirmation, bound to the tab and worktree it was asked in.
 pub(super) struct DeleteTagDialog {
     pub root: PathBuf,
@@ -697,7 +675,6 @@ impl Dialogs {
             || self.confirm_remove.is_some()
             || self.remove_with_branch.is_some()
             || self.confirm_drop_stash.is_some()
-            || self.convert.is_some()
             || self.delete_branch.is_some()
             || self.delete_remote.is_some()
             || self.delete_tag.is_some()
@@ -886,7 +863,7 @@ impl SpinneyApp {
             let mut result = None;
             let title = match d.mode {
                 BranchMode::Worktree => "New worktree",
-                BranchMode::Switch | BranchMode::Create => "New branch",
+                BranchMode::Switch => "New branch",
             };
             egui::Window::new(title)
                 .collapsible(false)
@@ -990,13 +967,6 @@ impl SpinneyApp {
                 }
                 Some(false) => {}
                 None => self.dialogs.confirm_drop_stash = Some(drop),
-            }
-        }
-        if let Some(d) = self.dialogs.convert.take() {
-            match (convert_dialog(ctx, &d), d.plan) {
-                (Some(true), Ok(plan)) => self.start_convert(d.root, plan),
-                (None, plan) => self.dialogs.convert = Some(ConvertDialog { root: d.root, plan }),
-                _ => {}
             }
         }
         if let Some(mut d) = self.dialogs.delete_branch.take() {
@@ -1753,66 +1723,6 @@ impl SpinneyApp {
         self.errors.extend(errors);
     }
 
-    /// Close the project's tab (so nothing runs git in it while files move) and convert on
-    /// a worker thread; `convert_done` reopens it.
-    pub(super) fn start_convert(&mut self, root: PathBuf, plan: Plan) {
-        let Some(space) = self.space() else { return };
-        if self.jobs.busy(&root) {
-            self.errors.push(format!(
-                "{} has background work running; convert it when that finishes",
-                root.display()
-            ));
-            return;
-        }
-        if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
-            self.close_tab(i);
-        }
-        self.forget_pending(&root);
-        // Canonical, like the paths `git worktree list` gives refresh() to match against.
-        let target = plan.root.join(&plan.target_dir_name);
-        self.converting.push((root.clone(), target));
-        let id = space.id.clone();
-        self.jobs.spawn(JobKind::Convert, root, id, move || {
-            convert::convert(&plan, &space).map(|_| ())
-        });
-    }
-
-    /// Reopen the project after a conversion (converted, or rolled back on failure).
-    pub(super) fn convert_done(&mut self, root: PathBuf, result: anyhow::Result<()>) {
-        let target = self
-            .converting
-            .iter()
-            .position(|(r, _)| *r == root)
-            .map(|i| self.converting.swap_remove(i).1);
-        match &result {
-            Ok(()) => {
-                let mut notice = format!("{} now uses the worktree layout", folder_name(&root));
-                if let Some(t) = &target {
-                    notice += &convert_strays_note(&root, t);
-                }
-                self.notices.push(notice);
-            }
-            Err(e) => self.errors.push(format!("Convert failed: {e:#}")),
-        }
-        let Some(space) = self.space() else { return };
-        if !visible_projects(&self.config).contains(&root) {
-            return; // the space was switched meanwhile
-        }
-        self.open_tab(&root, &space);
-        if result.is_err() {
-            return;
-        }
-        let (ctx, mut errors) = (self.ctx.clone(), vec![]);
-        if let (Some(target), Some(tab)) = (target, self.tab_mut(&root)) {
-            tab.active_worktree = target;
-            tab.refresh(&ctx, &mut errors);
-        }
-        self.errors.extend(errors);
-        if !self.jobs.running(JobKind::CommitGraph, &root) {
-            self.jobs.commit_graph(root.clone(), root.join(".bare"));
-        }
-    }
-
     /// `-d` (or `-D` once confirmed unmerged); then the remote branch as a background job.
     fn delete_branch(&mut self, mut d: DeleteBranchDialog) {
         let ctx = self.ctx.clone();
@@ -2086,10 +1996,10 @@ impl SpinneyApp {
             }
         };
         let url = d.url.trim().to_string();
-        let (id, layout) = (space.id.clone(), d.layout());
+        let id = space.id.clone();
         self.jobs
             .spawn(JobKind::Clone, parent.join(&name), id, move || {
-                project::clone_into(&url, &parent, &name, &space, layout).map(|_| ())
+                project::clone_into(&url, &parent, &name, &space).map(|_| ())
             });
     }
 
@@ -2122,7 +2032,6 @@ impl SpinneyApp {
                     })
                 }
                 BranchMode::Switch => actions::create_and_switch(&wt, branch, &d.base),
-                BranchMode::Create => actions::create_branch(&wt, branch, &d.base),
             };
             if let Err(e) = res {
                 errors.push(format!("{e:#}"));
@@ -2131,118 +2040,6 @@ impl SpinneyApp {
         }
         self.errors.extend(errors);
     }
-}
-
-/// Names of entries that appeared in `root` while converting (they did not move), if any.
-fn convert_strays_note(root: &Path, target: &Path) -> String {
-    match convert::strays(root, target) {
-        Ok(s) if s.is_empty() => String::new(),
-        Ok(s) => {
-            let names: Vec<_> = s.iter().map(|p| p.display().to_string()).collect();
-            format!(
-                ". These appeared in the project folder while converting and were not moved \
-                 into {}: {}",
-                folder_name(target),
-                names.join(", ")
-            )
-        }
-        Err(e) => format!(". Could not check the project folder for leftovers: {e:#}"),
-    }
-}
-
-/// Items listed by name in the preview; the rest are counted.
-const PREVIEW_ITEMS: usize = 6;
-
-/// Before/after folder trees for the convert confirm screen.
-fn convert_preview(name: &str, plan: &Plan) -> (String, String) {
-    let shown = plan.items.len().min(PREVIEW_ITEMS);
-    let mut items: Vec<String> = plan.items[..shown]
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    if plan.items.len() > shown {
-        items.push(format!("… {} more", plan.items.len() - shown));
-    }
-    let tree = |lines: &[String], indent: &str| -> String {
-        lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let branch = if i + 1 == lines.len() {
-                    "└─"
-                } else {
-                    "├─"
-                };
-                format!("{indent}{branch} {l}\n")
-            })
-            .collect()
-    };
-    let mut before_lines = vec![".git/".to_string()];
-    before_lines.extend(items.iter().cloned());
-    let before = format!("{name}/\n{}", tree(&before_lines, ""));
-    let target = &plan.target_dir_name;
-    let after_top = [
-        ".bare/   ← was .git/".to_string(),
-        ".git     ← file: gitdir: ./.bare".to_string(),
-        format!("{target}/"),
-    ];
-    let after = format!("{name}/\n{}{}", tree(&after_top, ""), tree(&items, "   "));
-    (before, after)
-}
-
-fn convert_dialog(ctx: &egui::Context, d: &ConvertDialog) -> Option<bool> {
-    let mut result = None;
-    egui::Modal::new(egui::Id::unique("convert_dialog")).show(ctx, |ui| {
-        ui.set_max_width(480.0);
-        ui.heading("Convert to worktree layout");
-        ui.add_space(6.0);
-        match &d.plan {
-            Err(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, format!("Can't convert: {e}"));
-                ui.add_space(6.0);
-                if ui.button("Close").clicked() {
-                    result = Some(false);
-                }
-            }
-            Ok(plan) => {
-                let (before, after) = convert_preview(&folder_name(&d.root), plan);
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(theme::caption("Before"));
-                        ui.monospace(before);
-                    });
-                    ui.add_space(24.0);
-                    ui.vertical(|ui| {
-                        ui.label(theme::caption("After"));
-                        ui.monospace(after);
-                    });
-                });
-                ui.add_space(6.0);
-                let n = plan.items.len();
-                ui.label(format!(
-                    "{n} item{} move into {}/, including uncommitted, untracked and ignored \
-                     files. Nothing is copied or deleted; if anything fails, every change is \
-                     undone.",
-                    if n == 1 { "" } else { "s" },
-                    plan.target_dir_name
-                ));
-                ui.colored_label(
-                    theme::WARN,
-                    "Close this project in your IDE and terminals first.",
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.add(theme::primary("Convert")).clicked() {
-                        result = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        result = Some(false);
-                    }
-                });
-            }
-        }
-    });
-    result
 }
 
 /// Height of a repository row: name line plus description line.
@@ -2346,12 +2143,7 @@ fn name_and_clone(
     let home = paths::home();
     let full = paths::expand_tilde(&d.where_dir, home.as_deref()).join(d.name.trim());
     ui.monospace(format!("{}/", full.display()));
-    ui.checkbox(&mut d.worktrees, "Use the old .bare layout");
-    ui.weak(if d.worktrees {
-        "worktrees go in folders inside this one"
-    } else {
-        "a normal clone; you can convert it later"
-    });
+    ui.weak("worktrees go beside it, in a .worktrees folder");
     ui.add_space(6.0);
     if let Err(reason) = target {
         ui.colored_label(ui.visuals().error_fg_color, reason);
@@ -2522,8 +2314,6 @@ fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
         let home = paths::home();
         let root = paths::expand_tilde(&d.dir, home.as_deref()).join(d.name.trim());
         ui.monospace(format!("{}/", root.display()));
-        let wt = project::worktree_dir_name(d.branch.trim());
-        ui.monospace(format!("{}/", root.join(wt).display()));
         ui.add_space(6.0);
         if let Err(reason) = &target {
             ui.colored_label(ui.visuals().error_fg_color, reason);
@@ -2566,72 +2356,6 @@ mod tests {
         d
     }
 
-    fn plan_with(items: usize) -> Plan {
-        Plan {
-            root: PathBuf::from("/tmp/proj"),
-            git_dir: PathBuf::from("/tmp/proj/.git"),
-            target_dir_name: "feature-x".into(),
-            worktree_id: "feature-x".into(),
-            items: (0..items).map(|i| PathBuf::from(format!("f{i}"))).collect(),
-            branch: Some("feature/x".into()),
-        }
-    }
-
-    #[test]
-    fn convert_preview_shows_layout_and_counts_extra_items() {
-        let (before, after) = convert_preview("proj", &plan_with(8));
-        assert!(before.starts_with("proj/\n├─ .git/\n├─ f0\n"), "{before}");
-        assert!(before.ends_with("└─ … 2 more\n"), "{before}");
-        assert!(
-            after.contains(".bare/") && after.contains("gitdir: ./.bare"),
-            "{after}"
-        );
-        assert!(after.contains("└─ feature-x/\n   ├─ f0\n"), "{after}");
-        assert!(after.ends_with("   └─ … 2 more\n"), "{after}");
-        let (_, after) = convert_preview("proj", &plan_with(1));
-        assert!(after.ends_with("feature-x/\n   └─ f0\n"), "{after}");
-    }
-
-    #[test]
-    fn success_notice_lists_strays() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        for d in [".bare", "main"] {
-            std::fs::create_dir(root.join(d)).unwrap();
-        }
-        std::fs::write(root.join(".git"), "gitdir: ./.bare\n").unwrap();
-        assert_eq!(convert_strays_note(root, &root.join("main")), "");
-        std::fs::write(root.join(".DS_Store"), "x").unwrap();
-        let note = convert_strays_note(root, &root.join("main"));
-        assert!(note.contains("not moved into main: .DS_Store"), "{note}");
-    }
-
-    #[test]
-    fn not_now_persists_per_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_path = tmp.path().join("config.toml");
-        let mut app = super::super::tests::test_app(super::super::tests::cfg(), &cfg_path);
-        let root = PathBuf::from("/tmp/p1");
-        app.apply(super::super::Action::DismissConvert(root.clone()));
-        app.apply(super::super::Action::DismissConvert(root.clone()));
-        let saved = crate::config::Config::load_from(&cfg_path).unwrap();
-        assert_eq!(saved.convert_dismissed, [root]);
-    }
-
-    #[test]
-    fn convert_refusal_is_shown_instead_of_running() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = super::super::tests::test_app(
-            super::super::tests::cfg(),
-            &tmp.path().join("config.toml"),
-        );
-        app.apply(super::super::Action::RequestConvert(
-            tmp.path().to_path_buf(),
-        ));
-        let d = app.dialogs.convert.as_ref().expect("dialog open");
-        assert!(d.plan.is_err(), "not a repo, so plan refuses");
-    }
-
     #[test]
     fn any_open_sees_every_dialog() {
         let mut d = Dialogs::default();
@@ -2669,12 +2393,6 @@ mod tests {
         });
         assert!(d.any_open());
         d.confirm_drop_stash = None;
-        d.convert = Some(ConvertDialog {
-            root: PathBuf::from("/tmp/r"),
-            plan: Err("no".into()),
-        });
-        assert!(d.any_open());
-        d.convert = None;
         d.delete_branch = Some(DeleteBranchDialog {
             branch: "topic".into(),
             remote: None,
@@ -3654,14 +3372,6 @@ mod tests {
         assert_eq!(d.where_dir, "/tmp/code");
         assert_eq!(d.github, "GitHub Enterprise (ghe.example.com)");
         assert_eq!(github_label("github.com"), "GitHub.com");
-    }
-
-    #[test]
-    fn clone_defaults_to_a_normal_clone() {
-        let mut d = CloneDialog::new(&Space::default());
-        assert_eq!(d.layout(), project::Layout::NormalClone);
-        d.worktrees = true;
-        assert_eq!(d.layout(), project::Layout::WorktreeRoot);
     }
 
     fn repo(name: &str) -> github::Repo {

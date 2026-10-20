@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::PullStrategy;
-use crate::project::{list_worktrees, same_dir, Layout};
+use crate::project::{list_worktrees, same_dir};
 use crate::{git, refs};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 pub enum CheckoutOutcome {
     Switched,
     JumpTo(PathBuf),
-    NeedsWorktree,
 }
 
 #[derive(Debug, PartialEq)]
@@ -245,7 +244,7 @@ pub fn in_progress(worktree: &Path) -> Result<Option<Operation>> {
     for (file, _) in &states {
         args.extend(["--git-path", file]);
     }
-    // Per-worktree paths: in the worktree layout they live under `.bare/worktrees/<name>`.
+    // Per-worktree paths: a linked worktree's live under `.git/worktrees/<name>`.
     let out = git::run(worktree, &args)?;
     Ok(out
         .lines()
@@ -861,32 +860,17 @@ fn stderr(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-pub fn checkout(
-    root: &Path,
-    layout: Layout,
-    active_worktree: &Path,
-    branch: &str,
-) -> Result<CheckoutOutcome> {
-    match layout {
-        Layout::NormalClone => {
-            // A branch already in another worktree (Spinney's, an agent's): go there, as git
-            // refuses to check it out twice.
-            let elsewhere = list_worktrees(root)?.into_iter().find(|w| {
-                w.branch.as_deref() == Some(branch) && !same_dir(&w.path, active_worktree)
-            });
-            if let Some(w) = elsewhere {
-                return Ok(CheckoutOutcome::JumpTo(w.path));
-            }
-            git::run(active_worktree, &["switch", branch])?;
-            Ok(CheckoutOutcome::Switched)
-        }
-        Layout::WorktreeRoot => Ok(list_worktrees(root)?
-            .into_iter()
-            .find(|w| w.branch.as_deref() == Some(branch))
-            .map_or(CheckoutOutcome::NeedsWorktree, |w| {
-                CheckoutOutcome::JumpTo(w.path)
-            })),
+/// Switch `active_worktree` to `branch`, or jump to the worktree (Spinney's, an agent's) that
+/// already has it, as git refuses to check a branch out twice.
+pub fn checkout(root: &Path, active_worktree: &Path, branch: &str) -> Result<CheckoutOutcome> {
+    let elsewhere = list_worktrees(root)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch) && !same_dir(&w.path, active_worktree));
+    if let Some(w) = elsewhere {
+        return Ok(CheckoutOutcome::JumpTo(w.path));
     }
+    git::run(active_worktree, &["switch", branch])?;
+    Ok(CheckoutOutcome::Switched)
 }
 
 /// Open Terminal.app at `dir`.
@@ -904,6 +888,7 @@ pub fn open_terminal(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn create_branch(worktree: &Path, name: &str, base: &str) -> Result<()> {
     git::run(worktree, &["branch", name, base])?;
     Ok(())
@@ -1424,18 +1409,11 @@ mod tests {
         (tmp, url, parent)
     }
 
-    /// Worktree-layout project; returns (tmp, root, main worktree).
+    /// Normal clone; returns (tmp, root, main worktree), which are the same folder.
     fn cloned() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let (tmp, url, parent) = fixture();
-        let root = clone_into(
-            &url,
-            &parent,
-            "proj",
-            &space(),
-            crate::project::Layout::WorktreeRoot,
-        )
-        .unwrap();
-        let main = root.join("main");
+        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
+        let main = root.clone();
         git::run(&main, &["config", "user.name", "Test User"]).unwrap();
         git::run(&main, &["config", "user.email", "test@example.com"]).unwrap();
         (tmp, root, main)
@@ -1934,28 +1912,11 @@ mod tests {
     }
 
     #[test]
-    fn checkout_worktree_root_jump() {
-        let (_tmp, root, main) = cloned();
-        let out = checkout(&root, Layout::WorktreeRoot, &main, "main").unwrap();
-        let CheckoutOutcome::JumpTo(p) = out else {
-            panic!("{out:?}")
-        };
-        assert_eq!(p.canonicalize().unwrap(), main.canonicalize().unwrap());
-    }
-
-    #[test]
-    fn checkout_worktree_root_needs() {
-        let (_tmp, root, main) = cloned();
-        let out = checkout(&root, Layout::WorktreeRoot, &main, "feature/x").unwrap();
-        assert_eq!(out, CheckoutOutcome::NeedsWorktree);
-    }
-
-    #[test]
     fn checkout_normal_switches() {
         let (tmp, url, _parent) = fixture();
         let dir = tmp.path().join("plain");
         git::run(tmp.path(), &["clone", "-q", &url, "plain"]).unwrap();
-        let out = checkout(&dir, Layout::NormalClone, &dir, "feature/x").unwrap();
+        let out = checkout(&dir, &dir, "feature/x").unwrap();
         assert_eq!(out, CheckoutOutcome::Switched);
         assert_eq!(
             refs::current_branch(&dir).unwrap().as_deref(),
@@ -1972,7 +1933,7 @@ mod tests {
         let agent = dir.join(".claude/worktrees/agent-1");
         let agent_str = agent.to_str().unwrap();
         git::run(&dir, &["worktree", "add", "-q", agent_str, "feature/x"]).unwrap();
-        let out = checkout(&dir, Layout::NormalClone, &dir, "feature/x").unwrap();
+        let out = checkout(&dir, &dir, "feature/x").unwrap();
         let CheckoutOutcome::JumpTo(p) = out else {
             panic!("{out:?}")
         };
@@ -2272,7 +2233,7 @@ mod tests {
         );
         git::run(&main, &["rev-parse", "--verify", "feature/x"]).unwrap();
         let err = delete_branch(&main, "main", true).unwrap_err();
-        assert!(err.to_string().contains("worktree main"), "{err}");
+        assert!(err.to_string().contains("worktree proj"), "{err}");
     }
 
     /// Whether `refs/tags/<tag>` exists in `dir`.
@@ -2503,7 +2464,7 @@ mod tests {
         assert_eq!(head(&main, "feature/x"), tip);
         // The active worktree's own branch too: pull is the way there.
         let err = fast_forward_to(&main, "main", "origin/feature/x").unwrap_err();
-        assert!(err.to_string().contains("worktree main"), "{err}");
+        assert!(err.to_string().contains("worktree proj"), "{err}");
     }
 
     fn remove_worktree_and_its_merged_branch() {
@@ -2865,9 +2826,11 @@ mod tests {
     #[test]
     fn detects_each_operation_in_a_linked_worktree() {
         for op in OPERATIONS {
-            let (_tmp, root, main) = conflicting();
-            // `main` is a linked worktree: its state files live under `.bare/worktrees/`.
-            assert!(main.join(".git").is_file() && root.join(".bare").is_dir());
+            let (_tmp, root, _) = conflicting();
+            // Move `main` into a linked worktree: its state files live under `.git/worktrees/`.
+            g(&root, &["switch", "-q", "--detach"]);
+            let main = add_worktree_existing(&root, "main").unwrap();
+            assert!(main.join(".git").is_file());
             assert_eq!(in_progress(&main).unwrap(), None);
             stop_on_conflict(&main, op);
             assert_eq!(in_progress(&main).unwrap(), Some(op));

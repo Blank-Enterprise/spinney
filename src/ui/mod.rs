@@ -17,7 +17,7 @@ use crate::actions::{self, CheckoutOutcome, MergeOutcome, Operation};
 use crate::config::{Config, PullStrategy, Space};
 use crate::diff::FileDiff;
 use crate::graph::{Ancestry, LogStream, Row};
-use crate::project::{self, Layout, Worktree};
+use crate::project::{self, Worktree};
 use crate::refs::{self, Branch, Tag};
 use crate::stage::Direction;
 use crate::stash::{self, Stash};
@@ -119,7 +119,6 @@ pub enum Center {
 
 pub struct ProjectTab {
     root: PathBuf,
-    layout: Layout,
     worktrees: Vec<Worktree>,
     active_worktree: PathBuf,
     branches: Vec<Branch>,
@@ -157,7 +156,7 @@ pub struct ProjectTab {
     git_pull: PullStrategy,
 }
 
-/// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
+/// `<git common dir>` of a project: its `.git`.
 fn common_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let out = git::run(root, &["rev-parse", "--git-common-dir"])?;
     Ok(root.join(out.trim()))
@@ -177,7 +176,7 @@ impl ProjectTab {
         jobs: &mut Jobs,
         errors: &mut Vec<String>,
     ) -> anyhow::Result<ProjectTab> {
-        let layout = project::detect(root)?;
+        project::ensure_project(root)?;
         match common_dir(root) {
             Ok(common) => {
                 if let Err(e) = creds::configure_repo(&common, space) {
@@ -205,7 +204,6 @@ impl ProjectTab {
             .map_or_else(|| root.to_path_buf(), |w: &Worktree| w.path.clone());
         let mut tab = ProjectTab {
             root: root.to_path_buf(),
-            layout,
             worktrees,
             log: LogPager::start(active_worktree.clone(), ctx.clone()),
             active_worktree,
@@ -409,8 +407,6 @@ enum JobKind {
     /// `git push origin refs/tags/<name>`.
     PushTag,
     CommitGraph,
-    /// Normal clone to worktree layout; the project's tab is closed while it runs.
-    Convert,
     /// An external merge tool, open until the user closes it.
     MergeTool,
 }
@@ -490,11 +486,6 @@ impl Jobs {
 
     fn running(&self, kind: JobKind, root: &Path) -> bool {
         self.active.iter().any(|(k, r)| *k == kind && r == root)
-    }
-
-    /// Any job is in flight for `root`.
-    fn busy(&self, root: &Path) -> bool {
-        self.active.iter().any(|(_, r)| r == root)
     }
 
     /// A fetch, pull, push, remote branch or tag delete, remote rename or tag push is in
@@ -592,14 +583,10 @@ pub enum Action {
     AskMerge(String),
     /// Ask before rebasing the checked-out branch onto the branch (local or remote).
     AskRebase(String),
-    /// New branch from the given base: a worktree in the worktree layout, else a switch.
+    /// New branch from the given base, switched to.
     NewBranch(String),
     /// Open Terminal.app at the active worktree.
     OpenTerminal,
-    /// Show the convert-to-worktree-layout confirm screen for a project.
-    RequestConvert(PathBuf),
-    /// "Not now" on the convert banner: hide it for that project for good.
-    DismissConvert(PathBuf),
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
     /// Point a missing worktree at its new folder (`git worktree repair`).
@@ -684,7 +671,7 @@ pub enum Action {
     /// "Create branch here…" on the detached-HEAD banner: a new branch at HEAD, switched to.
     AttachBranch,
     /// "Create branch here…" on a commit: the new-branch dialog with the commit as base,
-    /// which creates the branch (worktree layout) or creates and switches (normal clone).
+    /// which creates and switches.
     BranchAt(String),
     /// "Create tag here…" on a commit (its SHA) or a branch (its full ref): the tag dialog.
     TagAt(String),
@@ -718,8 +705,6 @@ pub struct SpinneyApp {
     confirm_op: Option<in_progress::Pending>,
     /// Root of the tab whose conflict resolution is awaiting confirmation, and what it is.
     confirm_resolve: Option<(PathBuf, Resolve)>,
-    /// Conversions in flight: (project root, worktree to activate afterwards).
-    converting: Vec<(PathBuf, PathBuf)>,
 }
 
 struct RejectedPush {
@@ -755,7 +740,6 @@ impl SpinneyApp {
             ctx,
             focused: true,
             confirm_discard: None,
-            converting: vec![],
             confirm_amend: None,
             rejected_push: None,
             confirm_op: None,
@@ -787,14 +771,6 @@ impl SpinneyApp {
     }
 
     fn open_tab(&mut self, root: &Path, space: &Space) {
-        if self.jobs.running(JobKind::Convert, root) {
-            // Its files are moving; git must not run on it until the job is done.
-            self.notices.push(format!(
-                "{} is being converted; it reopens when done",
-                root.display()
-            ));
-            return;
-        }
         match ProjectTab::open(root, space, &self.ctx, &mut self.jobs, &mut self.errors) {
             Ok(tab) => {
                 self.tabs.push(tab);
@@ -827,9 +803,6 @@ impl SpinneyApp {
             space_id,
             result,
         } = done;
-        if kind == JobKind::Convert {
-            return self.convert_done(root, result);
-        }
         if let Err(e) = result {
             // Left in progress: refresh so the banner and the Conflicted list show it.
             let e = match e.downcast::<actions::PullConflicts>() {
@@ -860,17 +833,9 @@ impl SpinneyApp {
         }
         match kind {
             JobKind::Clone => {
-                let normal = project::detect(&root).ok() == Some(Layout::NormalClone);
-                let git_dir = root.join(if normal { ".git" } else { ".bare" });
                 // Separate job: a commit-graph failure must not orphan the finished clone.
-                self.jobs.commit_graph(root.clone(), git_dir);
-                let mut changed = add_project(&mut self.config, &space_id, &root);
-                // The user just chose a normal clone; don't offer to convert it straight away.
-                if normal && !self.config.convert_dismissed.contains(&root) {
-                    self.config.convert_dismissed.push(root.clone());
-                    changed = true;
-                }
-                if changed {
+                self.jobs.commit_graph(root.clone(), root.join(".git"));
+                if add_project(&mut self.config, &space_id, &root) {
                     self.save_config();
                 }
                 let space = self.space().filter(|s| s.id == space_id);
@@ -892,7 +857,7 @@ impl SpinneyApp {
                 }
                 self.refresh_tab(&root);
             }
-            JobKind::CommitGraph | JobKind::Convert => {}
+            JobKind::CommitGraph => {}
         }
     }
 
@@ -1257,17 +1222,11 @@ impl SpinneyApp {
             Action::AskMerge(branch) => self.ask_merge(branch, false, &mut errors),
             Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
             Action::NewBranch(base) => {
-                if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let mode = match tab.layout {
-                        Layout::WorktreeRoot => BranchMode::Worktree,
-                        Layout::NormalClone => BranchMode::Switch,
-                    };
-                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                        base,
-                        branch: String::new(),
-                        mode,
-                    });
-                }
+                self.dialogs.new_worktree = Some(NewWorktreeDialog {
+                    base,
+                    branch: String::new(),
+                    mode: BranchMode::Switch,
+                });
             }
             Action::CherryPick(shas) => self.cherry_pick(&shas, &mut errors),
             Action::Revert(sha) => self.ask_revert(sha, &mut errors),
@@ -1287,17 +1246,11 @@ impl SpinneyApp {
                 }
             }
             Action::BranchAt(sha) => {
-                if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let mode = match tab.layout {
-                        Layout::WorktreeRoot => BranchMode::Create,
-                        Layout::NormalClone => BranchMode::Switch,
-                    };
-                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                        base: sha,
-                        branch: String::new(),
-                        mode,
-                    });
-                }
+                self.dialogs.new_worktree = Some(NewWorktreeDialog {
+                    base: sha,
+                    branch: String::new(),
+                    mode: BranchMode::Switch,
+                });
             }
             Action::TagAt(target) => self.ask_tag(target, &mut errors),
             Action::CopyText(text) => ctx.copy_text(text),
@@ -1329,16 +1282,6 @@ impl SpinneyApp {
                     if let Err(e) = actions::open_terminal(&tab.active_worktree) {
                         errors.push(format!("{e:#}"));
                     }
-                }
-            }
-            Action::RequestConvert(root) => {
-                let plan = crate::convert::plan(&root).map_err(|e| format!("{e:#}"));
-                self.dialogs.convert = Some(dialogs::ConvertDialog { root, plan });
-            }
-            Action::DismissConvert(root) => {
-                if !self.config.convert_dismissed.contains(&root) {
-                    self.config.convert_dismissed.push(root);
-                    self.save_config();
                 }
             }
             Action::Checkout(name) => {
@@ -1529,12 +1472,6 @@ impl SpinneyApp {
         }
     }
 
-    /// Whether to show the "normal clone" banner for `tab`. Never: a normal clone is now the
-    /// layout Spinney makes. #160 removes the conversion.
-    fn offer_convert(&self, _tab: &ProjectTab) -> bool {
-        false
-    }
-
     /// Whether the centre shows the New Tab page instead of the active project.
     fn showing_new_tab(&self) -> bool {
         self.new_tab || self.tabs.is_empty()
@@ -1555,34 +1492,6 @@ impl SpinneyApp {
         self.tabs
             .get_mut(self.active_tab)
             .filter(|t| t.root == root)
-    }
-
-    /// Drop the confirmations pending for `root`: they name files and worktrees that a
-    /// conversion is about to move, so they must not come back when its tab reopens.
-    fn forget_pending(&mut self, root: &Path) {
-        if self
-            .confirm_discard
-            .as_ref()
-            .is_some_and(|(r, _)| r == root)
-        {
-            self.confirm_discard = None;
-        }
-        if self.confirm_amend.as_deref() == Some(root) {
-            self.confirm_amend = None;
-        }
-        if self.rejected_push.as_ref().is_some_and(|r| r.root == root) {
-            self.rejected_push = None;
-        }
-        if self.confirm_op.as_ref().is_some_and(|p| p.root == root) {
-            self.confirm_op = None;
-        }
-        if self
-            .confirm_resolve
-            .as_ref()
-            .is_some_and(|(r, _)| r == root)
-        {
-            self.confirm_resolve = None;
-        }
     }
 
     /// Continue the operation stopped in `worktree`, or with `step` skip or abort it, then
@@ -1903,15 +1812,6 @@ pub enum LeaveTo {
     Commit(String),
 }
 
-/// Whether going to `to` moves the active worktree's HEAD. In the worktree layout a branch
-/// checkout jumps to (or creates) that branch's own worktree, leaving this one alone.
-pub fn leaves_head(layout: Layout, to: &LeaveTo) -> bool {
-    match to {
-        LeaveTo::Commit(_) => true,
-        LeaveTo::Branch(_) => layout == Layout::NormalClone,
-    }
-}
-
 /// "Detached at 1a2b3c4".
 pub fn detached_text(head: &str) -> String {
     format!("Detached at {}", &head[..head.len().min(7)])
@@ -1946,15 +1846,9 @@ fn checkout(tab: &mut ProjectTab, name: &str, errors: &mut Vec<String>) {
     } else {
         name
     };
-    match actions::checkout(&tab.root, tab.layout, &tab.active_worktree, local) {
+    match actions::checkout(&tab.root, &tab.active_worktree, local) {
         Ok(CheckoutOutcome::Switched) => {}
         Ok(CheckoutOutcome::JumpTo(path)) => tab.active_worktree = path,
-        Ok(CheckoutOutcome::NeedsWorktree) => {
-            match project::add_worktree_existing(&tab.root, local) {
-                Ok(path) => tab.active_worktree = path,
-                Err(e) => errors.push(format!("{e:#}")),
-            }
-        }
         Err(e) => errors.push(format!("{e:#}")),
     }
 }
@@ -1966,9 +1860,6 @@ impl SpinneyApp {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return false;
         };
-        if !leaves_head(tab.layout, &to) {
-            return false;
-        }
         // From git, not `tab.detached`: commits made outside Spinney since the last refresh
         // count too, and the confirmation is pinned to the HEAD they were counted at.
         let wt = &tab.active_worktree;
@@ -2032,26 +1923,9 @@ impl SpinneyApp {
             in_progress::bar(ui, op, conflicts, busy, asking, actions)
         });
     }
-
-    /// Refuse to close while a conversion runs: its undo journal lives only in memory,
-    /// so quitting would strand the repo half-converted.
-    fn hold_close(&mut self, ctx: &egui::Context) {
-        if !self.converting.is_empty() && ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            let wait = "Spinney can quit once the conversion finishes".to_string();
-            if !self.notices.contains(&wait) {
-                self.notices.push(wait);
-            }
-        }
-    }
 }
 
 impl eframe::App for SpinneyApp {
-    /// Runs every pass, even minimized, so a close request is always seen.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.hold_close(ctx);
-    }
-
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
@@ -2096,24 +1970,6 @@ impl eframe::App for SpinneyApp {
                     egui::Panel::top("detached")
                         .frame(warn)
                         .show(ui, |ui| detached_bar(ui, head, previous, &mut actions));
-                }
-                if self.offer_convert(tab) {
-                    let root = tab.root.clone();
-                    egui::Panel::top("convert_offer").frame(bar).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("This project uses a normal clone");
-                            ui.label(theme::caption(
-                                "Convert it to the worktree layout to work on several \
-                                 branches side by side.",
-                            ));
-                            if ui.add(theme::primary("Convert…")).clicked() {
-                                actions.push(Action::RequestConvert(root.clone()));
-                            }
-                            if ui.button("Not now").clicked() {
-                                actions.push(Action::DismissConvert(root));
-                            }
-                        });
-                    });
                 }
             }
         }
@@ -2231,7 +2087,6 @@ impl eframe::App for SpinneyApp {
                 };
                 let branch = tab.branches.iter().find(|b| b.head && !b.remote);
                 let menu = graph_view::MenuContext {
-                    layout: tab.layout,
                     dirty: graph_view::clean_blocked(&tab.status, tab.operation),
                     branch: branch.map(|b| b.name.clone()),
                     operation: tab.operation,
@@ -2362,7 +2217,6 @@ mod tests {
             ],
             active_space: Some("a".into()),
             diff_inline: false,
-            convert_dismissed: vec![],
             ..Default::default()
         }
     }
@@ -2472,25 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_clone_skips_the_convert_offer() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg_path = tmp.path().join("config.toml");
-        let mut app = test_app(cfg(), &cfg_path);
-        let normal = repo(1);
-        let root = normal.path().to_path_buf();
-        app.job_done(JobDone {
-            kind: JobKind::Clone,
-            root: root.clone(),
-            space_id: "b".into(),
-            result: Ok(()),
-        });
-        let saved = Config::load_from(&cfg_path).unwrap();
-        assert!(saved.spaces[1].projects.contains(&root));
-        assert_eq!(saved.convert_dismissed, [root]);
-    }
-
-    #[test]
-    fn common_dir_for_both_layouts() {
+    fn common_dir_of_a_normal_clone() {
         let normal = repo(0);
         let got = common_dir(normal.path()).unwrap();
         assert_eq!(
@@ -2498,15 +2334,6 @@ mod tests {
             normal.path().join(".git").canonicalize().unwrap()
         );
         assert!(needs_commit_graph(&got));
-
-        let tmp = tempfile::tempdir().unwrap();
-        crate::git::run(tmp.path(), &["init", "-q", "--bare", ".bare"]).unwrap();
-        std::fs::write(tmp.path().join(".git"), "gitdir: ./.bare\n").unwrap();
-        let got = common_dir(tmp.path()).unwrap();
-        assert_eq!(
-            got.canonicalize().unwrap(),
-            tmp.path().join(".bare").canonicalize().unwrap()
-        );
     }
 
     pub(super) fn test_app(config: Config, cfg_path: &Path) -> SpinneyApp {
@@ -2525,7 +2352,6 @@ mod tests {
             ctx,
             focused: true,
             confirm_discard: None,
-            converting: vec![],
             confirm_amend: None,
             rejected_push: None,
             confirm_op: None,
@@ -2674,62 +2500,6 @@ mod tests {
     }
 
     #[test]
-    fn close_is_held_only_while_converting() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
-        let ctx = egui::Context::default();
-        let mut close = egui::RawInput::default();
-        close
-            .viewports
-            .entry(egui::ViewportId::ROOT)
-            .or_default()
-            .events
-            .push(egui::ViewportEvent::Close);
-        let held = |app: &mut SpinneyApp| {
-            let out = ctx.run_logic(&close, |ctx| app.hold_close(ctx));
-            out.viewport_commands
-                .get(&egui::ViewportId::ROOT)
-                .is_some_and(|c| c.contains(&egui::ViewportCommand::CancelClose))
-        };
-        assert!(!held(&mut app), "nothing running: close normally");
-        app.converting
-            .push((PathBuf::from("/p/root"), PathBuf::from("/p/root/main")));
-        assert!(held(&mut app));
-        assert!(app
-            .notices
-            .iter()
-            .any(|n| n.contains("conversion finishes")));
-    }
-
-    #[test]
-    fn converting_forgets_only_that_projects_confirmations() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
-        let (root, other) = (PathBuf::from("/p/root"), PathBuf::from("/p/other"));
-        let rejected = |r: &Path| RejectedPush {
-            root: r.to_path_buf(),
-            rejected: actions::PushRejected {
-                worktree: r.to_path_buf(),
-                branch: "main".into(),
-            },
-            lease: None,
-        };
-        app.confirm_discard = Some((root.clone(), Discard::All));
-        app.confirm_amend = Some(root.clone());
-        app.rejected_push = Some(rejected(&root));
-        app.forget_pending(&root);
-        assert!(app.confirm_discard.is_none() && app.confirm_amend.is_none());
-        assert!(app.rejected_push.is_none());
-
-        app.confirm_discard = Some((other.clone(), Discard::All));
-        app.confirm_amend = Some(other.clone());
-        app.rejected_push = Some(rejected(&other));
-        app.forget_pending(&root);
-        assert!(app.confirm_discard.is_some() && app.confirm_amend.is_some());
-        assert!(app.rejected_push.is_some());
-    }
-
-    #[test]
     fn jobs_track_what_is_running() {
         let mut jobs = Jobs::new(egui::Context::default());
         let (a, b) = (Path::new("/tmp/a"), Path::new("/tmp/b"));
@@ -2764,16 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn only_moving_this_worktrees_head_leaves_it() {
-        let commit = LeaveTo::Commit("abc".into());
-        let branch = LeaveTo::Branch("main".into());
-        assert!(leaves_head(Layout::NormalClone, &commit));
-        assert!(leaves_head(Layout::WorktreeRoot, &commit));
-        assert!(leaves_head(Layout::NormalClone, &branch));
-        assert!(
-            !leaves_head(Layout::WorktreeRoot, &branch),
-            "jumps to its worktree"
-        );
+    fn detached_text_shortens_the_sha() {
         let sha = "83174b7246c76c9b6426a95147a715f0d26bf6c6";
         assert_eq!(detached_text(sha), "Detached at 83174b7");
     }
