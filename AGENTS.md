@@ -27,6 +27,7 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 | `src/actions.rs` | Git operations behind UI actions: commit and amend, fetch, pull, push and force push with lease, checkout, branches, merge and rebase. |
 | `src/stage.rs` | Line and hunk patches for staging, unstaging and discarding. |
 | `src/stash.rs` | Stash list and actions, addressed by commit hash and not index. |
+| `src/mergetool.rs` | "Open in merge tool": runs `git mergetool --no-prompt` for a conflicted file with the configured tool, stdin closed. |
 | `src/convert.rs` | Converts a normal clone to the worktree layout, with an undo journal and rollback. |
 | `src/project.rs` | Layout detection, worktrees, clone and create. |
 | `src/refs.rs`, `src/status.rs`, `src/diff.rs`, `src/graph.rs` | Parse `for-each-ref`, `status`, `diff` and `log` output. |

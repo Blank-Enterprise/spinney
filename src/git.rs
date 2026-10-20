@@ -77,6 +77,17 @@ pub fn output(dir: &Path, args: &[&str]) -> Result<Output> {
         .context("failed to spawn git")
 }
 
+/// Like `output`, with extra environment variables (e.g. a wider `PATH` for a GUI tool).
+pub fn output_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Output> {
+    let mut cmd = command(dir, args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.stdin(Stdio::null())
+        .output()
+        .context("failed to spawn git")
+}
+
 /// Spawn git with stdout piped for streaming; the caller owns the child.
 pub fn spawn_stream(dir: &Path, args: &[&str]) -> Result<Child> {
     command(dir, args)

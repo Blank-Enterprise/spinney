@@ -7,6 +7,7 @@ mod diff;
 mod git;
 mod github;
 mod graph;
+mod mergetool;
 mod project;
 mod refs;
 mod ssh;

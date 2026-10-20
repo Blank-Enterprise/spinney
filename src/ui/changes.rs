@@ -5,7 +5,9 @@ use super::conflict_view::ConflictView;
 use super::diff_view::{Selection, WorkDiff};
 use super::{theme, Action, Center, Discard, ProjectTab, Resolve};
 use crate::actions::{self, Operation, Version};
+use crate::config::MergeTool;
 use crate::diff::{commit_diff, file_diff};
+use crate::mergetool;
 use crate::stage::{self, Direction};
 use crate::status::{self, Change, Conflict, FileStatus, Side, Status};
 use anyhow::anyhow;
@@ -157,7 +159,13 @@ enum List {
 const COMMIT_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 
 /// `shortcuts` is false while a dialog is open, so ⌘↵ there never commits behind it.
-pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &mut Vec<Action>) {
+pub fn show(
+    ui: &mut egui::Ui,
+    tab: &mut ProjectTab,
+    shortcuts: bool,
+    merge_tool: MergeTool,
+    actions: &mut Vec<Action>,
+) {
     if let Some(i) = tab.selected_commit {
         commit_files(ui, tab, i, actions);
         return;
@@ -199,6 +207,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &
                     tab.operation,
                     &open,
                     false,
+                    merge_tool,
                     actions,
                 );
             }
@@ -212,9 +221,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &
                 op,
                 &open,
                 conflicts,
+                merge_tool,
                 actions,
             );
-            file_list(ui, List::Staged, &st.staged, st, op, &open, false, actions);
+            let none = MergeTool::None;
+            file_list(
+                ui,
+                List::Staged,
+                &st.staged,
+                st,
+                op,
+                &open,
+                false,
+                none,
+                actions,
+            );
         });
 }
 
@@ -262,6 +283,7 @@ fn file_list(
     op: Option<Operation>,
     open: &Option<(String, List)>,
     conflicts: bool,
+    merge_tool: MergeTool,
     actions: &mut Vec<Action>,
 ) {
     let (title, button) = match list {
@@ -349,7 +371,7 @@ fn file_list(
                     });
                 }
                 if list == List::Conflicted {
-                    r.context_menu(|ui| conflict_menu(ui, f, actions));
+                    r.context_menu(|ui| conflict_menu(ui, f, merge_tool, actions));
                 }
                 if list == List::Unstaged {
                     r.context_menu(|ui| {
@@ -369,22 +391,48 @@ fn file_list(
     ui.add_space(8.0);
 }
 
-/// A conflicted file's menu: Open, Use mine…, Use theirs…, Mark resolved.
-fn conflict_menu(ui: &mut egui::Ui, f: &FileStatus, actions: &mut Vec<Action>) {
-    let items = [
-        ("Open", Action::OpenFile(f.path.clone())),
+/// A conflicted file's menu: Open, Use mine…, Use theirs…, Mark resolved, and Open in
+/// merge tool when one is set. Each item comes with why it's disabled, if it is.
+pub(super) fn conflict_items(
+    f: &FileStatus,
+    merge_tool: MergeTool,
+) -> Vec<(&'static str, Action, Option<&'static str>)> {
+    let mut items = vec![
+        ("Open", Action::OpenFile(f.path.clone()), None),
         (
             "Use mine…",
             Action::AskResolve(Resolve::Use(f.clone(), Version::Mine)),
+            None,
         ),
         (
             "Use theirs…",
             Action::AskResolve(Resolve::Use(f.clone(), Version::Theirs)),
+            None,
         ),
-        ("Mark resolved", Action::MarkResolved(f.path.clone())),
+        ("Mark resolved", Action::MarkResolved(f.path.clone()), None),
     ];
-    for (label, action) in items {
-        if ui.button(label).clicked() {
+    if merge_tool != MergeTool::None {
+        let why = match &f.change {
+            Change::Conflicted(c) => mergetool::blocked(*c, &f.path),
+            _ => None,
+        };
+        let open = Action::OpenInMergeTool(f.path.clone());
+        items.push(("Open in merge tool", open, why));
+    }
+    items
+}
+
+fn conflict_menu(
+    ui: &mut egui::Ui,
+    f: &FileStatus,
+    merge_tool: MergeTool,
+    actions: &mut Vec<Action>,
+) {
+    for (label, action, why) in conflict_items(f, merge_tool) {
+        let r = ui
+            .add_enabled(why.is_none(), egui::Button::new(label))
+            .on_disabled_hover_text(why.unwrap_or_default());
+        if r.clicked() {
             actions.push(action);
             ui.close();
         }
@@ -672,6 +720,31 @@ impl ProjectTab {
 mod tests {
     use super::*;
     use crate::status::{Change, FileStatus};
+
+    #[test]
+    fn merge_tool_item_only_when_a_tool_is_set() {
+        let conflicted = |ours, theirs| FileStatus {
+            path: "f".into(),
+            change: Change::Conflicted(Conflict { ours, theirs }),
+        };
+        let both = conflicted(Side::Modified, Side::Modified);
+        let labels = |items: Vec<(&'static str, Action, Option<&str>)>| {
+            items.into_iter().map(|(l, ..)| l).collect::<Vec<_>>()
+        };
+        let base = ["Open", "Use mine…", "Use theirs…", "Mark resolved"];
+        assert_eq!(labels(conflict_items(&both, MergeTool::None)), base);
+        let items = conflict_items(&both, MergeTool::VsCode);
+        let (label, action, why) = items.last().unwrap();
+        assert_eq!(*label, "Open in merge tool");
+        assert!(matches!(action, Action::OpenInMergeTool(p) if p == "f"));
+        assert_eq!(*why, None);
+        let deleted = conflicted(Side::Modified, Side::Deleted);
+        let items = conflict_items(&deleted, MergeTool::Git);
+        assert!(
+            items.last().unwrap().2.is_some(),
+            "nothing to merge line by line"
+        );
+    }
 
     #[test]
     fn commit_needs_message_and_staged_files() {
