@@ -436,6 +436,16 @@ fn branch_menu(r: &egui::Response, b: &Branch, cx: Ctx, actions: &mut Vec<Action
             actions.push(Action::NewWorktreeFrom(name.to_string()));
             ui.close();
         }
+        // The full ref, so a tag of the same name isn't the one tagged.
+        if ui.button("Create tag here…").clicked() {
+            let prefix = if b.remote {
+                "refs/remotes"
+            } else {
+                "refs/heads"
+            };
+            actions.push(Action::TagAt(format!("{prefix}/{name}")));
+            ui.close();
+        }
         if let Some((label, why)) = fast_forward_item(b, cx.checked_out) {
             let r = ui.add_enabled(why.is_none(), egui::Button::new(label));
             let r = match &why {

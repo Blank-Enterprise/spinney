@@ -130,6 +130,7 @@ pub enum MenuAction {
     Checkout,
     Branch,
     Worktree,
+    Tag,
     /// A sub-menu of Soft, Mixed and Hard.
     Reset,
     /// The commit, or the ⌘-clicked selection it belongs to.
@@ -202,6 +203,7 @@ impl MenuAction {
             MenuAction::Checkout => Action::CheckoutCommit(sha),
             MenuAction::Branch => Action::BranchAt(sha),
             MenuAction::Worktree => Action::NewWorktreeFrom(sha),
+            MenuAction::Tag => Action::TagAt(sha),
             MenuAction::Revert => Action::Revert(sha),
             MenuAction::InteractiveRebase => Action::AskInteractiveRebase(sha),
             MenuAction::Reset | MenuAction::CherryPick => {
@@ -285,6 +287,7 @@ pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<Me
         vec![
             item("Create branch here…", MenuAction::Branch, branch_blocked),
             item("New worktree here…", MenuAction::Worktree, worktree_blocked),
+            item("Create tag here…", MenuAction::Tag, None),
         ],
         vec![
             item(&pick_label, MenuAction::CherryPick, pick_blocked),
@@ -861,6 +864,7 @@ mod tests {
             ("Checkout this commit", false),
             ("Create branch here…", true),
             ("New worktree here…", true),
+            ("Create tag here…", true),
             ("Cherry-pick onto main", false),
             ("Revert commit", false),
             ("Reset main to this commit", true),
