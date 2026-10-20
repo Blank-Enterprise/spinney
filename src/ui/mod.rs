@@ -665,9 +665,17 @@ impl SpinneyApp {
         }
         match kind {
             JobKind::Clone => {
+                let normal = project::detect(&root).ok() == Some(Layout::NormalClone);
+                let git_dir = root.join(if normal { ".git" } else { ".bare" });
                 // Separate job: a commit-graph failure must not orphan the finished clone.
-                self.jobs.commit_graph(root.clone(), root.join(".bare"));
-                if add_project(&mut self.config, &space_id, &root) {
+                self.jobs.commit_graph(root.clone(), git_dir);
+                let mut changed = add_project(&mut self.config, &space_id, &root);
+                // The user just chose a normal clone; don't offer to convert it straight away.
+                if normal && !self.config.convert_dismissed.contains(&root) {
+                    self.config.convert_dismissed.push(root.clone());
+                    changed = true;
+                }
+                if changed {
                     self.save_config();
                 }
                 let space = self.space().filter(|s| s.id == space_id);
@@ -1611,6 +1619,24 @@ mod tests {
         p.request(PAGE);
         assert!(wait(&mut p).unwrap().is_empty());
         assert!(p.done);
+    }
+
+    #[test]
+    fn normal_clone_skips_the_convert_offer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut app = test_app(cfg(), &cfg_path);
+        let normal = repo(1);
+        let root = normal.path().to_path_buf();
+        app.job_done(JobDone {
+            kind: JobKind::Clone,
+            root: root.clone(),
+            space_id: "b".into(),
+            result: Ok(()),
+        });
+        let saved = Config::load_from(&cfg_path).unwrap();
+        assert!(saved.spaces[1].projects.contains(&root));
+        assert_eq!(saved.convert_dismissed, [root]);
     }
 
     #[test]

@@ -105,7 +105,14 @@ mod tests {
         let url = format!("file://{}", remote.display());
         let parent = tmp.path().join("clones");
         std::fs::create_dir(&parent).unwrap();
-        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
+        let root = clone_into(
+            &url,
+            &parent,
+            "proj",
+            &space(),
+            crate::project::Layout::WorktreeRoot,
+        )
+        .unwrap();
         (tmp, root)
     }
 
