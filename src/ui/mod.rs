@@ -253,6 +253,19 @@ impl ProjectTab {
         )
     }
 
+    /// The window is back: reload what may have changed meanwhile. A changed worktree list
+    /// (an agent added, removed or moved one) needs the full refresh; otherwise only the
+    /// active worktree's changes and stashes, so history paging isn't restarted.
+    fn refocus(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
+        let listed = project::list_worktrees(&self.root)
+            .map(|w| w.into_iter().filter(|w| !w.is_bare).collect::<Vec<_>>());
+        if listed.is_ok_and(|w| w != self.worktrees) {
+            return self.refresh(ctx, errors);
+        }
+        self.reload_changes(errors);
+        self.load_stashes(errors);
+    }
+
     /// Reload worktrees and branches (fast, local) and restart history paging.
     fn refresh(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
         match project::list_worktrees(&self.root) {
@@ -1987,8 +2000,7 @@ impl eframe::App for SpinneyApp {
         let focused = ui.input(|i| i.focused);
         if focused && !self.focused {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.reload_changes(&mut self.errors);
-                tab.load_stashes(&mut self.errors);
+                tab.refocus(&ctx, &mut self.errors);
             }
         }
         self.focused = focused;
@@ -2543,6 +2555,35 @@ mod tests {
         assert_eq!(app.tabs[0].view, View::Git);
         assert_eq!(app.tabs[0].active_worktree, agent);
         assert!(app.errors.is_empty(), "{:?}", app.errors);
+    }
+
+    #[test]
+    fn refocus_picks_up_worktrees_changed_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        app.apply(Action::OpenProject(root.clone()));
+        let ctx = app.ctx.clone();
+        let mut errors = vec![];
+        let tab = &mut app.tabs[0];
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, Some(0), "unchanged: no full refresh");
+
+        // An agent adds a worktree while Spinney is in the background.
+        let wt = tmp.path().canonicalize().unwrap().join("agent");
+        let wt_str = wt.to_str().unwrap();
+        crate::git::run(&root, &["worktree", "add", "-q", "-b", "a", wt_str]).unwrap();
+        tab.refocus(&ctx, &mut errors);
+        assert!(tab.worktrees.iter().any(|w| w.path == wt && !w.prunable));
+        assert_eq!(tab.selected_commit, None, "changed: full refresh");
+
+        // Then moves it away.
+        std::fs::rename(&wt, tmp.path().join("moved")).unwrap();
+        tab.refocus(&ctx, &mut errors);
+        assert!(tab.worktrees.iter().any(|w| w.path == wt && w.prunable));
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
