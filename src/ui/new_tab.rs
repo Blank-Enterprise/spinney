@@ -1,4 +1,4 @@
-//! GitKraken-style New Tab page: Open / Clone / Create and the space's recent projects.
+//! The New Tab page: Open / Clone / Create and the space's recent projects.
 
 use super::{paths, theme, Action};
 use crate::config::Space;
