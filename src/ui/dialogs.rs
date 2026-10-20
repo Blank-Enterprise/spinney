@@ -434,7 +434,13 @@ fn remove_with_branch_text(p: &actions::RemoveWithBranch) -> (String, Vec<String
     );
     let mut lost = vec![];
     if p.dirty {
-        lost.push("Its uncommitted and untracked files will be lost.".to_string());
+        lost.push(match &p.dirty_files[..] {
+            [] => "Its uncommitted and untracked files will be lost.".to_string(),
+            files => format!(
+                "Its uncommitted and untracked files will be lost: {}.",
+                file_list(files)
+            ),
+        });
     }
     let commits = match p.unmerged {
         0 => None,
@@ -480,8 +486,8 @@ pub(super) struct Dialogs {
     pub(super) clone: Option<CloneDialog>,
     pub(super) create: Option<CreateDialog>,
     pub(super) new_worktree: Option<NewWorktreeDialog>,
-    /// Dirty worktree awaiting a forced-removal confirmation.
-    pub(super) confirm_remove: Option<PathBuf>,
+    /// Dirty worktree awaiting a forced-removal confirmation, with the files it would lose.
+    pub(super) confirm_remove: Option<(PathBuf, Vec<String>)>,
     pub(super) remove_with_branch: Option<RemoveWithBranchDialog>,
     pub(super) delete_branch: Option<DeleteBranchDialog>,
     /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
@@ -598,7 +604,7 @@ pub(super) fn reset_text(plan: &ResetPlan, mode: ResetMode) -> (String, String, 
         };
         warnings.push(format!(
             "Uncommitted changes to {files} will be lost and can't be recovered: {}.",
-            conflict_list(&plan.changed)
+            file_list(&plan.changed)
         ));
     }
     if plan.pushed > 0 {
@@ -635,18 +641,25 @@ pub(super) fn leave_question(lost: usize) -> String {
 }
 
 /// The worktree Remove confirmation: what is lost for a dirty one, or for a missing one
-/// (moved, not deleted, it stops being a worktree where it is now).
-pub fn remove_question(path: &Path, missing: bool) -> String {
+/// (moved, not deleted, it stops being a worktree where it is now). `files` are the dirty
+/// one's uncommitted and untracked files.
+pub fn remove_question(path: &Path, missing: bool, files: &[String]) -> String {
     if missing {
         format!(
             "{} is missing. Remove it from the project? If it was moved, it stops being a \
              worktree where it is now; use Locate… to keep it.",
             path.display()
         )
-    } else {
+    } else if files.is_empty() {
         format!(
             "{} has uncommitted changes. Remove it anyway?",
             path.display()
+        )
+    } else {
+        format!(
+            "{} has uncommitted changes to {}. They will be lost. Remove it anyway?",
+            path.display(),
+            file_list(files)
         )
     }
 }
@@ -813,27 +826,35 @@ fn danger(label: &str) -> egui::Button<'_> {
         .fill(theme::DELETED)
 }
 
-/// Conflicted files named in a stopped merge or rebase's message; the rest are counted.
-const CONFLICTS_SHOWN: usize = 5;
+/// Files a message names (conflicts, or changes a confirmation loses); the rest are counted.
+const FILES_SHOWN: usize = 5;
 
 /// "a.txt, b.txt", or the first few "and 2 more".
-fn conflict_list(files: &[String]) -> String {
-    let mut list = files[..files.len().min(CONFLICTS_SHOWN)].join(", ");
-    if files.len() > CONFLICTS_SHOWN {
-        list += &format!(" and {} more", files.len() - CONFLICTS_SHOWN);
+pub(super) fn file_list(files: &[String]) -> String {
+    let mut list = files[..files.len().min(FILES_SHOWN)].join(", ");
+    if files.len() > FILES_SHOWN {
+        list += &format!(" and {} more", files.len() - FILES_SHOWN);
     }
     list
 }
 
 /// "Merge stopped on conflicts in a.txt, b.txt. Resolve them, then Continue."
 pub(super) fn conflict_message(op: &str, files: &[String]) -> String {
-    let list = conflict_list(files);
+    let list = file_list(files);
     format!("{op} stopped on conflicts in {list}. Resolve them, then Continue.")
+}
+
+/// "Stash applied with conflicts in a.txt, b.txt", the files the apply or pop conflicted.
+pub(super) fn stash_conflict_notice(files: &[String]) -> String {
+    match files {
+        [] => "Stash applied with conflicts".to_string(),
+        _ => format!("Stash applied with conflicts in {}", file_list(files)),
+    }
 }
 
 /// "Squash stopped: conflicts in a.txt. Nothing was changed."
 fn squash_conflict_message(files: &[String]) -> String {
-    let list = conflict_list(files);
+    let list = file_list(files);
     format!("Squash stopped: conflicts in {list}. Nothing was changed.")
 }
 
@@ -906,10 +927,10 @@ impl SpinneyApp {
                 None => self.dialogs.new_worktree = Some(d),
             }
         }
-        if let Some(path) = self.dialogs.confirm_remove.take() {
+        if let Some((path, files)) = self.dialogs.confirm_remove.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("confirm_remove")).show(ctx, |ui| {
-                ui.label(remove_question(&path, !path.is_dir()));
+                ui.label(remove_question(&path, !path.is_dir(), &files));
                 ui.horizontal(|ui| {
                     if ui.add(danger("Remove")).clicked() {
                         result = Some(true);
@@ -926,7 +947,7 @@ impl SpinneyApp {
                     self.errors.extend(errors);
                 }
                 Some(false) => {}
-                None => self.dialogs.confirm_remove = Some(path),
+                None => self.dialogs.confirm_remove = Some((path, files)),
             }
         }
         if let Some(d) = self.dialogs.remove_with_branch.take() {
@@ -2400,7 +2421,7 @@ mod tests {
         });
         assert!(d.any_open());
         d.new_worktree = None;
-        d.confirm_remove = Some(PathBuf::from("/tmp/wt"));
+        d.confirm_remove = Some((PathBuf::from("/tmp/wt"), vec![]));
         assert!(d.any_open());
         d.confirm_remove = None;
         d.remove_with_branch = Some(RemoveWithBranchDialog {
@@ -3053,6 +3074,7 @@ mod tests {
             path: PathBuf::from("/p/proj/feat-x"),
             branch: "feat/x".into(),
             dirty,
+            dirty_files: vec![],
             base: "origin/feat/x".into(),
             unmerged,
         }
@@ -3076,6 +3098,43 @@ mod tests {
         assert_eq!(button, "Remove and delete anyway");
         let (_, lost, _) = remove_with_branch_text(&plan(false, 1));
         assert!(lost[0].contains(": 1 commit not on"), "{lost:?}");
+        let mut p = plan(true, 0);
+        p.dirty_files = (0..7).map(|i| format!("f{i}")).collect();
+        let (_, lost, _) = remove_with_branch_text(&p);
+        assert_eq!(
+            lost,
+            ["Its uncommitted and untracked files will be lost: f0, f1, f2, f3, f4 and 2 more."]
+        );
+    }
+
+    #[test]
+    fn remove_question_names_the_files_lost() {
+        let wt = Path::new("/p/proj.worktrees/feat-x");
+        let files = ["scratch.txt".to_string(), "a.txt".to_string()];
+        assert_eq!(
+            remove_question(wt, false, &files),
+            "/p/proj.worktrees/feat-x has uncommitted changes to scratch.txt, a.txt. They \
+             will be lost. Remove it anyway?"
+        );
+        assert_eq!(
+            remove_question(wt, false, &[]),
+            "/p/proj.worktrees/feat-x has uncommitted changes. Remove it anyway?"
+        );
+        assert!(remove_question(wt, true, &files).contains("is missing"));
+    }
+
+    #[test]
+    fn stash_conflict_notice_names_the_files() {
+        assert_eq!(
+            stash_conflict_notice(&["a.txt".into()]),
+            "Stash applied with conflicts in a.txt"
+        );
+        let many: Vec<String> = (0..6).map(|i| format!("f{i}")).collect();
+        assert_eq!(
+            stash_conflict_notice(&many),
+            "Stash applied with conflicts in f0, f1, f2, f3, f4 and 1 more"
+        );
+        assert_eq!(stash_conflict_notice(&[]), "Stash applied with conflicts");
     }
 
     #[test]

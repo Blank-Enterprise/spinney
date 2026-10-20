@@ -156,6 +156,9 @@ impl LogStream {
             dir,
             &[
                 "log",
+                // Stashes have their own sidebar section; their WIP, index and untracked
+                // commits aren't history.
+                "--exclude=refs/stash",
                 "--all",
                 "--topo-order",
                 "-z",
@@ -342,6 +345,25 @@ mod tests {
             .map(|r| (r.commit.subject.as_str(), r.commit.refs.as_str()))
             .collect();
         assert_eq!(got, [("loose", "HEAD"), ("init", "main")]);
+    }
+
+    #[test]
+    fn log_stream_leaves_out_stashes() {
+        let tmp = repo();
+        let g = |args: &[&str]| git::run(tmp.path(), args).unwrap();
+        std::fs::write(tmp.path().join("f"), "a").unwrap();
+        g(&["add", "f"]);
+        g(&["commit", "-q", "-m", "init"]);
+        std::fs::write(tmp.path().join("f"), "b").unwrap();
+        std::fs::write(tmp.path().join("new"), "u").unwrap();
+        g(&["stash", "push", "-q", "-u", "-m", "wip"]);
+        let mut s = LogStream::open(tmp.path()).unwrap();
+        let rows = s.next_page(10).unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.commit.subject.as_str(), r.commit.refs.as_str()))
+            .collect();
+        assert_eq!(got, [("init", "HEAD -> main")]);
     }
 
     #[test]

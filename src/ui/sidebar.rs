@@ -112,6 +112,17 @@ struct Ctx<'a> {
     current: Option<&'a str>,
     /// Branches checked out in any of the project's worktrees.
     checked_out: &'a [&'a str],
+    /// Rows show hover tooltips (see `branch_drop::row_tips_shown`).
+    tips: bool,
+}
+
+/// `r` with hover `text`, unless tooltips are off while a branch is dragged or dropped.
+fn tip(r: egui::Response, tips: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    if tips {
+        r.on_hover_text(text)
+    } else {
+        r
+    }
 }
 
 /// Draw `nodes`: folders start open and collapse; a filter opens them all so every match shows.
@@ -140,9 +151,8 @@ fn tree(
                     header
                 };
                 let r = header.show(ui, |ui| tree(ui, id, children, filtering, cx, actions));
-                let r = r
-                    .header_response
-                    .on_hover_text(format!("{path} · {}", count(children)));
+                let text = format!("{path} · {}", count(children));
+                let r = tip(r.header_response, cx.tips, text);
                 // Only the branches drawn under it: with a filter on, the ones that match.
                 let branches = leaves(children);
                 let remote = branches.first().is_some_and(|b| b.remote);
@@ -179,9 +189,8 @@ fn branch_row(ui: &mut egui::Ui, b: &Branch, cx: Ctx, actions: &mut Vec<Action>)
     } else {
         leaf.to_string()
     };
-    let r = row(ui, b.head, text, track.trim().to_string())
-        .interact(egui::Sense::drag())
-        .on_hover_text(&b.name);
+    let r = row(ui, b.head, text, track.trim().to_string()).interact(egui::Sense::drag());
+    let r = tip(r, cx.tips, &b.name);
     super::branch_drop::drag_and_drop(ui, &r, &b.name, actions);
     branch_menu(&r, b, cx, actions);
 }
@@ -252,6 +261,20 @@ pub fn worktree_hover(wt: &Worktree) -> Vec<String> {
     lines.push(format!("Folder {}", folder_name(&wt.path)));
     lines.push(wt.path.display().to_string());
     lines
+}
+
+/// A worktree row's tooltip: the agent line leads, in the accent colour; the path is muted.
+fn worktree_tip(ui: &mut egui::Ui, wt: &Worktree) {
+    let lines = worktree_hover(wt);
+    let agent = agent_id(&wt.path).is_some();
+    for (i, line) in lines.iter().enumerate() {
+        let color = match i {
+            0 if agent => theme::ACCENT_TEXT,
+            _ if i + 1 == lines.len() => theme::MUTED,
+            _ => theme::TEXT,
+        };
+        ui.label(RichText::new(line).color(color));
+    }
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -497,7 +520,8 @@ impl Split {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) {
+/// `tips`: rows show hover tooltips (off while a branch is dragged or its drop menu is open).
+pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, tips: bool, actions: &mut Vec<Action>) {
     if let Some(view) = worktrees_view::toggle(ui, tab.view) {
         actions.push(Action::SetView(view));
     }
@@ -562,6 +586,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
         let cx = Ctx {
             current,
             checked_out: &checked_out,
+            tips,
         };
         split.section(ui, 0, "Local", local.len(), |ui| {
             let nodes = branch_tree(&local);
@@ -589,19 +614,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             for wt in worktrees {
                 let (text, tag) = worktree_label(wt);
                 let on = wt.path == tab.active_worktree;
-                let r = row(ui, on, format!("▣ {text}"), tag).on_hover_ui(|ui| {
-                    // The agent line leads, in the accent colour; the path is muted.
-                    let lines = worktree_hover(wt);
-                    let agent = agent_id(&wt.path).is_some();
-                    for (i, line) in lines.iter().enumerate() {
-                        let color = match i {
-                            0 if agent => theme::ACCENT_TEXT,
-                            _ if i + 1 == lines.len() => theme::MUTED,
-                            _ => theme::TEXT,
-                        };
-                        ui.label(RichText::new(line).color(color));
-                    }
-                });
+                let r = row(ui, on, format!("▣ {text}"), tag);
+                let r = match tips {
+                    true => r.on_hover_ui(|ui| worktree_tip(ui, wt)),
+                    false => r,
+                };
                 // A missing folder can't be opened, only located or removed.
                 if r.clicked() && !wt.prunable {
                     actions.push(Action::ActivateWorktree(wt.path.clone()));
@@ -670,7 +687,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .collect();
         split.section(ui, 4, "Tags", tags.len(), |ui| {
             for t in tags {
-                tag_row(ui, t, actions);
+                tag_row(ui, t, tips, actions);
             }
         });
     }
@@ -687,8 +704,9 @@ pub fn tag_hover(t: &Tag) -> String {
 }
 
 /// One tag: its full name (`release/1.0` stays whole, not foldered), the commit on the right.
-fn tag_row(ui: &mut egui::Ui, t: &Tag, actions: &mut Vec<Action>) {
-    let r = row(ui, false, t.name.clone(), short_sha(&t.target).into()).on_hover_text(tag_hover(t));
+fn tag_row(ui: &mut egui::Ui, t: &Tag, tips: bool, actions: &mut Vec<Action>) {
+    let r = row(ui, false, t.name.clone(), short_sha(&t.target).into());
+    let r = tip(r, tips, tag_hover(t));
     r.context_menu(|ui| {
         // The peeled commit, so it goes through the detached-HEAD checks like a commit does.
         if ui.button("Checkout").clicked() {
