@@ -503,6 +503,66 @@ mod tests {
         assert!(!file_diff(utf8.path(), "g.txt", false).unwrap().lossy);
     }
 
+    /// A type change is staged, unstaged and discarded as a whole file, both ways round.
+    #[test]
+    fn type_change_stages_unstages_and_discards_whole_file() {
+        use crate::status::{status, Change, Kind};
+        use std::os::unix::fs::symlink;
+        let link = |d: &Path| symlink("target", d.join("f")).unwrap();
+        let file = |d: &Path| fs::write(d.join("f"), "hi\n").unwrap();
+        type Make = fn(&Path);
+        let cases: [(Make, Make, Kind, Kind, &str, &str); 2] = [
+            (file, link, Kind::File, Kind::Symlink, "hi", "target"),
+            (link, file, Kind::Symlink, Kind::File, "target", "hi"),
+        ];
+        for (before, after, from, to, old, new) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path();
+            g(d, &["init", "-q"]);
+            before(d);
+            g(d, &["add", "."]);
+            commit(d, "init");
+            fs::remove_file(d.join("f")).unwrap();
+            after(d);
+            let t = Change::TypeChanged { from, to };
+
+            let st = status(d).unwrap();
+            assert_eq!(
+                st.unstaged.iter().map(|f| &f.change).collect::<Vec<_>>(),
+                [&t]
+            );
+            // Both sections of git's diff: the old side deleted, then the new one added.
+            let texts = |fd: &FileDiff| -> Vec<(LineKind, String)> {
+                let lines = fd.hunks.iter().flat_map(|h| &h.lines);
+                lines.map(|l| (l.kind, l.text.clone())).collect()
+            };
+            let want = vec![(LineKind::Del, old.into()), (LineKind::Add, new.into())];
+            assert_eq!(texts(&file_diff(d, "f", false).unwrap()), want);
+
+            stage_file(d, "f").unwrap();
+            let st = status(d).unwrap();
+            assert_eq!(
+                st.staged.iter().map(|f| &f.change).collect::<Vec<_>>(),
+                [&t]
+            );
+            assert!(st.unstaged.is_empty());
+            assert_eq!(texts(&file_diff(d, "f", true).unwrap()), want);
+
+            unstage_file(d, "f").unwrap();
+            let st = status(d).unwrap();
+            assert!(st.staged.is_empty());
+            assert_eq!(
+                st.unstaged.iter().map(|f| &f.change).collect::<Vec<_>>(),
+                [&t]
+            );
+
+            discard_file(d, "f", false).unwrap();
+            assert_eq!(status(d).unwrap(), Default::default());
+            let is_link = fs::symlink_metadata(d.join("f")).unwrap().is_symlink();
+            assert_eq!(is_link, from == Kind::Symlink, "{from:?} restored");
+        }
+    }
+
     #[test]
     fn unstage_before_first_commit() {
         let tmp = tempfile::tempdir().unwrap();

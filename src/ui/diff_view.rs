@@ -155,6 +155,9 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
             return;
         };
         ui.weak(if *staged { "staged" } else { "unstaged" });
+        if let Some(t) = change.type_label() {
+            ui.weak(t);
+        }
         let file = FileStatus {
             path: fd.path.clone(),
             change: (*change).clone(),
@@ -560,6 +563,10 @@ mod tests {
                 theirs: crate::status::Side::Deleted,
             }),
             Change::Renamed { from: "x".into() },
+            Change::TypeChanged {
+                from: crate::status::Kind::File,
+                to: crate::status::Kind::Symlink,
+            },
         ] {
             assert!(!line_staging(&c, &fd), "{c:?}");
         }
