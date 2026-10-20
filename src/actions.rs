@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::PullStrategy;
-use crate::project::{list_worktrees, Layout};
+use crate::project::{list_worktrees, same_dir, Layout};
 use crate::{git, refs};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -869,6 +869,14 @@ pub fn checkout(
 ) -> Result<CheckoutOutcome> {
     match layout {
         Layout::NormalClone => {
+            // A branch already in another worktree (Spinney's, an agent's): go there, as git
+            // refuses to check it out twice.
+            let elsewhere = list_worktrees(root)?.into_iter().find(|w| {
+                w.branch.as_deref() == Some(branch) && !same_dir(&w.path, active_worktree)
+            });
+            if let Some(w) = elsewhere {
+                return Ok(CheckoutOutcome::JumpTo(w.path));
+            }
             git::run(active_worktree, &["switch", branch])?;
             Ok(CheckoutOutcome::Switched)
         }
@@ -1953,6 +1961,23 @@ mod tests {
             refs::current_branch(&dir).unwrap().as_deref(),
             Some("feature/x")
         );
+    }
+
+    #[test]
+    fn checkout_normal_jumps_to_an_external_worktree() {
+        let (tmp, url, _parent) = fixture();
+        let dir = tmp.path().join("plain");
+        git::run(tmp.path(), &["clone", "-q", &url, "plain"]).unwrap();
+        // An agent's worktree, made with plain git, nested in the repo.
+        let agent = dir.join(".claude/worktrees/agent-1");
+        let agent_str = agent.to_str().unwrap();
+        git::run(&dir, &["worktree", "add", "-q", agent_str, "feature/x"]).unwrap();
+        let out = checkout(&dir, Layout::NormalClone, &dir, "feature/x").unwrap();
+        let CheckoutOutcome::JumpTo(p) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(p.canonicalize().unwrap(), agent.canonicalize().unwrap());
+        assert_eq!(refs::current_branch(&dir).unwrap().as_deref(), Some("main"));
     }
 
     #[test]

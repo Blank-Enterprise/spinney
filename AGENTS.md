@@ -1,6 +1,6 @@
 # Working on Spinney
 
-Spinney is a lightweight Git desktop client for macOS on Apple Silicon, written in Rust with egui (eframe 0.37). It's built around a worktree-first project layout: a `.bare` repo plus one folder per branch.
+Spinney is a lightweight Git desktop client for macOS on Apple Silicon, written in Rust with egui (eframe 0.37). It's built around worktrees: each project is a normal clone, with its worktrees beside it in `<project>.worktrees/`. Worktrees made by anything else (CLI, IDEs, agents) are found through `git worktree list`, never by folder name. Old `.bare` projects still open; #160 removes that layout.
 
 This file is for anyone changing the code, human or agent. Read it before your first change.
 
@@ -30,7 +30,7 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 | `src/stash.rs` | Stash list and actions, addressed by commit hash and not index. |
 | `src/mergetool.rs` | "Open in merge tool": runs `git mergetool --no-prompt` for a conflicted file with the configured tool, stdin closed. |
 | `src/convert.rs` | Converts a normal clone to the worktree layout, with an undo journal and rollback. |
-| `src/project.rs` | Layout detection, worktrees, clone and create. |
+| `src/project.rs` | Clone and create, worktrees (where they go, listing, repair and relink), and finding the project for any worktree folder. |
 | `src/refs.rs`, `src/status.rs`, `src/diff.rs`, `src/graph.rs` | Parse `for-each-ref`, `status`, `diff` and `log` output. |
 | `src/conflict.rs` | Parses a conflicted file's `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` blocks, and writes them back with a side picked for each (the built-in merge tool). |
 | `src/creds.rs`, `src/ssh.rs`, `src/github.rs` | Keychain tokens and the credential helper; per-space SSH keys; the GitHub API and device-flow sign-in. |

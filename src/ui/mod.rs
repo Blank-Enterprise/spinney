@@ -189,6 +189,10 @@ impl ProjectTab {
             }
             Err(e) => errors.push(format!("{}: {e:#}", root.display())),
         }
+        // Relink worktrees an agent or the user moved, before listing them.
+        if let Err(e) = project::repair(root) {
+            errors.push(format!("repairing worktrees: {e:#}"));
+        }
         let worktrees = match project::list_worktrees(root) {
             Ok(w) => w.into_iter().filter(|w| !w.is_bare).collect(),
             Err(e) => {
@@ -595,6 +599,8 @@ pub enum Action {
     DismissConvert(PathBuf),
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
+    /// Point a missing worktree at its new folder (`git worktree repair`).
+    LocateWorktree(PathBuf),
     /// Ask before removing a worktree and deleting its branch in one step.
     AskRemoveWithBranch(PathBuf),
     SelectCommit(usize),
@@ -1367,6 +1373,17 @@ impl SpinneyApp {
                     }
                 }
             }
+            Action::LocateWorktree(path) => {
+                let start = path.parent().map(Path::to_path_buf);
+                let picked = paths::pick_folder("Where is this worktree now?", start.as_deref());
+                if let (Some(new), Some(tab)) = (picked, self.tabs.get_mut(self.active_tab)) {
+                    if let Err(e) = project::relink(&tab.root, &[new]) {
+                        errors.push(format!("{e:#}"));
+                    }
+                    tab.refresh(&ctx, &mut errors);
+                }
+                ctx.request_repaint();
+            }
             Action::RemoveWorktree(path) => {
                 let dirty = git::run(&path, &["status", "--porcelain"])
                     .map(|s| !s.trim().is_empty())
@@ -1503,9 +1520,10 @@ impl SpinneyApp {
         }
     }
 
-    /// Whether to show the "normal clone" banner for `tab`.
-    fn offer_convert(&self, tab: &ProjectTab) -> bool {
-        tab.layout == Layout::NormalClone && !self.config.convert_dismissed.contains(&tab.root)
+    /// Whether to show the "normal clone" banner for `tab`. Never: a normal clone is now the
+    /// layout Spinney makes. #160 removes the conversion.
+    fn offer_convert(&self, _tab: &ProjectTab) -> bool {
+        false
     }
 
     /// Whether the centre shows the New Tab page instead of the active project.
@@ -2504,6 +2522,25 @@ mod tests {
             confirm_op: None,
             confirm_resolve: None,
         }
+    }
+
+    #[test]
+    fn opening_a_worktree_folder_opens_its_project_with_it_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let agent = root.join(".claude/worktrees/agent-1");
+        let agent_str = agent.to_str().unwrap();
+        crate::git::run(&root, &["worktree", "add", "-q", "-b", "a", agent_str]).unwrap();
+        let mut app = test_app(cfg(), &cfg_path);
+        app.apply(Action::OpenProject(agent.clone()));
+        assert_eq!(app.tabs.len(), 1, "{:?}", app.errors);
+        assert_eq!(app.tabs[0].root, root);
+        assert_eq!(app.tabs[0].active_worktree, agent);
+        assert!(app.config.spaces[0].projects.contains(&root));
+        app.apply(Action::OpenProject(root.clone()));
+        assert_eq!(app.tabs.len(), 1, "same tab");
     }
 
     #[test]

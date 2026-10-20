@@ -22,9 +22,22 @@ pub struct Worktree {
     pub branch: Option<String>,
     pub head: String,
     pub is_bare: bool,
+    /// The repo's own working tree (listed first): git can't remove it.
+    pub main: bool,
+    /// `git worktree lock`ed: Spinney won't remove it.
+    pub locked: bool,
+    /// Its folder is gone or moved: git can't reach it until it is located or removed.
+    pub prunable: bool,
 }
 
 pub fn detect(root: &Path) -> Result<Layout> {
+    if !root.exists() {
+        // Moved: opening it from the new place relinks its worktrees (`repair`).
+        bail!(
+            "{} no longer exists. If it moved, open it from its new folder",
+            root.display()
+        );
+    }
     let git = root.join(".git");
     if root.join(".bare").is_dir() && git.is_file() {
         Ok(Layout::WorktreeRoot)
@@ -148,8 +161,8 @@ pub fn check_branch_name(branch: &str) -> Result<()> {
     .map(|_| ())
 }
 
-/// New empty project at `<parent>/<name>`: `.bare` plus an orphan worktree for `branch`.
-/// No remote and no commit.
+/// New empty project at `<parent>/<name>`: a normal repo on `branch`. No remote and no
+/// commit.
 pub fn create_new(parent: &Path, name: &str, branch: &str, space: &Space) -> Result<PathBuf> {
     let root = claim_root(parent, name)?;
     let result = create_steps(parent, &root, branch, space);
@@ -160,28 +173,80 @@ pub fn create_new(parent: &Path, name: &str, branch: &str, space: &Space) -> Res
 }
 
 fn create_steps(parent: &Path, root: &Path, branch: &str, space: &Space) -> Result<()> {
-    let bare = root.join(".bare");
-    let bare_str = bare.to_str().context("non-UTF-8 path")?;
-    git::run(parent, &["init", "-q", "--bare", "-b", branch, bare_str])?;
-    std::fs::write(root.join(".git"), "gitdir: ./.bare\n")?;
-    let dir = format!("./{}", worktree_dir_name(branch));
-    git::run(
-        root,
-        &["worktree", "add", "-q", "--orphan", "-b", branch, &dir],
-    )?;
-    creds::configure_repo(&bare, space)
+    let root_str = root.to_str().context("non-UTF-8 path")?;
+    git::run(parent, &["init", "-q", "-b", branch, root_str])?;
+    creds::configure_repo(&root.join(".git"), space)
+}
+
+/// The project a folder belongs to: the main repo of any of its worktrees, wherever that
+/// worktree lives (Spinney's, an agent's, an IDE's). A `.git` or `.bare` common dir means
+/// its parent; any other bare repo is the project itself.
+pub fn project_root(dir: &Path) -> Result<PathBuf> {
+    let out = git::run(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .with_context(|| format!("{} is not a git project", dir.display()))?;
+    let common = PathBuf::from(out.trim());
+    let name = common.file_name().unwrap_or_default();
+    Ok(match common.parent() {
+        Some(parent) if name == ".git" || name == ".bare" => parent.to_path_buf(),
+        _ => common,
+    })
+}
+
+/// Same folder, through symlinks such as macOS's `/tmp` (git lists canonical paths).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || a.canonicalize().ok() == b.canonicalize().ok()
+}
+
+/// Relink worktrees that moved, or whose project moved: every listed worktree folder that
+/// still exists (git still knows where they are) plus every folder in `worktrees_dir` (finds
+/// ones renamed there). `git worktree repair` leaves healthy links alone.
+pub fn repair(root: &Path) -> Result<()> {
+    let mut paths: Vec<PathBuf> = list_worktrees(root)?
+        .into_iter()
+        .filter(|w| !w.is_bare && w.path.is_dir())
+        .map(|w| w.path)
+        .collect();
+    let dir = worktrees_dir(root);
+    if dir != root {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let renamed: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.join(".git").is_file() && !paths.contains(p))
+                .collect();
+            paths.extend(renamed);
+        }
+    }
+    relink(root, &paths)
+}
+
+/// `git worktree repair` for `paths`, e.g. a missing worktree's new location.
+pub fn relink(root: &Path, paths: &[PathBuf]) -> Result<()> {
+    let mut args = vec!["worktree".to_string(), "repair".to_string()];
+    for p in paths {
+        args.push(p.to_str().context("non-UTF-8 path")?.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    git::run(root, &refs).map(|_| ())
 }
 
 pub fn list_worktrees(root: &Path) -> Result<Vec<Worktree>> {
     let out = git::run(root, &["worktree", "list", "--porcelain"])?;
     Ok(out
         .split("\n\n")
-        .filter_map(|block| {
+        .enumerate()
+        .filter_map(|(i, block)| {
             let mut wt = Worktree {
                 path: PathBuf::new(),
                 branch: None,
                 head: String::new(),
                 is_bare: false,
+                main: i == 0,
+                locked: false,
+                prunable: false,
             };
             for line in block.lines() {
                 if let Some(p) = line.strip_prefix("worktree ") {
@@ -192,21 +257,37 @@ pub fn list_worktrees(root: &Path) -> Result<Vec<Worktree>> {
                     wt.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
                 } else if line == "bare" {
                     wt.is_bare = true;
+                } else if line == "locked" || line.starts_with("locked ") {
+                    wt.locked = true;
+                } else if line == "prunable" || line.starts_with("prunable ") {
+                    wt.prunable = true;
                 }
             }
+            wt.main &= !wt.is_bare;
             (!wt.path.as_os_str().is_empty()).then_some(wt)
         })
         .collect())
 }
 
+/// Where new worktrees go: `<parent>/<name>.worktrees`, beside the project and outside its
+/// working tree (so IDEs, search and builds don't see a copy). Old `.bare` projects keep
+/// theirs inside the root.
+pub fn worktrees_dir(root: &Path) -> PathBuf {
+    if detect(root).ok() == Some(Layout::WorktreeRoot) {
+        return root.to_path_buf();
+    }
+    let name = root.file_name().unwrap_or_default().to_string_lossy();
+    root.with_file_name(format!("{name}.worktrees"))
+}
+
 /// Target folder for `branch`, refusing before git runs if it already exists.
 fn free_target(root: &Path, branch: &str) -> Result<(PathBuf, String)> {
-    let dir = worktree_dir_name(branch);
-    let target = root.join(&dir);
+    let target = worktrees_dir(root).join(worktree_dir_name(branch));
     if target.exists() {
         bail!("{} already exists", target.display());
     }
-    Ok((target, format!("./{dir}")))
+    let arg = target.to_str().context("non-UTF-8 path")?.to_string();
+    Ok((target, arg))
 }
 
 /// Create worktree + new branch `branch` from `base`.
@@ -225,7 +306,9 @@ pub fn add_worktree_existing(root: &Path, branch: &str) -> Result<PathBuf> {
 
 pub fn remove_worktree(root: &Path, path: &Path, force: bool) -> Result<()> {
     let path_str = path.to_str().context("non-UTF-8 path")?;
+    // A missing folder has no changes to lose; git drops its record.
     if !force
+        && path.is_dir()
         && !git::run(path, &["status", "--porcelain"])?
             .trim()
             .is_empty()
@@ -284,6 +367,141 @@ mod tests {
         let (tmp, url, parent) = fixture();
         let root = clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).unwrap();
         (tmp, root)
+    }
+
+    /// Normal clone of the fixture; returns (tmp, root).
+    fn normal() -> (tempfile::TempDir, PathBuf) {
+        let (tmp, url, parent) = fixture();
+        let root = clone_into(&url, &parent, "proj", &space(), Layout::NormalClone).unwrap();
+        (tmp, root)
+    }
+
+    /// `git worktree add` run directly, as an agent or another tool would.
+    fn external(root: &Path, path: &Path, args: &[&str]) {
+        let p = path.to_str().unwrap();
+        let mut all = vec!["worktree", "add", "-q"];
+        all.extend_from_slice(args);
+        all.push(p);
+        git::run(root, &all).unwrap();
+    }
+
+    fn listed(root: &Path, path: &Path) -> Worktree {
+        list_worktrees(root)
+            .unwrap()
+            .into_iter()
+            .find(|w| same_dir(&w.path, path))
+            .unwrap_or_else(|| panic!("{} not listed", path.display()))
+    }
+
+    #[test]
+    fn add_worktree_goes_beside_the_project() {
+        let (_tmp, root) = normal();
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        assert_eq!(p, root.with_file_name("proj.worktrees").join("feature-new"));
+        assert_eq!(listed(&root, &p).branch.as_deref(), Some("feature/new"));
+        let main = listed(&root, &root);
+        assert!(main.main && !main.is_bare);
+        assert!(!listed(&root, &p).main);
+    }
+
+    #[test]
+    fn worktrees_made_outside_spinney_are_listed_resolved_and_removable() {
+        let (tmp, root) = normal();
+        let nested = root.join(".claude/worktrees/agent-1");
+        let sibling = root.with_file_name("proj.feature-x");
+        let elsewhere = tmp.path().join("elsewhere/wt");
+        let detached = tmp.path().join("detached");
+        let locked = tmp.path().join("locked");
+        external(&root, &nested, &["-b", "agent-1"]);
+        external(&root, &sibling, &[]);
+        git::run(&root, &["branch", "other", "main"]).unwrap();
+        // Path before the branch: `git worktree add <path> <branch>`.
+        let e = elsewhere.to_str().unwrap();
+        git::run(&root, &["worktree", "add", "-q", e, "other"]).unwrap();
+        external(&root, &detached, &["--detach"]);
+        external(&root, &locked, &["--lock", "-b", "held"]);
+        // The sibling was added with no branch argument: git named one after the folder.
+        for wt in [&nested, &sibling, &elsewhere, &detached, &locked] {
+            let got = project_root(wt).unwrap();
+            assert!(
+                same_dir(&got, &root),
+                "{} -> {}",
+                wt.display(),
+                got.display()
+            );
+            assert!(!listed(&root, wt).prunable);
+        }
+        assert_eq!(listed(&root, &detached).branch, None);
+        assert!(listed(&root, &locked).locked);
+        assert!(!listed(&root, &nested).locked);
+        for wt in [&nested, &sibling, &elsewhere, &detached] {
+            remove_worktree(&root, wt, false).unwrap();
+            assert!(!wt.exists());
+        }
+        assert!(remove_worktree(&root, &locked, false).is_err(), "locked");
+    }
+
+    #[test]
+    fn project_root_of_old_layout() {
+        let (_tmp, root) = cloned();
+        assert!(same_dir(&project_root(&root.join("main")).unwrap(), &root));
+        assert!(same_dir(&project_root(&root).unwrap(), &root));
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        assert_eq!(p, root.join("feature-new"), "inside the root, as before");
+    }
+
+    #[test]
+    fn repair_finds_a_worktree_renamed_beside_the_project() {
+        let (_tmp, root) = normal();
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        let renamed = p.with_file_name("renamed");
+        std::fs::rename(&p, &renamed).unwrap();
+        assert!(listed(&root, &p).prunable);
+        repair(&root).unwrap();
+        let wt = listed(&root, &renamed);
+        assert!(!wt.prunable);
+        assert_eq!(wt.branch.as_deref(), Some("feature/new"));
+        git::run(&renamed, &["status"]).unwrap();
+    }
+
+    #[test]
+    fn repair_after_the_project_folder_moves() {
+        let (_tmp, root) = normal();
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        let moved = root.with_file_name("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        assert!(git::run(&p, &["status"]).is_err(), "link broken");
+        repair(&moved).unwrap();
+        git::run(&p, &["status"]).unwrap();
+        assert!(same_dir(&project_root(&p).unwrap(), &moved));
+    }
+
+    #[test]
+    fn a_worktree_moved_elsewhere_is_missing_until_located() {
+        let (tmp, root) = normal();
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        let away = tmp.path().join("away");
+        std::fs::rename(&p, &away).unwrap();
+        repair(&root).unwrap();
+        assert!(
+            listed(&root, &p).prunable,
+            "repair can't know where it went"
+        );
+        relink(&root, std::slice::from_ref(&away)).unwrap();
+        assert!(!listed(&root, &away).prunable);
+        git::run(&away, &["status"]).unwrap();
+    }
+
+    #[test]
+    fn remove_a_missing_worktree() {
+        let (tmp, root) = normal();
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        std::fs::rename(&p, tmp.path().join("gone")).unwrap();
+        remove_worktree(&root, &p, false).unwrap();
+        assert!(list_worktrees(&root)
+            .unwrap()
+            .iter()
+            .all(|w| !same_dir(&w.path, &p)));
     }
 
     #[test]
@@ -427,20 +645,15 @@ mod tests {
     }
 
     #[test]
-    fn create_new_makes_empty_worktree_project() {
+    fn create_new_makes_empty_normal_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let root = create_new(tmp.path(), "fresh", "feature/x", &space()).unwrap();
         assert_eq!(root, tmp.path().join("fresh"));
-        assert!(root.join(".bare").is_dir());
-        assert_eq!(
-            std::fs::read_to_string(root.join(".git")).unwrap(),
-            "gitdir: ./.bare\n"
-        );
-        let wt = root.join("feature-x");
-        assert!(wt.is_dir());
+        assert!(root.join(".git").is_dir());
+        let wt = root.clone();
         let head = git::run(&wt, &["symbolic-ref", "--short", "HEAD"]).unwrap();
         assert_eq!(head.trim(), "feature/x");
-        assert_eq!(detect(&root).unwrap(), Layout::WorktreeRoot);
+        assert_eq!(detect(&root).unwrap(), Layout::NormalClone);
         let st = crate::status::status(&wt).unwrap();
         assert_eq!(st, crate::status::Status::default());
         let email = git::run(&wt, &["config", "user.email"]).unwrap();
@@ -451,7 +664,7 @@ mod tests {
         );
         // What opening the tab runs next must cope with an unborn branch.
         git::run(
-            &root.join(".bare"),
+            &root.join(".git"),
             &["commit-graph", "write", "--reachable"],
         )
         .unwrap();

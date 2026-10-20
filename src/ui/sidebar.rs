@@ -1,5 +1,5 @@
 use super::{theme, toolbar::folder_name, Action, ProjectTab};
-use crate::project::{Layout, Worktree};
+use crate::project::Worktree;
 use crate::refs::{Branch, Tag};
 use eframe::egui::{self, RichText};
 use std::path::Path;
@@ -107,7 +107,6 @@ pub fn folder_delete_label(remote: bool, path: &str, n: usize) -> Option<String>
 /// What a branch's menu needs to know about the project.
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
-    layout: Layout,
     /// The checked-out branch; None when HEAD is detached.
     current: Option<&'a str>,
     /// Branches checked out in any of the project's worktrees.
@@ -210,18 +209,33 @@ pub fn agent_id(path: &Path) -> Option<&str> {
 }
 
 /// A worktree's row: its branch (what you know it as) or the detached commit, and a muted
-/// "agent" tag for an agent's worktree. The folder goes in the hover.
+/// tag: "missing" (moved or deleted), "locked", or "agent". The folder goes in the hover.
 pub fn worktree_label(wt: &Worktree) -> (String, String) {
     let text = match &wt.branch {
         Some(b) => b.clone(),
         None => format!("detached at {}", short_sha(&wt.head)),
     };
-    let tag = if agent_id(&wt.path).is_some() {
+    let tag = if wt.prunable {
+        "missing"
+    } else if wt.locked {
+        "locked"
+    } else if agent_id(&wt.path).is_some() {
         "agent"
     } else {
         ""
     };
     (text, tag.into())
+}
+
+/// Why "Remove" is unavailable for a worktree, if it is.
+pub fn remove_blocked(wt: &Worktree) -> Option<&'static str> {
+    if wt.main {
+        Some("The project's own folder can't be removed as a worktree")
+    } else if wt.locked {
+        Some("Locked: unlock it with git worktree unlock first")
+    } else {
+        None
+    }
 }
 
 /// Hover lines for a worktree: the agent (if any), branch, folder and full path.
@@ -523,7 +537,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .filter_map(|w| w.branch.as_deref())
             .collect();
         let cx = Ctx {
-            layout: tab.layout,
             current,
             checked_out: &checked_out,
         };
@@ -566,19 +579,33 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                         ui.label(RichText::new(line).color(color));
                     }
                 });
-                if r.clicked() {
+                // A missing folder can't be opened, only located or removed.
+                if r.clicked() && !wt.prunable {
                     actions.push(Action::ActivateWorktree(wt.path.clone()));
                 }
+                let blocked = remove_blocked(wt);
                 r.context_menu(|ui| {
-                    if ui.button("Remove").clicked() {
+                    if wt.prunable && ui.button("Locate…").clicked() {
+                        actions.push(Action::LocateWorktree(wt.path.clone()));
+                        ui.close();
+                    }
+                    let remove = ui.add_enabled(blocked.is_none(), egui::Button::new("Remove"));
+                    if remove
+                        .on_disabled_hover_text(blocked.unwrap_or_default())
+                        .clicked()
+                    {
                         actions.push(Action::RemoveWorktree(wt.path.clone()));
                         ui.close();
                     }
+                    let why = blocked.or(wt.branch.is_none().then_some("Detached: no branch"));
                     let both = ui.add_enabled(
-                        wt.branch.is_some(),
+                        why.is_none() && !wt.prunable,
                         egui::Button::new("Remove worktree and delete branch…"),
                     );
-                    if both.on_disabled_hover_text("Detached: no branch").clicked() {
+                    if both
+                        .on_disabled_hover_text(why.unwrap_or("Missing: locate it first"))
+                        .clicked()
+                    {
                         actions.push(Action::AskRemoveWithBranch(wt.path.clone()));
                         ui.close();
                     }
@@ -695,26 +722,14 @@ pub fn fast_forward_item(b: &Branch, checked_out: &[&str]) -> Option<(String, Op
 }
 
 fn branch_menu(r: &egui::Response, b: &Branch, cx: Ctx, actions: &mut Vec<Action>) {
-    let Ctx {
-        layout, current, ..
-    } = cx;
+    let Ctx { current, .. } = cx;
     let name = b.name.as_str();
     r.context_menu(|ui| {
         if ui.button("Checkout").clicked() {
             actions.push(Action::Checkout(name.to_string()));
             ui.close();
         }
-        // Worktrees live beside `.bare`; in a normal clone they would nest in the working tree.
-        let r = ui
-            .add_enabled(
-                layout == Layout::WorktreeRoot,
-                egui::Button::new("New worktree from here"),
-            )
-            .on_disabled_hover_text(
-                "This project is a normal clone: right-click its tab and choose Convert to \
-                 worktree layout",
-            );
-        if r.clicked() {
+        if ui.button("New worktree from here").clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));
             ui.close();
         }
@@ -786,6 +801,9 @@ mod tests {
             branch: branch.map(str::to_string),
             head: "83174b7246c76c9b6426a95147a715f0d26bf6c6".into(),
             is_bare: false,
+            main: false,
+            locked: false,
+            prunable: false,
         }
     }
 
@@ -821,6 +839,29 @@ mod tests {
             worktree_label(&detached),
             ("detached at 83174b7".into(), String::new())
         );
+    }
+
+    #[test]
+    fn missing_and_locked_worktrees_are_tagged_and_guarded() {
+        let agent = "/p/spinney/.claude/worktrees/agent-1";
+        let missing = Worktree {
+            prunable: true,
+            locked: true,
+            ..wt(agent, Some("a"))
+        };
+        assert_eq!(worktree_label(&missing).1, "missing");
+        let locked = Worktree {
+            locked: true,
+            ..wt(agent, Some("a"))
+        };
+        assert_eq!(worktree_label(&locked).1, "locked");
+        assert!(remove_blocked(&locked).is_some());
+        let main = Worktree {
+            main: true,
+            ..wt("/p/spinney", Some("main"))
+        };
+        assert!(remove_blocked(&main).is_some());
+        assert_eq!(remove_blocked(&wt(agent, Some("a"))), None);
     }
 
     #[test]
