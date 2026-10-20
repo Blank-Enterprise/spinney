@@ -304,6 +304,8 @@ impl ProjectTab {
                     open_review_file(self, i, errors);
                 }
             }
+        } else if matches!(self.center, Center::Review(..)) {
+            self.center = Center::Graph; // only the Worktrees view shows one
         }
     }
 
@@ -1353,6 +1355,7 @@ impl SpinneyApp {
             Action::OpenInGit(path) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.view = worktrees_view::View::Git;
+                    tab.center = Center::Graph; // a review diff belongs to the Worktrees view
                 }
                 self.apply(Action::ActivateWorktree(path));
             }
@@ -2637,9 +2640,27 @@ mod tests {
         assert!(matches!(app.tabs[0].center, Center::Graph));
         assert_eq!(app.tabs[0].view, View::Worktrees, "back to the list");
 
+        // Open in Git view with a review file open: the graph, not that file (#179).
+        app.apply(Action::ReviewFile(0));
+        assert!(matches!(app.tabs[0].center, Center::Review(..)));
         app.apply(Action::OpenInGit(agent.clone()));
         assert_eq!(app.tabs[0].view, View::Git);
         assert_eq!(app.tabs[0].active_worktree, agent);
+        assert!(
+            matches!(app.tabs[0].center, Center::Graph),
+            "graph, not review"
+        );
+
+        // Nor does switching to the Git view, or worktree once there.
+        app.apply(Action::SetView(View::Worktrees));
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        app.apply(Action::SetView(View::Git));
+        assert!(matches!(app.tabs[0].center, Center::Graph));
+        app.apply(Action::SetView(View::Worktrees));
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        app.tabs[0].view = View::Git; // however it got there
+        app.apply(Action::ActivateWorktree(root.clone()));
+        assert!(matches!(app.tabs[0].center, Center::Graph));
         assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 
