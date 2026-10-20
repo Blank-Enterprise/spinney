@@ -26,6 +26,25 @@ pub struct Config {
     pub diff_inline: bool,
     /// Normal clones whose "convert to the worktree layout" banner was dismissed.
     pub convert_dismissed: Vec<PathBuf>,
+    /// External tool behind a conflicted file's "Open in merge tool".
+    pub merge_tool: MergeTool,
+}
+
+/// `merge_tool` in config.toml. Each named tool is a fixed command (see `mergetool.rs`),
+/// so it behaves the same whatever the user's own git config says.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeTool {
+    /// No "Open in merge tool" item.
+    #[default]
+    None,
+    /// `git mergetool` with the user's own `merge.tool` setting.
+    Git,
+    FileMerge,
+    Kaleidoscope,
+    #[serde(rename = "vscode")]
+    VsCode,
+    BeyondCompare,
 }
 
 impl Space {
@@ -104,6 +123,7 @@ mod tests {
             active_space: Some("work-abc123".into()),
             diff_inline: true,
             convert_dismissed: vec![PathBuf::from("/tmp/code/p")],
+            merge_tool: MergeTool::Kaleidoscope,
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), cfg);
@@ -121,6 +141,34 @@ mod tests {
         assert!(cfg.spaces[0].projects.is_empty());
         assert_eq!(cfg.spaces[0].default_clone_dir, None);
         assert_eq!(cfg.spaces[0].ssh_key, None, "older configs stay on HTTPS");
+    }
+
+    #[test]
+    fn config_without_merge_tool_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "diff_inline = true\n").unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.diff_inline);
+        assert_eq!(cfg.merge_tool, MergeTool::None);
+    }
+
+    #[test]
+    fn merge_tool_is_a_kebab_case_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "merge_tool = \"vscode\"\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().merge_tool,
+            MergeTool::VsCode
+        );
+        let cfg = Config {
+            merge_tool: MergeTool::BeyondCompare,
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("merge_tool = \"beyond-compare\""), "{text}");
     }
 
     #[test]

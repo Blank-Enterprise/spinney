@@ -20,7 +20,7 @@ use crate::refs::{self, Branch};
 use crate::stage::Direction;
 use crate::stash::{self, Stash};
 use crate::status::{self, FileStatus, Status};
-use crate::{creds, git};
+use crate::{creds, git, mergetool};
 use dialogs::{CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui::{self, Margin};
 use std::path::{Path, PathBuf};
@@ -335,6 +335,8 @@ enum JobKind {
     CommitGraph,
     /// Normal clone to worktree layout; the project's tab is closed while it runs.
     Convert,
+    /// An external merge tool, open until the user closes it.
+    MergeTool,
 }
 
 struct JobDone {
@@ -547,6 +549,8 @@ pub enum Action {
     OpenFile(String),
     /// Mark a conflicted file resolved; with conflict markers left, asks first.
     MarkResolved(String),
+    /// Merge a conflicted file in the configured external tool, as a job.
+    OpenInMergeTool(String),
     /// Ask before a resolution that drops work; `ConfirmResolve` runs it, `CancelResolve` hides it.
     AskResolve(Resolve),
     ConfirmResolve,
@@ -694,6 +698,10 @@ impl SpinneyApp {
             return self.convert_done(root, result);
         }
         if let Err(e) = result {
+            if kind == JobKind::MergeTool {
+                // The tool may have resolved some of it; show what's left.
+                self.refresh_tab(&root);
+            }
             match e.downcast::<actions::PushRejected>() {
                 Ok(rejected) => {
                     self.rejected_push = Some(RejectedPush {
@@ -730,20 +738,47 @@ impl SpinneyApp {
             | JobKind::Pull
             | JobKind::Push
             | JobKind::DeleteRemote
-            | JobKind::RenameRemote => {
+            | JobKind::RenameRemote
+            | JobKind::MergeTool => {
                 if kind == JobKind::Fetch {
                     if let Ok(common) = common_dir(&root) {
                         self.jobs.commit_graph(root.clone(), common);
                     }
                 }
-                let (ctx, mut errors) = (self.ctx.clone(), vec![]);
-                if let Some(tab) = self.tab_mut(&root) {
-                    tab.refresh(&ctx, &mut errors);
-                }
-                self.errors.extend(errors);
+                self.refresh_tab(&root);
             }
             JobKind::CommitGraph | JobKind::Convert => {}
         }
+    }
+
+    fn refresh_tab(&mut self, root: &Path) {
+        let (ctx, mut errors) = (self.ctx.clone(), vec![]);
+        if let Some(tab) = self.tab_mut(root) {
+            tab.refresh(&ctx, &mut errors);
+        }
+        self.errors.extend(errors);
+    }
+
+    /// Open `path` in the configured merge tool as a job; it ends when the tool closes.
+    fn open_in_merge_tool(&mut self, path: String) {
+        let tool = self.config.merge_tool;
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+        if self.jobs.running(JobKind::MergeTool, &root) {
+            return self
+                .errors
+                .push("A merge tool is already open for this project.".into());
+        }
+        if self.jobs.network_busy(&root) {
+            return self
+                .errors
+                .push("Wait for the running fetch, pull or push".into());
+        }
+        let work = move || mergetool::run(&wt, tool, &path);
+        self.jobs
+            .spawn(JobKind::MergeTool, root, String::new(), work);
     }
 
     /// Start a network job for the active tab.
@@ -933,6 +968,7 @@ impl SpinneyApp {
                     tab.open_file(&path, &mut errors);
                 }
             }
+            Action::OpenInMergeTool(path) => self.open_in_merge_tool(path),
             Action::MarkResolved(path) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     if tab.mark_resolved(&path, false, &mut errors) {
@@ -1604,6 +1640,7 @@ impl eframe::App for SpinneyApp {
         } else {
             self.tabs.get_mut(self.active_tab)
         };
+        let merge_tool = self.config.merge_tool;
         if let Some(tab) = tab {
             egui::Panel::left("sidebar")
                 .frame(theme::side_panel())
@@ -1614,7 +1651,9 @@ impl eframe::App for SpinneyApp {
                 .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(260.0)
-                .show(ui, |ui| changes::show(ui, tab, shortcuts, &mut actions));
+                .show(ui, |ui| {
+                    changes::show(ui, tab, shortcuts, merge_tool, &mut actions)
+                });
             let inline = self.config.diff_inline;
             let center = egui::Frame::new()
                 .fill(theme::BG)
@@ -1745,6 +1784,7 @@ mod tests {
             active_space: Some("a".into()),
             diff_inline: false,
             convert_dismissed: vec![],
+            ..Default::default()
         }
     }
 
