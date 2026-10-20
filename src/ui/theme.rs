@@ -1,4 +1,4 @@
-//! "Kraken Dark" palette, spacing and small styled building blocks, applied once at startup.
+//! "Spinney Dark" palette, spacing and small styled building blocks, applied once at startup.
 //! ponytail: dark only; a light theme can come later.
 
 use eframe::egui::{
@@ -61,7 +61,7 @@ pub const LANES: [Color32; 8] = [
 pub const WIDGET_R: u8 = 6;
 pub const CARD_R: u8 = 8;
 
-/// Make the dark style the Kraken Dark one and select it.
+/// Make the dark style the Spinney Dark one and select it.
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(Theme::Dark);
     ctx.style_mut_of(Theme::Dark, style);
@@ -166,7 +166,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_selects_kraken_dark() {
+    fn apply_selects_spinney_dark() {
         let ctx = egui::Context::default();
         ctx.set_theme(Theme::Light);
         apply(&ctx);

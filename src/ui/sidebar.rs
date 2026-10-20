@@ -4,7 +4,7 @@ use crate::refs::Branch;
 use eframe::egui::{self, RichText};
 use std::path::Path;
 
-/// Branches grouped by their `/` segments, GitKraken style: `feat/login` sits in `feat`.
+/// Branches grouped into folders by their `/` segments: `feat/login` sits in `feat`.
 #[derive(Debug, PartialEq)]
 pub enum Node<'a> {
     Folder {
@@ -479,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn branches_group_into_folders_like_gitkraken() {
+    fn branches_group_into_folders_by_slash() {
         let names = [
             "main",
             "feat/ui/menu",

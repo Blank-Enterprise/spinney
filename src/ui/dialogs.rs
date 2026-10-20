@@ -974,7 +974,7 @@ const REPO_ROW_H: f32 = 40.0;
 /// Width of the dialog's right pane.
 const PANE_W: f32 = 390.0;
 
-/// GitKraken-style "Clone a Repository" modal; `Some(true)` = clone, `Some(false)` = cancel
+/// The "Clone a Repository" modal; `Some(true)` = clone, `Some(false)` = cancel
 /// (or `edit_space`), `None` = still open.
 fn clone_dialog(ctx: &egui::Context, d: &mut CloneDialog) -> Option<bool> {
     d.poll();
@@ -1219,7 +1219,7 @@ fn paint_repo_row(ui: &egui::Ui, rect: Rect, repo: &github::Repo, selected: bool
         );
     }
 }
-/// GitKraken-style "Create a Repository" modal; `Some(true)` = create, `Some(false)` = cancel,
+/// The "Create a Repository" modal; `Some(true)` = create, `Some(false)` = cancel,
 /// `None` = still open.
 fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
     let (mut result, mut browse) = (None, false);

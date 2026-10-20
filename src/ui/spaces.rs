@@ -134,8 +134,8 @@ fn advanced(ui: &mut egui::Ui, e: &mut SpaceEdit) {
         });
 }
 
-/// Account section of a GitHub Enterprise (or other) space, as GitKraken does it: open the
-/// host's token page with everything filled in, then paste; or reuse the GitHub CLI's login.
+/// Account section of a GitHub Enterprise (or other) space: open the host's token page with
+/// everything filled in, then paste; or reuse the GitHub CLI's login.
 fn token_account(ui: &mut egui::Ui, e: &mut SpaceEdit) {
     let host = normalize_host(&e.host);
     ui.label(theme::section(&format!("{host} account")));
