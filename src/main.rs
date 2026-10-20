@@ -9,6 +9,7 @@ mod graph;
 mod mergetool;
 mod project;
 mod refs;
+mod review;
 mod ssh;
 mod stage;
 mod stash;

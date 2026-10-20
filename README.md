@@ -21,7 +21,9 @@ and work like its own. Moved ones are relinked when the project opens.
 - **Projects:** clone from a URL or by searching your repositories; create, open recent, and one
   tab per project. Opening any worktree folder opens its project.
 - **Worktrees:** add and remove them, or remove a worktree and delete its branch in one step.
-  Missing ones can be located or removed; locked ones are left alone.
+  Missing ones can be located or removed; locked ones are left alone. The **Worktrees** view
+  (toolbar toggle) lists every worktree and agent with how far each is from the default branch,
+  and shows what one changed since it branched, committed or not.
 - **Branches:** a sidebar grouped into folders, with checkout, create, rename (also on the remote),
   delete local and remote, and fast-forward without checking out. Merge or rebase from the branch
   menu, or drag one branch onto another.

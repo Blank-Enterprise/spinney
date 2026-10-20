@@ -12,6 +12,7 @@ mod sidebar;
 mod spaces;
 mod theme;
 mod toolbar;
+mod worktrees_view;
 
 use crate::actions::{self, CheckoutOutcome, MergeOutcome, Operation};
 use crate::config::{Config, PullStrategy, Space};
@@ -115,6 +116,9 @@ pub enum Center {
     Conflict(Box<conflict_view::ConflictView>),
     /// The built-in merge tool on a conflicted file.
     Merge(Box<merge_view::MergeEditor>),
+    /// A file a worktree changed since it branched, read-only, with where the change lives
+    /// ("committed", "uncommitted"…).
+    Review(Box<FileDiff>, &'static str),
 }
 
 pub struct ProjectTab {
@@ -154,6 +158,10 @@ pub struct ProjectTab {
     picked: Vec<usize>,
     /// The pull strategy `active_worktree`'s git config asks for (`pull.rebase`, `pull.ff`).
     git_pull: PullStrategy,
+    /// The commit graph, or the Worktrees view.
+    view: worktrees_view::View,
+    /// The Worktrees view's data, loaded while it shows.
+    review: worktrees_view::Review,
 }
 
 /// `<git common dir>` of a project: its `.git`.
@@ -228,6 +236,8 @@ impl ProjectTab {
             on_head: vec![],
             picked: vec![],
             git_pull: PullStrategy::default(),
+            view: worktrees_view::View::default(),
+            review: worktrees_view::Review::default(),
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -270,6 +280,9 @@ impl ProjectTab {
         self.selected_commit = None;
         self.commit_files.clear();
         self.reload_changes(errors);
+        if self.view == worktrees_view::View::Worktrees {
+            self.review.load(&self.root, &self.worktrees);
+        }
     }
 
     /// Branches, tags and HEAD: what a checkout, fetch or commit can change.
@@ -632,6 +645,14 @@ pub enum Action {
     CancelAmend,
     ToggleInline,
     CloseDiff,
+    /// The toolbar's Git | Worktrees toggle.
+    SetView(worktrees_view::View),
+    /// List what a worktree changed since it branched.
+    ReviewWorktree(PathBuf),
+    /// Show one of the listed changes (an index into `review.changes`).
+    ReviewFile(usize),
+    /// "Open in Git view": make a worktree active and show its graph.
+    OpenInGit(PathBuf),
     /// From the in-progress banner: `ContinueOp` goes on; `AskOpStep` asks before a Skip
     /// or Abort, which `ConfirmOpStep` runs and `CancelOpStep` drops.
     ContinueOp,
@@ -1155,7 +1176,10 @@ impl SpinneyApp {
             | Action::StageAll
             | Action::UnstageAll
             | Action::SetAmend(_)
-            | Action::CloseDiff => {
+            | Action::CloseDiff
+            | Action::SetView(_)
+            | Action::ReviewWorktree(_)
+            | Action::ReviewFile(_) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab_action(tab, action, &mut errors);
                 }
@@ -1291,6 +1315,12 @@ impl SpinneyApp {
                         tab.refresh(&ctx, &mut errors);
                     }
                 }
+            }
+            Action::OpenInGit(path) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.view = worktrees_view::View::Git;
+                }
+                self.apply(Action::ActivateWorktree(path));
             }
             Action::ActivateWorktree(path) => {
                 self.confirm_discard = None; // it was asked about the other worktree's files
@@ -1787,6 +1817,29 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
         Action::UnstageAll => tab.stage_all(true, errors),
         Action::SetAmend(on) => tab.set_amend(on, errors),
         Action::CloseDiff => tab.center = Center::Graph,
+        Action::SetView(view) => {
+            tab.view = view;
+            tab.center = Center::Graph;
+            if view == worktrees_view::View::Worktrees {
+                tab.review.load(&tab.root, &tab.worktrees);
+            }
+        }
+        Action::ReviewWorktree(path) => {
+            tab.center = Center::Graph;
+            tab.review.select(path);
+        }
+        Action::ReviewFile(i) => {
+            let Some(change) = tab.review.changes.get(i).cloned() else {
+                return;
+            };
+            let Some((wt, base)) = tab.review.base() else {
+                return;
+            };
+            match crate::review::file_since(wt, base, &change) {
+                Ok(fd) => tab.center = Center::Review(Box::new(fd), change.origin.label()),
+                Err(e) => errors.push(format!("{e:#}")),
+            }
+        }
         _ => {}
     }
 }
@@ -2074,6 +2127,9 @@ impl eframe::App for SpinneyApp {
                 }
                 if !matches!(tab.center, Center::Graph) {
                     return diff_view::show(ui, &mut tab.center, inline, &mut actions);
+                }
+                if tab.view == worktrees_view::View::Worktrees {
+                    return worktrees_view::show(ui, &tab.worktrees, &tab.review, &mut actions);
                 }
                 let wip = Some(tab.status.changed_files()).filter(|&n| n > 0);
                 let remotes = tab
@@ -2428,6 +2484,65 @@ mod tests {
         assert!(!listed(&app), "removed once confirmed");
         let q = dialogs::remove_question(&wt, true);
         assert!(q.contains("is missing") && q.contains("Locate"), "{q}");
+    }
+
+    #[test]
+    fn worktrees_view_lists_reviews_and_opens_a_worktree() {
+        use worktrees_view::View;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let agent = root.join(".claude/worktrees/agent-1");
+        let agent_str = agent.to_str().unwrap();
+        let g = |dir: &Path, args: &[&str]| crate::git::run(dir, args).unwrap();
+        g(
+            &root,
+            &["worktree", "add", "-q", "-b", "agent-1", agent_str],
+        );
+        std::fs::write(agent.join("done.txt"), "a\nb\n").unwrap();
+        g(&agent, &["add", "."]);
+        g(&agent, &["commit", "-q", "-m", "agent work"]);
+        std::fs::write(agent.join("wip.txt"), "w\n").unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        app.apply(Action::OpenProject(root.clone()));
+        assert!(
+            app.tabs[0].review.standings.is_empty(),
+            "not loaded in the Git view"
+        );
+
+        app.apply(Action::SetView(View::Worktrees));
+        let tab = &app.tabs[0];
+        assert_eq!(tab.view, View::Worktrees);
+        let s = tab
+            .review
+            .standings
+            .iter()
+            .find(|s| s.path == agent)
+            .unwrap();
+        assert_eq!((s.base.as_str(), s.counts), ("main", Some((1, 0))));
+
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        let paths: Vec<_> = app.tabs[0]
+            .review
+            .changes
+            .iter()
+            .map(|c| (c.path.as_str(), c.origin.label()))
+            .collect();
+        assert_eq!(paths, [("done.txt", "committed"), ("wip.txt", "untracked")]);
+
+        app.apply(Action::ReviewFile(0));
+        let Center::Review(fd, origin) = &app.tabs[0].center else {
+            panic!("no review diff")
+        };
+        assert_eq!((fd.path.as_str(), *origin), ("done.txt", "committed"));
+        app.apply(Action::CloseDiff);
+        assert!(matches!(app.tabs[0].center, Center::Graph));
+        assert_eq!(app.tabs[0].view, View::Worktrees, "back to the list");
+
+        app.apply(Action::OpenInGit(agent.clone()));
+        assert_eq!(app.tabs[0].view, View::Git);
+        assert_eq!(app.tabs[0].active_worktree, agent);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 
     #[test]
