@@ -1,4 +1,5 @@
 mod changes;
+mod conflict_view;
 mod dialogs;
 mod diff_view;
 mod graph_view;
@@ -106,6 +107,8 @@ pub enum Center {
     Diff(Box<diff_view::WorkDiff>),
     /// A file of the selected commit, read-only.
     CommitFile(Box<FileDiff>),
+    /// A conflicted working-copy file with its conflict blocks, read-only.
+    Conflict(Box<conflict_view::ConflictView>),
 }
 
 pub struct ProjectTab {
@@ -504,6 +507,8 @@ pub enum Action {
     SelectCommit(usize),
     DeselectCommit,
     OpenDiff(FileStatus, bool),
+    /// Show a conflicted file (by path) with its conflict blocks.
+    OpenConflict(String),
     OpenCommitFile(usize),
     /// Stage the file, or unstage it when the flag is set.
     StageFile(FileStatus, bool),
@@ -956,6 +961,7 @@ impl SpinneyApp {
             Action::SelectCommit(_)
             | Action::DeselectCommit
             | Action::OpenDiff(..)
+            | Action::OpenConflict(_)
             | Action::OpenCommitFile(_)
             | Action::StageFile(..)
             | Action::ApplyPatch(..)
@@ -1373,6 +1379,10 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
             tab.commit_files.clear();
         }
         Action::OpenDiff(f, staged) => tab.open_diff(f, staged, errors),
+        Action::OpenConflict(path) => {
+            let view = conflict_view::ConflictView::load(&tab.active_worktree, &path);
+            tab.center = Center::Conflict(Box::new(view));
+        }
         Action::OpenCommitFile(k) => tab.open_commit_file(k),
         Action::StageFile(f, unstage) => tab.stage_file(&f, unstage, errors),
         Action::ApplyPatch(p, dir) => tab.apply_patch(&p, dir, errors),
@@ -1600,6 +1610,9 @@ impl eframe::App for SpinneyApp {
                 .fill(theme::BG)
                 .inner_margin(Margin::symmetric(12, 6));
             egui::CentralPanel::default().frame(center).show(ui, |ui| {
+                if let Center::Conflict(view) = &tab.center {
+                    return conflict_view::show(ui, view, &mut actions);
+                }
                 if !matches!(tab.center, Center::Graph) {
                     return diff_view::show(ui, &mut tab.center, inline, &mut actions);
                 }
@@ -2137,5 +2150,60 @@ mod tests {
         app.apply(Action::AskDiscard(untracked));
         app.apply(Action::ConfirmDiscard);
         assert!(!d.join("new.txt").exists());
+    }
+
+    #[test]
+    fn conflict_view_opens_reloads_and_closes_when_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| git::run(d, args);
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Test User"],
+            &["config", "user.email", "test@example.com"],
+        ] {
+            g(args).unwrap();
+        }
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]).unwrap();
+        g(&["commit", "-qm", "init"]).unwrap();
+        g(&["switch", "-qc", "topic"]).unwrap();
+        std::fs::write(d.join("a.txt"), "topic\n").unwrap();
+        g(&["commit", "-qam", "topic"]).unwrap();
+        g(&["switch", "-q", "main"]).unwrap();
+        std::fs::write(d.join("a.txt"), "main\n").unwrap();
+        g(&["commit", "-qam", "main"]).unwrap();
+        assert!(g(&["merge", "topic"]).is_err(), "conflicts");
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        app.apply(Action::OpenConflict("a.txt".into()));
+        let Center::Conflict(v) = &app.tabs[0].center else {
+            panic!("conflict view open")
+        };
+        assert_eq!(v.head.as_deref(), Some("main"));
+        let conflicts = |app: &SpinneyApp| match &app.tabs[0].center {
+            Center::Conflict(v) => match &v.content {
+                conflict_view::Content::Text(c) => Some(crate::conflict::count(c)),
+                _ => None,
+            },
+            _ => None,
+        };
+        assert_eq!(conflicts(&app), Some(1));
+
+        // Edited outside: re-read on the next reload.
+        std::fs::write(d.join("a.txt"), "both\n").unwrap();
+        app.tabs[0].reload_changes(&mut app.errors);
+        assert_eq!(conflicts(&app), Some(0));
+
+        let f = app.tabs[0].status.conflicted[0].clone();
+        app.apply(Action::StageFile(f, false));
+        assert!(
+            matches!(app.tabs[0].center, Center::Graph),
+            "resolved: closed"
+        );
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 }

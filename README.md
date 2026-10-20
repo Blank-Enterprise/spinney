@@ -63,8 +63,8 @@ Spinney is early and under active development. The
 [roadmap (#31)](https://github.com/Blank-Enterprise/spinney/issues/31) lists what's planned, and the
 [milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's next. A merge or
 rebase that stops on conflicts stays in progress, with Continue, Skip and Abort in a banner, and each
-conflicted file can be opened, resolved with your or their version, or marked resolved. A conflict
-view and a merge tool are planned ([#12](https://github.com/Blank-Enterprise/spinney/issues/12)).
+conflicted file can be viewed with its conflict blocks highlighted, opened, resolved with your or
+their version, or marked resolved. A built-in merge tool is planned ([#12](https://github.com/Blank-Enterprise/spinney/issues/12)).
 
 ## Contributing
 
