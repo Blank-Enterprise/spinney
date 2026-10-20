@@ -79,14 +79,23 @@ fn count(nodes: &[Node]) -> usize {
         .sum()
 }
 
+/// What a branch's menu needs to know about the project.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    layout: Layout,
+    /// The checked-out branch; None when HEAD is detached.
+    current: Option<&'a str>,
+    /// Branches checked out in any of the project's worktrees.
+    checked_out: &'a [&'a str],
+}
+
 /// Draw `nodes`: folders start open and collapse; a filter opens them all so every match shows.
 fn tree(
     ui: &mut egui::Ui,
     id: &str,
     nodes: &[Node],
     filtering: bool,
-    layout: Layout,
-    current: Option<&str>,
+    cx: Ctx,
     actions: &mut Vec<Action>,
 ) {
     for n in nodes {
@@ -105,25 +114,17 @@ fn tree(
                 } else {
                     header
                 };
-                let r = header.show(ui, |ui| {
-                    tree(ui, id, children, filtering, layout, current, actions)
-                });
+                let r = header.show(ui, |ui| tree(ui, id, children, filtering, cx, actions));
                 r.header_response
                     .on_hover_text(format!("{path} · {}", count(children)));
             }
-            Node::Branch(b) => branch_row(ui, b, layout, current, actions),
+            Node::Branch(b) => branch_row(ui, b, cx, actions),
         }
     }
 }
 
 /// One branch: its last name segment, ✓ when checked out, ahead/behind on the right.
-fn branch_row(
-    ui: &mut egui::Ui,
-    b: &Branch,
-    layout: Layout,
-    current: Option<&str>,
-    actions: &mut Vec<Action>,
-) {
+fn branch_row(ui: &mut egui::Ui, b: &Branch, cx: Ctx, actions: &mut Vec<Action>) {
     let leaf = b.name.rsplit('/').next().unwrap_or(&b.name);
     let mut track = String::new();
     if b.ahead > 0 {
@@ -138,7 +139,7 @@ fn branch_row(
         leaf.to_string()
     };
     let r = row(ui, b.head, text, track.trim().to_string()).on_hover_text(&b.name);
-    branch_menu(&r, layout, b, current, actions);
+    branch_menu(&r, b, cx, actions);
 }
 
 /// Case-insensitive substring match of the sidebar filter on a branch or worktree name.
@@ -234,9 +235,19 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .iter()
             .find(|b| b.head && !b.remote)
             .map(|b| b.name.as_str());
+        let checked_out: Vec<&str> = tab
+            .worktrees
+            .iter()
+            .filter_map(|w| w.branch.as_deref())
+            .collect();
+        let cx = Ctx {
+            layout: tab.layout,
+            current,
+            checked_out: &checked_out,
+        };
         section(ui, "local", "Local", local.len(), true, |ui| {
             let nodes = branch_tree(&local);
-            tree(ui, "local", &nodes, filtering, tab.layout, current, actions);
+            tree(ui, "local", &nodes, filtering, cx, actions);
         });
         let remote: Vec<_> = tab
             .branches
@@ -246,9 +257,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
         section(ui, "remote", "Remote", remote.len(), true, |ui| {
             // `origin/feat/x`: the remote is the first folder level.
             let nodes = branch_tree(&remote);
-            tree(
-                ui, "remote", &nodes, filtering, tab.layout, current, actions,
-            );
+            tree(ui, "remote", &nodes, filtering, cx, actions);
         });
         let worktrees: Vec<_> = tab
             .worktrees
@@ -330,13 +339,30 @@ pub fn merge_labels(current: Option<&str>, branch: &str) -> Option<(String, Stri
     }
 }
 
-fn branch_menu(
-    r: &egui::Response,
-    layout: Layout,
-    b: &Branch,
-    current: Option<&str>,
-    actions: &mut Vec<Action>,
-) {
+/// "Fast-forward to origin/x" for a local branch behind its upstream, and why it is
+/// disabled (if it is): checked out somewhere, or diverged. None when not behind.
+pub fn fast_forward_item(b: &Branch, checked_out: &[&str]) -> Option<(String, Option<String>)> {
+    let up = b
+        .upstream
+        .as_deref()
+        .filter(|_| !b.remote && b.behind > 0)?;
+    let why = if checked_out.contains(&b.name.as_str()) {
+        Some(format!("{} is checked out: pull it there instead", b.name))
+    } else if b.ahead > 0 {
+        Some(format!(
+            "{} has diverged from {up}: check it out to merge or rebase",
+            b.name
+        ))
+    } else {
+        None
+    };
+    Some((format!("Fast-forward to {up}"), why))
+}
+
+fn branch_menu(r: &egui::Response, b: &Branch, cx: Ctx, actions: &mut Vec<Action>) {
+    let Ctx {
+        layout, current, ..
+    } = cx;
     let name = b.name.as_str();
     r.context_menu(|ui| {
         if ui.button("Checkout").clicked() {
@@ -356,6 +382,17 @@ fn branch_menu(
         if r.clicked() {
             actions.push(Action::NewWorktreeFrom(name.to_string()));
             ui.close();
+        }
+        if let Some((label, why)) = fast_forward_item(b, cx.checked_out) {
+            let r = ui.add_enabled(why.is_none(), egui::Button::new(label));
+            let r = match &why {
+                Some(why) => r.on_disabled_hover_text(why),
+                None => r,
+            };
+            if r.clicked() {
+                actions.push(Action::FastForward(name.to_string()));
+                ui.close();
+            }
         }
         if let Some((merge, rebase)) = merge_labels(current, name) {
             ui.separator();
@@ -556,6 +593,31 @@ mod tests {
             (merge.as_str(), rebase.as_str()),
             ("Merge feat/x…", "Rebase onto feat/x…")
         );
+    }
+
+    #[test]
+    fn fast_forward_offered_only_when_behind() {
+        let mut b = branch("main");
+        b.upstream = Some("origin/main".into());
+        assert_eq!(fast_forward_item(&b, &[]), None, "up to date");
+        b.behind = 2;
+        assert_eq!(
+            fast_forward_item(&b, &["feat/x"]),
+            Some(("Fast-forward to origin/main".into(), None))
+        );
+        let (_, why) = fast_forward_item(&b, &["main"]).unwrap();
+        assert_eq!(
+            why.as_deref(),
+            Some("main is checked out: pull it there instead")
+        );
+        b.ahead = 1;
+        let (_, why) = fast_forward_item(&b, &[]).unwrap();
+        assert!(why.unwrap().contains("diverged from origin/main"));
+        b.upstream = None;
+        assert_eq!(fast_forward_item(&b, &[]), None, "no upstream");
+        let mut r = branch("origin/main");
+        (r.remote, r.behind, r.upstream) = (true, 1, Some("x".into()));
+        assert_eq!(fast_forward_item(&r, &[]), None, "remote branch");
     }
 
     #[test]

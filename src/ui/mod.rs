@@ -497,6 +497,8 @@ pub enum Action {
     AskDeleteRemote(String),
     /// Ask for a new name for a local branch (refused when another worktree has it out).
     AskRename(String),
+    /// Move a local branch checked out nowhere up to its upstream (fast-forward only).
+    FastForward(String),
     /// Ask how to merge the branch (local or remote) into the checked-out one.
     AskMerge(String),
     /// Ask before rebasing the checked-out branch onto the branch (local or remote).
@@ -1046,6 +1048,24 @@ impl SpinneyApp {
             }
             Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
             Action::AskRename(branch) => self.ask_rename(branch, &mut errors),
+            Action::FastForward(branch) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    // A fetch may be moving the upstream it goes to.
+                    if self.jobs.network_busy(&tab.root) {
+                        errors.push("Wait for the running fetch, pull or push".into());
+                    } else {
+                        let res = actions::fast_forward(&tab.active_worktree, &branch);
+                        tab.refresh(&ctx, &mut errors);
+                        match res {
+                            Ok(MergeOutcome::UpToDate) => {
+                                self.notices.push(format!("{branch} is already up to date"))
+                            }
+                            Ok(_) => {}
+                            Err(e) => errors.push(format!("{e:#}")),
+                        }
+                    }
+                }
+            }
             Action::AskMerge(branch) => self.ask_merge(branch, false, &mut errors),
             Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
             Action::NewBranch(base) => {
