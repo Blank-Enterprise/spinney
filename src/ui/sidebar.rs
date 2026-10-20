@@ -138,7 +138,10 @@ fn branch_row(ui: &mut egui::Ui, b: &Branch, cx: Ctx, actions: &mut Vec<Action>)
     } else {
         leaf.to_string()
     };
-    let r = row(ui, b.head, text, track.trim().to_string()).on_hover_text(&b.name);
+    let r = row(ui, b.head, text, track.trim().to_string())
+        .interact(egui::Sense::drag())
+        .on_hover_text(&b.name);
+    super::branch_drop::drag_and_drop(ui, &r, &b.name, actions);
     branch_menu(&r, b, cx, actions);
 }
 

@@ -1,3 +1,4 @@
+mod branch_drop;
 mod changes;
 mod conflict_view;
 mod dialogs;
@@ -502,6 +503,10 @@ pub enum Action {
     AskRename(String),
     /// Move a local branch checked out nowhere up to its upstream (fast-forward only).
     FastForward(String),
+    /// Move the first branch (checked out nowhere) up to the second, fast-forward only.
+    FastForwardTo(String, String),
+    /// A branch was dropped onto another (dragged, target, where): opens the drop menu.
+    DropBranch(String, String, egui::Pos2),
     /// Ask how to merge the branch (local or remote) into the checked-out one.
     AskMerge(String),
     /// Ask before rebasing the checked-out branch onto the branch (local or remote).
@@ -1077,23 +1082,10 @@ impl SpinneyApp {
             }
             Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
             Action::AskRename(branch) => self.ask_rename(branch, &mut errors),
-            Action::FastForward(branch) => {
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    // A fetch may be moving the upstream it goes to.
-                    if self.jobs.network_busy(&tab.root) {
-                        errors.push("Wait for the running fetch, pull or push".into());
-                    } else {
-                        let res = actions::fast_forward(&tab.active_worktree, &branch);
-                        tab.refresh(&ctx, &mut errors);
-                        match res {
-                            Ok(MergeOutcome::UpToDate) => {
-                                self.notices.push(format!("{branch} is already up to date"))
-                            }
-                            Ok(_) => {}
-                            Err(e) => errors.push(format!("{e:#}")),
-                        }
-                    }
-                }
+            Action::FastForward(branch) => self.fast_forward(branch, None, &mut errors),
+            Action::FastForwardTo(branch, to) => self.fast_forward(branch, Some(to), &mut errors),
+            Action::DropBranch(dragged, target, pos) => {
+                self.drop_branch(dragged, target, pos, &mut errors)
             }
             Action::AskMerge(branch) => self.ask_merge(branch, false, &mut errors),
             Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
@@ -1168,6 +1160,72 @@ impl SpinneyApp {
             }
         }
         self.errors.extend(errors);
+    }
+
+    /// Fast-forward `branch` to `to`, or to its upstream when `to` is None.
+    fn fast_forward(&mut self, branch: String, to: Option<String>, errors: &mut Vec<String>) {
+        let ctx = self.ctx.clone();
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        // A fetch may be moving the upstream it goes to.
+        if self.jobs.network_busy(&tab.root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let wt = tab.active_worktree.clone();
+        let res = match &to {
+            Some(to) => actions::fast_forward_to(&wt, &branch, to),
+            None => actions::fast_forward(&wt, &branch),
+        };
+        tab.refresh(&ctx, errors);
+        match res {
+            Ok(MergeOutcome::UpToDate) => {
+                self.notices.push(format!("{branch} is already up to date"))
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
+
+    /// Open the drop menu for `dragged` dropped onto `target` in the active tab.
+    fn drop_branch(
+        &mut self,
+        dragged: String,
+        target: String,
+        pos: egui::Pos2,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let wt = &tab.active_worktree;
+        let current = match refs::current_branch(wt) {
+            Ok(c) => c,
+            Err(e) => return errors.push(format!("{e:#}")),
+        };
+        let remote = |name: &str| tab.branches.iter().any(|b| b.remote && b.name == name);
+        let target_remote = remote(&target);
+        let checked_out = tab
+            .worktrees
+            .iter()
+            .any(|w| w.branch.as_deref() == Some(&target));
+        let fast_forward = !target_remote
+            && !checked_out
+            && actions::can_fast_forward(wt, &target, &dragged).unwrap_or(false);
+        let facts = branch_drop::DropFacts {
+            current: current.as_deref(),
+            dragged_remote: remote(&dragged),
+            target_remote,
+            fast_forward,
+        };
+        let choices = branch_drop::drop_choices(&dragged, &target, facts);
+        self.dialogs.drop_menu = Some(branch_drop::DropMenu {
+            root: tab.root.clone(),
+            dragged,
+            target,
+            choices,
+            pos,
+        });
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -1792,7 +1850,13 @@ impl eframe::App for SpinneyApp {
                     .filter(|b| b.remote)
                     .map(|b| b.name.as_str())
                     .collect();
-                let out = graph_view::show(ui, &tab.rows, tab.selected_commit, wip, &remotes);
+                let branches = tab.branches.iter().map(|b| b.name.as_str()).collect();
+                let names = graph_view::Names {
+                    remotes: &remotes,
+                    branches: &branches,
+                };
+                let out = graph_view::show(ui, &tab.rows, tab.selected_commit, wip, names);
+                actions.extend(out.drops);
                 if let Some(i) = out.clicked {
                     actions.push(Action::SelectCommit(i));
                 }
@@ -1814,6 +1878,7 @@ impl eframe::App for SpinneyApp {
                 }
             });
         }
+        branch_drop::preview(&ctx);
         self.dialogs(&ctx);
         for a in actions {
             self.apply(a);

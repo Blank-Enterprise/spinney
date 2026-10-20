@@ -370,6 +370,8 @@ pub(super) struct Dialogs {
     pub(super) convert: Option<ConvertDialog>,
     pub(super) merge: Option<MergeDialog>,
     pub(super) rebase: Option<RebaseDialog>,
+    /// The menu shown after dropping one branch onto another.
+    pub(super) drop_menu: Option<super::branch_drop::DropMenu>,
 }
 
 /// Convert-to-worktree-layout confirm screen; `plan` holds the refusal when it cannot run.
@@ -402,6 +404,7 @@ impl Dialogs {
             || self.rename_branch.is_some()
             || self.merge.is_some()
             || self.rebase.is_some()
+            || self.drop_menu.is_some()
     }
 }
 
@@ -673,6 +676,19 @@ impl SpinneyApp {
                 (Some(true), Ok(name)) => self.rename_branch(d, name),
                 (Some(false), _) => {}
                 _ => self.dialogs.rename_branch = Some(d),
+            }
+        }
+        if let Some(m) = self.dialogs.drop_menu.take() {
+            // Only for the tab it was dropped in.
+            let here = self.asking_tab(Some(m.root.clone())).is_some();
+            match super::branch_drop::menu(ctx, &m) {
+                _ if !here => {}
+                Some(Some(kind)) => {
+                    let action = super::branch_drop::choice_action(kind, &m.dragged, &m.target);
+                    self.apply(action);
+                }
+                Some(None) => {}
+                None => self.dialogs.drop_menu = Some(m),
             }
         }
         if let Some(mut d) = self.dialogs.merge.take() {
