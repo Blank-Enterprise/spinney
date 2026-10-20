@@ -329,6 +329,91 @@ pub fn abort_op(worktree: &Path, op: Operation) -> Result<()> {
     Ok(())
 }
 
+/// Which version of a conflicted file to keep. Mine is always the user's branch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Version {
+    Mine,
+    Theirs,
+}
+
+/// git's name for `version` during `op`: `--ours` is HEAD, which during a rebase is the
+/// branch being rebased onto, so there mine is `--theirs`. A stash pop (no operation)
+/// keeps HEAD as ours too.
+pub fn git_side(op: Option<Operation>, version: Version) -> &'static str {
+    let rebase = op == Some(Operation::Rebase);
+    match (version, rebase) {
+        (Version::Mine, false) | (Version::Theirs, true) => "--ours",
+        (Version::Theirs, false) | (Version::Mine, true) => "--theirs",
+    }
+}
+
+/// Resolve `path` with `version`, dropping the other side and any edits to the file. When
+/// that version deleted the file, it is removed (`git rm`).
+pub fn use_version(
+    worktree: &Path,
+    op: Option<Operation>,
+    path: &str,
+    version: Version,
+) -> Result<()> {
+    let side = git_side(op, version);
+    let stage = if side == "--ours" { "2" } else { "3" };
+    // `<mode> <sha> <stage>\t<path>` per index entry; a side that deleted it has none.
+    let out = git::run(
+        worktree,
+        &["--literal-pathspecs", "ls-files", "-u", "-z", "--", path],
+    )?;
+    if out.is_empty() {
+        bail!("{path} is not conflicted");
+    }
+    let kept = out
+        .split('\0')
+        .filter_map(|e| e.split_once('\t'))
+        .any(|(meta, _)| meta.rsplit(' ').next() == Some(stage));
+    if !kept {
+        git::run(worktree, &["--literal-pathspecs", "rm", "-q", "--", path])?;
+        return Ok(());
+    }
+    git::run(
+        worktree,
+        &["--literal-pathspecs", "checkout", side, "--", path],
+    )?;
+    git::run(worktree, &["--literal-pathspecs", "add", "--", path])?;
+    Ok(())
+}
+
+/// Lines git writes around a conflict: `<<<<<<< ours` and `>>>>>>> theirs`. A lone
+/// `=======` is left out, as it is also a Markdown heading underline.
+pub fn has_conflict_markers(text: &str) -> bool {
+    text.lines().any(|l| {
+        let marker = |m: &str| l == m || l.strip_prefix(m).is_some_and(|r| r.starts_with(' '));
+        marker("<<<<<<<") || marker(">>>>>>>")
+    })
+}
+
+/// Mark `path` resolved as it is in the worktree (deleted, if it is gone). Without `anyway`
+/// a text file still holding conflict markers is refused: false, and nothing changes.
+pub fn mark_resolved(worktree: &Path, path: &str, anyway: bool) -> Result<bool> {
+    if !anyway {
+        if let Ok(bytes) = std::fs::read(worktree.join(path)) {
+            let text = !bytes.contains(&0);
+            if text && has_conflict_markers(&String::from_utf8_lossy(&bytes)) {
+                return Ok(false);
+            }
+        }
+    }
+    git::run(worktree, &["--literal-pathspecs", "add", "-A", "--", path])?;
+    Ok(true)
+}
+
+/// Open `path` in its default macOS app, as a double-click in Finder would.
+pub fn open_file(path: &Path) -> Result<()> {
+    let out = std::process::Command::new("open").arg(path).output()?;
+    if !out.status.success() {
+        bail!("open: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 pub fn fetch(dir: &Path) -> Result<()> {
     git::run(dir, &["fetch", "--all", "--prune"])?;
     Ok(())
@@ -1169,6 +1254,104 @@ mod tests {
         assert_eq!(head_message(&main).unwrap(), "main edit");
         let err = skip_op(&main, Operation::Merge).unwrap_err();
         assert!(err.to_string().contains("can't skip"), "{err}");
+    }
+
+    fn read(dir: &Path, file: &str) -> String {
+        std::fs::read_to_string(dir.join(file)).unwrap()
+    }
+
+    #[test]
+    fn mine_is_ours_except_during_a_rebase() {
+        use Version::*;
+        for op in [None, Some(Operation::Merge), Some(Operation::CherryPick)] {
+            assert_eq!(git_side(op, Mine), "--ours", "{op:?}");
+            assert_eq!(git_side(op, Theirs), "--theirs", "{op:?}");
+        }
+        assert_eq!(git_side(Some(Operation::Revert), Mine), "--ours");
+        assert_eq!(git_side(Some(Operation::Rebase), Mine), "--theirs");
+        assert_eq!(git_side(Some(Operation::Rebase), Theirs), "--ours");
+    }
+
+    #[test]
+    fn rebase_use_mine_keeps_the_branch_being_rebased() {
+        for (version, want) in [(Version::Mine, "main\n"), (Version::Theirs, "other\n")] {
+            let (_tmp, _root, main) = conflicting();
+            rebase(&main, "other").unwrap();
+            let op = in_progress(&main).unwrap();
+            assert_eq!(op, Some(Operation::Rebase));
+            use_version(&main, op, "a.txt", version).unwrap();
+            assert_eq!(read(&main, "a.txt"), want, "{version:?}");
+            assert!(unmerged(&main).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn merge_use_mine_then_continue_makes_a_clean_merge_commit() {
+        let (_tmp, _root, main) = conflicting();
+        let before = head(&main, "HEAD");
+        let out = merge(&main, "other", MergeMode::NoFf).unwrap();
+        assert_eq!(out, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        let op = in_progress(&main).unwrap();
+        use_version(&main, op, "a.txt", Version::Mine).unwrap();
+        assert_eq!(read(&main, "a.txt"), "main\n");
+        assert_eq!(
+            continue_op(&main, Operation::Merge).unwrap(),
+            MergeOutcome::Done
+        );
+        assert_eq!(in_progress(&main).unwrap(), None);
+        assert!(g(&main, &["status", "--porcelain"]).is_empty());
+        let parents = g(&main, &["log", "-1", "--format=%P"]);
+        assert_eq!(parents, format!("{before} {}", head(&main, "other")));
+        assert_eq!(g(&main, &["show", "HEAD:a.txt"]), "main");
+    }
+
+    #[test]
+    fn delete_modify_conflicts_rm_for_the_deleting_side() {
+        for (version, gone) in [(Version::Mine, false), (Version::Theirs, true)] {
+            let (_tmp, _root, main) = conflicting();
+            g(&main, &["switch", "-q", "other"]);
+            g(&main, &["rm", "-q", "a.txt"]);
+            g(&main, &["commit", "-qm", "delete a"]);
+            g(&main, &["switch", "-q", "main"]);
+            let out = merge(&main, "other", MergeMode::NoFf).unwrap();
+            assert_eq!(out, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+            use_version(&main, Some(Operation::Merge), "a.txt", version).unwrap();
+            assert_eq!(!main.join("a.txt").exists(), gone, "{version:?}");
+            assert!(unmerged(&main).unwrap().is_empty());
+            continue_op(&main, Operation::Merge).unwrap();
+            let tree = g(&main, &["ls-tree", "--name-only", "HEAD"]);
+            assert_eq!(!tree.lines().any(|l| l == "a.txt"), gone, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn mark_resolved_refuses_markers_unless_asked_anyway() {
+        let (_tmp, _root, main) = conflicting();
+        merge(&main, "other", MergeMode::NoFf).unwrap();
+        assert!(read(&main, "a.txt").contains("<<<<<<< HEAD"));
+        assert!(!mark_resolved(&main, "a.txt", false).unwrap());
+        assert_eq!(unmerged(&main).unwrap(), ["a.txt"], "unchanged");
+        assert!(mark_resolved(&main, "a.txt", true).unwrap());
+        assert!(unmerged(&main).unwrap().is_empty());
+        g(&main, &["merge", "--abort"]);
+
+        merge(&main, "other", MergeMode::NoFf).unwrap();
+        std::fs::write(main.join("a.txt"), "Title\n=======\nboth\n").unwrap();
+        assert!(
+            mark_resolved(&main, "a.txt", false).unwrap(),
+            "underline only"
+        );
+        assert!(use_version(&main, None, "a.txt", Version::Mine).is_err());
+    }
+
+    #[test]
+    fn conflict_markers_need_the_angle_lines() {
+        assert!(has_conflict_markers(
+            "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n"
+        ));
+        assert!(has_conflict_markers(">>>>>>>\n"));
+        assert!(!has_conflict_markers("Title\n=======\n"));
+        assert!(!has_conflict_markers("<<<<<<<<< not one\n<<<<<<<x\n"));
     }
 
     #[test]

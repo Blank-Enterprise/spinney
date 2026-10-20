@@ -1532,11 +1532,8 @@ mod tests {
         assert!(app.dialogs.rebase.is_none());
     }
 
-    #[test]
-    fn conflicted_merge_shows_the_banner_until_continued_or_aborted() {
-        use super::super::in_progress::Step;
-        use super::super::Action;
-        use crate::actions::Operation;
+    /// An app with one tab on a repo whose `main` and `topic` change `a.txt` differently.
+    fn conflicting_app() -> (tempfile::TempDir, tempfile::TempDir, SpinneyApp) {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = super::super::tests::test_app(
             super::super::tests::cfg(),
@@ -1559,11 +1556,25 @@ mod tests {
         g(&["commit", "-qam", "main"]);
         let space = app.space().unwrap();
         app.open_tab(d, &space);
-        let merge = |app: &mut SpinneyApp| {
-            app.apply(Action::AskMerge("topic".into()));
-            let m = app.dialogs.merge.take().expect("dialog open");
-            app.merge(m);
-        };
+        (tmp, proj, app)
+    }
+
+    /// Merge `topic` into the checked-out branch through the dialog.
+    fn merge_topic(app: &mut SpinneyApp) {
+        app.apply(super::super::Action::AskMerge("topic".into()));
+        let m = app.dialogs.merge.take().expect("dialog open");
+        app.merge(m);
+    }
+
+    #[test]
+    fn conflicted_merge_shows_the_banner_until_continued_or_aborted() {
+        use super::super::in_progress::Step;
+        use super::super::Action;
+        use crate::actions::Operation;
+        let (_tmp, proj, mut app) = conflicting_app();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap();
+        let merge = merge_topic;
 
         merge(&mut app);
         assert!(app.errors.is_empty(), "{:?}", app.errors);
@@ -1600,6 +1611,36 @@ mod tests {
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, None);
         assert_eq!(g(&["log", "-1", "--format=%P"]).split(' ').count(), 2);
+    }
+
+    #[test]
+    fn resolve_with_mine_after_markers_are_refused_then_continue() {
+        use super::super::{Action, Resolve};
+        use crate::actions::Version;
+        let (_tmp, proj, mut app) = conflicting_app();
+        let d = proj.path();
+        merge_topic(&mut app);
+
+        // Mark resolved with the markers still in: asks instead.
+        app.apply(Action::MarkResolved("a.txt".into()));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].status.conflicted.len(), 1);
+        let asked = app.confirm_resolve.as_ref().map(|(_, w)| w.clone());
+        assert_eq!(asked, Some(Resolve::Anyway("a.txt".into())));
+        app.apply(Action::CancelResolve);
+
+        let f = app.tabs[0].status.conflicted[0].clone();
+        app.apply(Action::AskResolve(Resolve::Use(f, Version::Mine)));
+        assert_eq!(app.tabs[0].status.conflicted.len(), 1, "only asked");
+        app.apply(Action::ConfirmResolve);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert!(app.tabs[0].status.conflicted.is_empty());
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "main\n");
+
+        app.apply(Action::ContinueOp);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].operation, None);
+        assert!(app.tabs[0].status.changed_files() == 0);
     }
 
     #[test]

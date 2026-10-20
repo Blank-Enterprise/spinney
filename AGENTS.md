@@ -40,7 +40,7 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 - **UI events become `Action`s.** Widgets push an `Action`, and `SpinneyApp::apply` handles it. Add a variant rather than mutating state from a widget.
 - **Slow or network git runs as a job.** Use `Jobs::spawn` (fetch, pull, push, clone, conversion, remote branch delete). Check `jobs.network_busy(root)` before anything that touches the same worktree, as stash and merge do. Local operations (commit, checkout, merge, rebase, stash) currently run on the UI thread. #16 tracks moving the slow ones off it.
 - **Confirmations:**
-  - inline bars use `confirm_discard`, `confirm_amend`, `rejected_push` and `confirm_op`, found through `asking_tab`;
+  - inline bars use `confirm_discard`, `confirm_amend`, `rejected_push`, `confirm_op` and `confirm_resolve`, found through `asking_tab`;
   - modals use `egui::Modal` with the `danger()` button in `ui/dialogs.rs`;
   - pending bars are tied to a project root, and `forget_pending` clears them when a project is converted.
 - **Pure logic first.** Keep decisions (labels, enabled states, git argument lists, parsers) in pure functions with unit tests, and keep the egui code thin. The UI isn't tested by rendering, so there are no screenshot tests.
@@ -49,7 +49,7 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 
 ## Safety rules (these protect users' work)
 
-- **Destructive actions always confirm**, naming what is lost: discard, branch delete, reset, force push, stash drop.
+- **Destructive actions always confirm**, naming what is lost: discard, branch delete, reset, force push, stash drop, use mine/theirs.
 - **Never `git push --force`.** Force pushes use `--force-with-lease=<ref>:<sha>`, pinned to the commit the user was shown.
 - **A stopped merge, rebase, cherry-pick or revert is always visible.** Conflicts stay in place under the in-progress banner (Continue, Skip, Abort…), never silently half-done. A squash merge has no MERGE_HEAD for the banner to drive, so its conflicts are undone instead. See `actions::stopped`.
 - **Paths go to git as literal pathspecs** (`--literal-pathspecs`). Deleting untracked files only ever deletes a regular file inside the worktree.
