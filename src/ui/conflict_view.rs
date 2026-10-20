@@ -151,6 +151,14 @@ pub fn show(ui: &mut egui::Ui, view: &ConflictView, actions: &mut Vec<Action>) {
             if ui.add(close).on_hover_text("Close (Esc)").clicked() {
                 actions.push(Action::CloseDiff);
             }
+            if matches!(view.content, Content::Text(_)) {
+                let merge = ui
+                    .add(theme::primary("Merge…"))
+                    .on_hover_text("Pick a side for each conflict, or edit the result");
+                if merge.clicked() {
+                    actions.push(Action::OpenMerge(view.path.clone()));
+                }
+            }
         });
     });
     let chunks = match &view.content {

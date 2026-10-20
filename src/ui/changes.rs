@@ -489,6 +489,13 @@ impl ProjectTab {
             Ok(op) => self.operation = op,
             Err(e) => errors.push(format!("in progress: {e:#}")),
         }
+        if let Center::Merge(e) = &self.center {
+            // Picks and typing stay; Save checks the file is still as it was read.
+            if !self.status.conflicted.iter().any(|f| f.path == e.path) {
+                self.center = Center::Graph; // resolved some other way
+            }
+            return;
+        }
         if let Center::Conflict(v) = &self.center {
             let path = v.path.clone();
             self.center = if self.status.conflicted.iter().any(|f| f.path == path) {
@@ -651,6 +658,28 @@ impl ProjectTab {
                 self.mark_resolved(path, true, errors);
             }
         }
+    }
+
+    /// Save the built-in merge tool's result and mark the file resolved. With conflict
+    /// markers left the file is saved but not marked, and this returns its path to ask about.
+    pub(super) fn save_merge(&mut self, errors: &mut Vec<String>) -> Option<String> {
+        let Center::Merge(e) = &self.center else {
+            return None;
+        };
+        let path = e.path.clone();
+        let res = actions::save_resolution(&self.active_worktree, &path, &e.original, &e.result);
+        let marked = match res {
+            Ok(marked) => marked,
+            Err(e) => {
+                errors.push(format!("{e:#}"));
+                return None;
+            }
+        };
+        // Saved: show the file as it now is (closing once it's resolved).
+        let view = ConflictView::load(&self.active_worktree, &path);
+        self.center = Center::Conflict(Box::new(view));
+        self.after_stage(errors);
+        (!marked).then_some(path)
     }
 
     pub(super) fn open_file(&self, path: &str, errors: &mut Vec<String>) {

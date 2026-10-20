@@ -4,6 +4,7 @@ mod dialogs;
 mod diff_view;
 mod graph_view;
 mod in_progress;
+mod merge_view;
 mod new_tab;
 mod paths;
 mod sidebar;
@@ -20,7 +21,7 @@ use crate::refs::{self, Branch};
 use crate::stage::Direction;
 use crate::stash::{self, Stash};
 use crate::status::{self, FileStatus, Status};
-use crate::{creds, git, mergetool};
+use crate::{conflict, creds, git, mergetool};
 use dialogs::{CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog};
 use eframe::egui::{self, Margin};
 use std::path::{Path, PathBuf};
@@ -109,6 +110,8 @@ pub enum Center {
     CommitFile(Box<FileDiff>),
     /// A conflicted working-copy file with its conflict blocks, read-only.
     Conflict(Box<conflict_view::ConflictView>),
+    /// The built-in merge tool on a conflicted file.
+    Merge(Box<merge_view::MergeEditor>),
 }
 
 pub struct ProjectTab {
@@ -520,6 +523,17 @@ pub enum Action {
     OpenDiff(FileStatus, bool),
     /// Show a conflicted file (by path) with its conflict blocks.
     OpenConflict(String),
+    /// Built-in merge tool: open it on a conflicted file, pick (or un-pick) a conflict's
+    /// side, `StartOverMerge` with no typing to lose, and Save. `AskMergeEditor` asks on
+    /// the editor's bar before losing work; `ConfirmMergeEditor` goes ahead and
+    /// `CancelMergeEditor` doesn't.
+    OpenMerge(String),
+    PickConflict(usize, conflict::Pick),
+    StartOverMerge,
+    SaveMerge,
+    AskMergeEditor(merge_view::Ask),
+    ConfirmMergeEditor,
+    CancelMergeEditor,
     OpenCommitFile(usize),
     /// Stage the file, or unstage it when the flag is set.
     StageFile(FileStatus, bool),
@@ -1007,10 +1021,23 @@ impl SpinneyApp {
                 }
                 self.confirm_amend = None;
             }
+            Action::SaveMerge => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if let Some(path) = tab.save_merge(&mut errors) {
+                        self.confirm_resolve = Some((tab.root.clone(), Resolve::Anyway(path)));
+                    }
+                }
+            }
             Action::SelectCommit(_)
             | Action::DeselectCommit
             | Action::OpenDiff(..)
             | Action::OpenConflict(_)
+            | Action::OpenMerge(_)
+            | Action::PickConflict(..)
+            | Action::StartOverMerge
+            | Action::AskMergeEditor(_)
+            | Action::ConfirmMergeEditor
+            | Action::CancelMergeEditor
             | Action::OpenCommitFile(_)
             | Action::StageFile(..)
             | Action::ApplyPatch(..)
@@ -1458,6 +1485,22 @@ impl SpinneyApp {
 
 /// Changes-panel and diff-view actions on the active tab.
 fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
+    // Anything that would replace the merge editor asks first when it holds work.
+    let replaces = matches!(
+        action,
+        Action::OpenDiff(..)
+            | Action::OpenConflict(_)
+            | Action::OpenMerge(_)
+            | Action::OpenCommitFile(_)
+            | Action::SelectCommit(_)
+            | Action::CloseDiff
+    );
+    if let Center::Merge(e) = &mut tab.center {
+        if replaces && e.dirty() {
+            e.ask = Some(merge_view::Ask::Close);
+            return;
+        }
+    }
     match action {
         Action::SelectCommit(i) => tab.select_commit(i, errors),
         Action::DeselectCommit => {
@@ -1468,6 +1511,40 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
         Action::OpenConflict(path) => {
             let view = conflict_view::ConflictView::load(&tab.active_worktree, &path);
             tab.center = Center::Conflict(Box::new(view));
+        }
+        Action::OpenMerge(path) => match merge_view::MergeEditor::load(&tab.active_worktree, &path)
+        {
+            Ok(e) => tab.center = Center::Merge(Box::new(e)),
+            Err(e) => errors.push(format!("{e:#}")),
+        },
+        Action::PickConflict(i, pick) => {
+            if let Center::Merge(e) = &mut tab.center {
+                e.pick(i, pick);
+            }
+        }
+        Action::StartOverMerge => {
+            if let Center::Merge(e) = &mut tab.center {
+                e.start_over();
+            }
+        }
+        Action::AskMergeEditor(ask) => {
+            if let Center::Merge(e) = &mut tab.center {
+                e.ask = Some(ask);
+            }
+        }
+        Action::CancelMergeEditor => {
+            if let Center::Merge(e) = &mut tab.center {
+                e.ask = None;
+            }
+        }
+        Action::ConfirmMergeEditor => {
+            if let Center::Merge(e) = &mut tab.center {
+                match e.ask.take() {
+                    Some(merge_view::Ask::Close) => tab.center = Center::Graph,
+                    Some(merge_view::Ask::StartOver) => e.start_over(),
+                    None => {}
+                }
+            }
         }
         Action::OpenCommitFile(k) => tab.open_commit_file(k),
         Action::StageFile(f, unstage) => tab.stage_file(&f, unstage, errors),
@@ -1701,6 +1778,9 @@ impl eframe::App for SpinneyApp {
             egui::CentralPanel::default().frame(center).show(ui, |ui| {
                 if let Center::Conflict(view) = &tab.center {
                     return conflict_view::show(ui, view, &mut actions);
+                }
+                if let Center::Merge(e) = &mut tab.center {
+                    return merge_view::show(ui, e, &mut actions);
                 }
                 if !matches!(tab.center, Center::Graph) {
                     return diff_view::show(ui, &mut tab.center, inline, &mut actions);
@@ -2240,6 +2320,101 @@ mod tests {
         app.apply(Action::AskDiscard(untracked));
         app.apply(Action::ConfirmDiscard);
         assert!(!d.join("new.txt").exists());
+    }
+
+    #[test]
+    fn merge_editor_saves_picks_and_asks_about_markers_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| git::run(d, args);
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Test User"],
+            &["config", "user.email", "test@example.com"],
+        ] {
+            g(args).unwrap();
+        }
+        let write = |text: &str| {
+            for f in ["a.txt", "b.txt"] {
+                std::fs::write(d.join(f), format!("{text}\n")).unwrap();
+            }
+        };
+        write("base");
+        g(&["add", "."]).unwrap();
+        g(&["commit", "-qm", "init"]).unwrap();
+        g(&["switch", "-qc", "topic"]).unwrap();
+        write("topic");
+        g(&["commit", "-qam", "topic"]).unwrap();
+        g(&["switch", "-q", "main"]).unwrap();
+        write("main");
+        g(&["commit", "-qam", "main"]).unwrap();
+        assert!(g(&["merge", "topic"]).is_err(), "conflicts");
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        // Both sides, theirs first: saved and resolved, and the view closes.
+        app.apply(Action::OpenConflict("a.txt".into()));
+        app.apply(Action::OpenMerge("a.txt".into()));
+        assert!(matches!(app.tabs[0].center, Center::Merge(_)));
+        app.apply(Action::PickConflict(0, conflict::Pick::TheirsThenOurs));
+        app.tabs[0].reload_changes(&mut app.errors);
+        let Center::Merge(e) = &app.tabs[0].center else {
+            panic!("a reload keeps the picks")
+        };
+        assert_eq!(e.result, "topic\nmain\n");
+        app.apply(Action::SaveMerge);
+        assert_eq!(
+            std::fs::read_to_string(d.join("a.txt")).unwrap(),
+            "topic\nmain\n"
+        );
+        assert!(
+            matches!(app.tabs[0].center, Center::Graph),
+            "resolved: closed"
+        );
+        let conflicted = |app: &SpinneyApp| app.tabs[0].status.conflicted.len();
+        assert_eq!(conflicted(&app), 1);
+        assert!(app.confirm_resolve.is_none());
+
+        // Nothing picked: saved as is, then the usual "mark resolved anyway?" bar.
+        app.apply(Action::OpenMerge("b.txt".into()));
+        app.apply(Action::SaveMerge);
+        assert!(matches!(
+            &app.confirm_resolve,
+            Some((_, Resolve::Anyway(p))) if p == "b.txt"
+        ));
+        app.apply(Action::ConfirmResolve);
+        assert_eq!(conflicted(&app), 0);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+    }
+
+    #[test]
+    fn merge_editor_asks_before_losing_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        git::run(d, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(d.join("f"), "<<<<<<< HEAD\nm\n=======\nt\n>>>>>>> x\n").unwrap();
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+        app.apply(Action::OpenMerge("f".into()));
+        app.apply(Action::PickConflict(0, conflict::Pick::Ours));
+        app.apply(Action::AskMergeEditor(merge_view::Ask::Close));
+        app.apply(Action::CancelMergeEditor);
+        let Center::Merge(e) = &app.tabs[0].center else {
+            panic!("still open")
+        };
+        assert_eq!((e.result.as_str(), e.ask), ("m\n", None));
+        // Opening something else in the centre asks too.
+        app.apply(Action::OpenConflict("f".into()));
+        let Center::Merge(e) = &app.tabs[0].center else {
+            panic!("still open")
+        };
+        assert_eq!(e.ask, Some(merge_view::Ask::Close));
+        app.apply(Action::ConfirmMergeEditor);
+        assert!(matches!(app.tabs[0].center, Center::Graph));
     }
 
     #[test]
