@@ -1,4 +1,4 @@
-use super::theme;
+use super::{branch_drop, theme, Action};
 use crate::graph::Row;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::collections::HashSet;
@@ -21,6 +21,17 @@ pub struct GraphOutput {
     pub clicked: Option<usize>,
     pub wip_clicked: bool,
     pub near_end: bool,
+    /// A branch label dropped onto another label.
+    pub drops: Vec<Action>,
+}
+
+/// Branch names the labels are matched against.
+#[derive(Clone, Copy)]
+pub struct Names<'a> {
+    /// Remote-tracking branches, drawn neutral.
+    pub remotes: &'a HashSet<&'a str>,
+    /// Every branch, local or remote: the labels that can be dragged and dropped on.
+    pub branches: &'a HashSet<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -81,12 +92,13 @@ pub fn show(
     rows: &[Row],
     selected: Option<usize>,
     wip: Option<usize>,
-    remotes: &HashSet<&str>,
+    names: Names,
 ) -> GraphOutput {
     let mut out = GraphOutput {
         clicked: None,
         wip_clicked: false,
         near_end: false,
+        drops: vec![],
     };
     if rows.is_empty() && wip.is_none() {
         ui.weak("No commits yet.");
@@ -132,7 +144,15 @@ pub fn show(
                         if resp.clicked() {
                             out.clicked = Some(i);
                         }
-                        paint_row(ui, rect, &rows[i], text_x, now, remotes);
+                        let pills = paint_row(ui, rect, &rows[i], text_x, now, names);
+                        // Branch labels drag onto each other; a plain click still selects.
+                        for (j, (r, name)) in pills.into_iter().enumerate() {
+                            let label = ui.interact(r, resp.id.with(j), Sense::click_and_drag());
+                            if label.clicked() {
+                                out.clicked = Some(i);
+                            }
+                            branch_drop::drag_and_drop(ui, &label, name, &mut out.drops);
+                        }
                     }
                 }
             }
@@ -199,7 +219,15 @@ fn paint_wip(ui: &egui::Ui, rect: Rect, files: usize) {
     );
 }
 
-fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, text_x: f32, now: i64, remotes: &HashSet<&str>) {
+/// Paint one commit; returns the visible branch labels and their rects.
+fn paint_row<'a>(
+    ui: &egui::Ui,
+    rect: Rect,
+    row: &'a Row,
+    text_x: f32,
+    now: i64,
+    names: Names,
+) -> Vec<(Rect, &'a str)> {
     let painter = ui.painter();
     let x = |lane: usize| lane_x(rect, lane);
     let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
@@ -237,12 +265,20 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, text_x: f32, now: i64, remote
             .intersect(ui.clip_rect()),
     );
     let mut cx = rect.left() + text_x;
-    for p in parse_refs(&row.commit.refs, remotes) {
+    let mut labels = vec![];
+    for p in parse_refs(&row.commit.refs, names.remotes) {
         let (fill, fg) = match p.kind {
             PillKind::Remote => (theme::BORDER, theme::TEXT),
             _ => (color(row.lane), ON_PILL),
         };
+        let left = cx;
         cx = pill(&main, cx, mid, p.text, fill, fg, p.kind == PillKind::Head);
+        let r = Rect::from_min_max(Pos2::new(left, top), Pos2::new(cx - 6.0, bottom));
+        let r = r.intersect(main.clip_rect());
+        // Tags and a detached HEAD aren't branches.
+        if names.branches.contains(p.text) && r.is_positive() {
+            labels.push((r, p.text));
+        }
     }
     main.text(
         Pos2::new(cx, mid),
@@ -274,6 +310,7 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &Row, text_x: f32, now: i64, remote
         small,
         theme::MUTED,
     );
+    labels
 }
 
 /// Slot in `lanes` holding commit `id`, preferring `prefer` when several do.

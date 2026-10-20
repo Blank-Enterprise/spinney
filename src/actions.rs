@@ -783,6 +783,13 @@ pub fn fast_forward(worktree: &Path, branch: &str) -> Result<MergeOutcome> {
     fast_forward_to(worktree, branch, short)
 }
 
+/// Whether local `branch` can move forward to `target`: it is behind and not diverged.
+pub fn can_fast_forward(worktree: &Path, branch: &str, target: &str) -> Result<bool> {
+    let old = rev_parse(worktree, &format!("refs/heads/{branch}"))?;
+    let new = rev_parse(worktree, &format!("{target}^{{commit}}"))?;
+    Ok(old != new && is_ancestor(worktree, &old, &new)?)
+}
+
 /// Move local `branch` forward to `target` when that only adds commits, like
 /// `git fetch . target:branch`. Refused for a branch any worktree has checked out (its
 /// files would no longer match) and when the two have diverged.
@@ -1360,6 +1367,26 @@ mod tests {
         create_branch(&main, "topic", "main").unwrap();
         let err = fast_forward(&main, "topic").unwrap_err();
         assert!(err.to_string().contains("no upstream"), "{err}");
+    }
+
+    #[test]
+    fn fast_forward_to_another_branch() {
+        let (_tmp, _root, main) = cloned();
+        g(&main, &["branch", "feature/x", "origin/feature/x"]);
+        create_branch(&main, "base", "origin/main").unwrap();
+        assert!(can_fast_forward(&main, "base", "feature/x").unwrap());
+        assert!(
+            !can_fast_forward(&main, "feature/x", "base").unwrap(),
+            "ahead"
+        );
+        assert!(
+            !can_fast_forward(&main, "base", "main").unwrap(),
+            "same commit"
+        );
+        let out = fast_forward_to(&main, "base", "feature/x").unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        assert_eq!(head(&main, "base"), head(&main, "feature/x"));
+        assert!(!can_fast_forward(&main, "base", "feature/x").unwrap());
     }
 
     #[test]
