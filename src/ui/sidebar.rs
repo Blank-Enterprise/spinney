@@ -207,9 +207,8 @@ pub const SECTIONS: usize = 5;
 const HEADER_H: f32 = 22.0;
 /// The divider between two sections, dragged to resize them.
 const HANDLE_H: f32 = 6.0;
-/// Rows an open section keeps showing, however its neighbours are resized: enough to
-/// see it has content and scroll it.
-const MIN_ROWS: f32 = 2.0;
+/// The shortest an open section's body gets, however its neighbours are resized.
+const MIN_BODY: f32 = 150.0;
 /// The first split between open sections: Local gets the most.
 const FIRST_SHARES: [f32; SECTIONS] = [3.0, 2.0, 1.0, 1.0, 1.0];
 
@@ -438,7 +437,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
     ui.spacing_mut().item_spacing.y = 0.0;
     let fixed = SECTIONS as f32 * HEADER_H + (SECTIONS - 1) as f32 * HANDLE_H;
     let space = (ui.available_height() - fixed).max(0.0);
-    let min = MIN_ROWS * (ui.spacing().interact_size.y + spacing.y) + 4.0;
+    let min = MIN_BODY;
     let mut s = tab.sections;
     s.fit(space, min);
     let mut split = Split {
