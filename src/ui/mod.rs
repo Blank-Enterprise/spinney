@@ -1337,10 +1337,12 @@ impl SpinneyApp {
                 ctx.request_repaint();
             }
             Action::RemoveWorktree(path) => {
-                let dirty = git::run(&path, &["status", "--porcelain"])
-                    .map(|s| !s.trim().is_empty())
-                    .unwrap_or(false);
-                if dirty {
+                // Missing: it may have moved, and removing it unlinks it there (#166).
+                let ask = !path.is_dir()
+                    || git::run(&path, &["status", "--porcelain"])
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                if ask {
                     self.dialogs.confirm_remove = Some(path);
                 } else {
                     self.remove_worktree(&path, false, &mut errors);
@@ -2398,6 +2400,34 @@ mod tests {
             .worktrees
             .iter()
             .any(|w| w.path == wt && w.prunable));
+    }
+
+    #[test]
+    fn removing_a_missing_worktree_asks_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let wt = tmp.path().canonicalize().unwrap().join("wt");
+        let wt_str = wt.to_str().unwrap();
+        crate::git::run(&root, &["worktree", "add", "-q", "-b", "a", wt_str]).unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        app.apply(Action::OpenProject(root.clone()));
+        std::fs::rename(&wt, tmp.path().join("moved")).unwrap();
+        app.apply(Action::RemoveWorktree(wt.clone()));
+        assert_eq!(app.dialogs.confirm_remove.as_ref(), Some(&wt), "asks");
+        let listed = |app: &SpinneyApp| {
+            project::list_worktrees(&app.tabs[0].root)
+                .unwrap()
+                .iter()
+                .any(|w| w.path == wt)
+        };
+        assert!(listed(&app), "not removed yet");
+        let mut errors = vec![];
+        app.remove_worktree(&wt, true, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!listed(&app), "removed once confirmed");
+        let q = dialogs::remove_question(&wt, true);
+        assert!(q.contains("is missing") && q.contains("Locate"), "{q}");
     }
 
     #[test]
