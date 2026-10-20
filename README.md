@@ -17,14 +17,24 @@ undo journal if anything goes wrong), and manages the worktrees for you. A norma
 - **Spaces:** keep work and personal accounts apart. Each space has its own GitHub or GitHub
   Enterprise account (device-flow sign-in or a token), SSH key, author identity and clone folder.
   Tokens live in the macOS Keychain, and Spinney gives them only to the space's own host.
-- **Projects:** clone from a URL or by searching your repositories, create, open recent, and one
-  tab per project.
-- **Branches:** a sidebar grouped into folders, checkout, create, delete local and remote, and
-  merge or rebase from the branch menu.
-- **Commit graph** with branch and tag labels.
-- **Changes:** stage, unstage or discard a file, a hunk or single lines; commit and amend.
-- **Sync:** fetch, pull (fast-forward only) and push. When a push is rejected, Spinney offers a
-  force push with lease, pinned to the commit you were shown.
+- **Projects:** clone from a URL or by searching your repositories, in the worktree layout or as a
+  plain clone; create, open recent, and one tab per project.
+- **Worktrees:** add and remove them, or remove a worktree and delete its branch in one step.
+- **Branches:** a sidebar grouped into folders, with checkout, create, rename (also on the remote),
+  delete local and remote, and fast-forward without checking out. Merge or rebase from the branch
+  menu, or drag one branch onto another.
+- **Commit graph** with branch and tag labels. Right-click a commit to copy it, check it out,
+  branch, tag or open a worktree from it, cherry-pick, revert, reset (soft, mixed or hard) or start
+  an interactive rebase. A detached HEAD is shown, and leaving commits no branch keeps asks first.
+- **Changes:** stage, unstage or discard a file, a hunk or single lines; commit and amend. When line
+  staging isn't possible (binary, non-UTF-8, renamed, a file turned symlink…), Spinney says why.
+- **Sync:** fetch, push, and pull by fast-forward, merge or rebase. When a push is rejected,
+  Spinney offers a force push with lease, pinned to the commit you were shown.
+- **Conflicts:** a merge, rebase, cherry-pick, revert or pull that stops on conflicts stays in
+  progress, with Continue, Skip and Abort in a banner. View each conflicted file with its blocks
+  highlighted, take your version or theirs, resolve it in the built-in merge tool, or open it in
+  an external one.
+- **Tags:** a sidebar section; create lightweight or annotated tags, push and delete them.
 - **Stash:** stash and pop from the toolbar; apply, pop and drop from the sidebar.
 
 Anything that can lose work asks first and says what will be lost.
@@ -61,10 +71,12 @@ Requires Rust 1.95 or newer.
 
 Spinney is early and under active development. The
 [roadmap (#31)](https://github.com/Blank-Enterprise/spinney/issues/31) lists what's planned, and the
-[milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's next. A merge or
-rebase that stops on conflicts stays in progress, with Continue, Skip and Abort in a banner, and each
-conflicted file can be viewed with its conflict blocks highlighted, opened, resolved with your or
-their version, or marked resolved. A built-in merge tool is planned ([#12](https://github.com/Blank-Enterprise/spinney/issues/12)).
+[milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's next.
+
+There's no Preferences window yet ([#84](https://github.com/Blank-Enterprise/spinney/issues/84)).
+Until there is, two settings live in `~/Library/Application Support/Spinney/config.toml`:
+`pull_strategy` (`"ff-only"`, `"merge"` or `"rebase"`; without it, Spinney follows your git config)
+and `merge_tool` (`"vscode"`, `"file-merge"`, `"kaleidoscope"`, `"beyond-compare"` or `"git"`).
 
 ## Contributing
 
