@@ -66,7 +66,7 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
   - one issue per PR;
   - never paste links to AI or chat sessions in PRs.
 - **Issues:** epics (label `epic`) hold sub-issues. Labels mark type (`bug`, `enhancement`, `security`, `release`, `ci`, `chore`), `priority: …`, `size: XS…XL`, and state (`blocked`, `needs decision`, `needs QA`). Start from the roadmap, #31.
-- **Board:** the [Spinney roadmap project](https://github.com/users/SameetKeshav/projects/4), with Status Backlog → Ready → In progress → In review → Blocked → Done. Move an issue to **In review** when its PR opens.
+- **Board:** the [Spinney roadmap project](https://github.com/orgs/Blank-Enterprise/projects/1), with Status Backlog → Ready → In progress → In review → Blocked → Done. Move an issue to **In review** when its PR opens.
 
 ## Pitfalls we hit
 

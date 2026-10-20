@@ -41,15 +41,15 @@ Everything must pass. To try UI changes, use a debug build (`cargo run`) and not
   - End with the "🤖 Generated with Claude Code" line only. No session links.
 
 ## 6. Board
-Move the issue to **In review** on the [Spinney roadmap board](https://github.com/users/SameetKeshav/projects/4):
+Move the issue to **In review** on the [Spinney roadmap board](https://github.com/orgs/Blank-Enterprise/projects/1):
 ```sh
-P=PVT_kwHOBktr-c4Bny3h
-ITEM=$(gh api graphql -f query='{ node(id:"'$P'"){ ... on ProjectV2 { items(first:100){ nodes{ id content{ ... on Issue { number } } } } } } }' \
-  -q '.data.node.items.nodes[] | select(.content.number==<n>) | .id')
+P=PVT_kwDOFJLyNM4Bn3IO
+ITEM=$(gh api graphql -f query='{ repository(owner:"Blank-Enterprise",name:"spinney"){ issue(number:<n>){ projectItems(first:5){ nodes{ id project{ id } } } } } }' \
+  -q '.data.repository.issue.projectItems.nodes[] | select(.project.id=="'$P'") | .id')
 gh api graphql -f query='mutation{ updateProjectV2ItemFieldValue(input:{projectId:"'$P'",itemId:"'$ITEM'",
-  fieldId:"PVTSSF_lAHOBktr-c4Bny3hzhmV1Ho",value:{singleSelectOptionId:"da59e90c"}}){ clientMutationId } }'
+  fieldId:"PVTSSF_lADOFJLyNM4Bn3IOzhmZzWM",value:{singleSelectOptionId:"da59e90c"}}){ clientMutationId } }'
 ```
-The board has more than 100 items, so page with `after:` if the issue isn't in the first 100.
+Looking the item up from the issue avoids paging through the whole board.
 
 Status option ids:
 
@@ -62,7 +62,7 @@ Status option ids:
 | Blocked | `2e979f1b` |
 | Done | `98236657` |
 
-A new issue also needs adding (`addProjectV2ItemById`), plus its Start date, Target date and Area. Field ids: `gh project field-list 4 --owner SameetKeshav`.
+A new issue also needs adding (`addProjectV2ItemById`), plus its Start date, Target date and Area. Field ids: `gh project field-list 1 --owner Blank-Enterprise`.
 
 ## 7. Report
 Give the PR link, what changed, the check results, and anything unverified or deviating from the issue.

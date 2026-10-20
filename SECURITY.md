@@ -8,8 +8,8 @@ privately.
 
 **Don't open a public issue.** Use GitHub's private vulnerability reporting instead:
 
-1. Go to the [Security tab](https://github.com/SameetKeshav/spinney/security) and choose
-   **Report a vulnerability** ([direct link](https://github.com/SameetKeshav/spinney/security/advisories/new)).
+1. Go to the [Security tab](https://github.com/Blank-Enterprise/spinney/security) and choose
+   **Report a vulnerability** ([direct link](https://github.com/Blank-Enterprise/spinney/security/advisories/new)).
 2. Describe the problem, how to reproduce it, and what an attacker could do with it.
 
 Only the maintainers can see the report. We'll reply there, agree on a fix, and credit you in the
