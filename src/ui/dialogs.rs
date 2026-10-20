@@ -1,5 +1,5 @@
 //! Modal dialogs: clone, create, new worktree, confirm worktree removal and branch deletion,
-//! convert, merge and rebase.
+//! merge and rebase.
 
 use super::{
     actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
@@ -2328,8 +2328,6 @@ fn create_dialog(ctx: &egui::Context, d: &mut CreateDialog) -> Option<bool> {
         let home = paths::home();
         let root = paths::expand_tilde(&d.dir, home.as_deref()).join(d.name.trim());
         ui.monospace(format!("{}/", root.display()));
-        let wt = project::worktree_dir_name(d.branch.trim());
-        ui.monospace(format!("{}/", root.join(wt).display()));
         ui.add_space(6.0);
         if let Err(reason) = &target {
             ui.colored_label(ui.visuals().error_fg_color, reason);
