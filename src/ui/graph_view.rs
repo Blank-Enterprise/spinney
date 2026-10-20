@@ -134,6 +134,7 @@ pub enum MenuAction {
     Reset,
     /// The commit, or the ⌘-clicked selection it belongs to.
     CherryPick,
+    Revert,
 }
 
 /// What the menu needs to know about one commit.
@@ -200,6 +201,7 @@ impl MenuAction {
             MenuAction::Checkout => Action::CheckoutCommit(sha),
             MenuAction::Branch => Action::BranchAt(sha),
             MenuAction::Worktree => Action::NewWorktreeFrom(sha),
+            MenuAction::Revert => Action::Revert(sha),
             MenuAction::Reset | MenuAction::CherryPick => {
                 unreachable!("handled in commit_menu")
             }
@@ -232,6 +234,21 @@ fn reset_item(ctx: &MenuContext, on_head: bool) -> (String, Option<String>) {
         None
     };
     (label, blocked)
+}
+
+/// Why "Revert commit" is disabled, if it is: only commits on the checked-out branch's
+/// history are offered, in a clean worktree.
+fn revert_blocked(ctx: &MenuContext, this: Facts) -> Option<String> {
+    let Some(branch) = &ctx.branch else {
+        return Some("Check out a branch first".into());
+    };
+    if ctx.dirty.is_some() {
+        ctx.dirty.clone()
+    } else if !this.on_head {
+        Some(format!("This commit isn't on {branch}'s history"))
+    } else {
+        None
+    }
 }
 
 /// The commit menu's entries in groups (separated in the menu), with enabled states, for a
@@ -267,7 +284,14 @@ pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<Me
             item("Create branch here…", MenuAction::Branch, branch_blocked),
             item("New worktree here…", MenuAction::Worktree, worktree_blocked),
         ],
-        vec![item(&pick_label, MenuAction::CherryPick, pick_blocked)],
+        vec![
+            item(&pick_label, MenuAction::CherryPick, pick_blocked),
+            item(
+                "Revert commit",
+                MenuAction::Revert,
+                revert_blocked(ctx, this),
+            ),
+        ],
         vec![item(&reset_label, MenuAction::Reset, reset_blocked)],
     ]
 }
@@ -750,6 +774,32 @@ mod tests {
     }
 
     #[test]
+    fn revert_is_offered_only_on_the_current_branchs_history() {
+        let c = ctx(Layout::WorktreeRoot, None);
+        assert_eq!(revert_blocked(&c, ON), None);
+        assert_eq!(
+            revert_blocked(&c, OFF).as_deref(),
+            Some("This commit isn't on main's history")
+        );
+        let dirty = ctx(
+            Layout::WorktreeRoot,
+            Some("Commit or stash your changes first"),
+        );
+        assert_eq!(
+            revert_blocked(&dirty, ON).as_deref(),
+            Some("Commit or stash your changes first")
+        );
+        let detached = MenuContext {
+            branch: None,
+            ..ctx(Layout::WorktreeRoot, None)
+        };
+        assert_eq!(
+            revert_blocked(&detached, ON).as_deref(),
+            Some("Check out a branch first")
+        );
+    }
+
+    #[test]
     fn reset_is_offered_only_on_the_current_branchs_history() {
         let reset = |c: &MenuContext, on_head| {
             let f = Facts {
@@ -800,6 +850,7 @@ mod tests {
             ("Create branch here…", true),
             ("New worktree here…", true),
             ("Cherry-pick onto main", false),
+            ("Revert commit", false),
             ("Reset main to this commit", true),
         ];
         let want: Vec<_> = want.iter().map(|(l, on)| (l.to_string(), *on)).collect();
