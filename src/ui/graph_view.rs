@@ -1,5 +1,5 @@
 use super::{branch_drop, theme, Action};
-use crate::actions::Operation;
+use crate::actions::{Operation, ResetMode};
 use crate::graph::Row;
 use crate::project::Layout;
 use crate::status::{Change, Status};
@@ -85,10 +85,16 @@ pub fn parse_refs<'a>(refs: &'a str, remotes: &HashSet<&str>) -> Vec<Pill<'a>> {
 }
 
 /// What the commit menu needs to know about the tab.
-pub struct MenuContext {
+pub struct MenuContext<'a> {
     pub layout: Layout,
     /// Why entries that move HEAD are disabled, when they are (see `clean_blocked`).
     pub dirty: Option<String>,
+    /// The checked-out branch; None when HEAD is detached.
+    pub branch: Option<String>,
+    /// The merge, rebase, cherry-pick or revert in progress, if any.
+    pub operation: Option<Operation>,
+    /// Per row: the commit is HEAD or one of its ancestors.
+    pub on_head: &'a [bool],
 }
 
 /// Why checking out another commit must wait: uncommitted changes to tracked files, or an
@@ -107,7 +113,7 @@ pub fn clean_blocked(status: &Status, op: Option<Operation>) -> Option<String> {
 /// One entry of the commit menu: its label, the action, and why it is disabled (if it is).
 #[derive(Debug, PartialEq)]
 pub struct MenuItem {
-    pub label: &'static str,
+    pub label: String,
     pub action: MenuAction,
     pub blocked: Option<String>,
 }
@@ -120,6 +126,8 @@ pub enum MenuAction {
     Checkout,
     Branch,
     Worktree,
+    /// A sub-menu of Soft, Mixed and Hard.
+    Reset,
 }
 
 impl MenuAction {
@@ -131,17 +139,47 @@ impl MenuAction {
             MenuAction::Checkout => Action::CheckoutCommit(sha),
             MenuAction::Branch => Action::BranchAt(sha),
             MenuAction::Worktree => Action::NewWorktreeFrom(sha),
+            MenuAction::Reset => unreachable!("a sub-menu, see reset_action"),
         }
     }
 }
 
+/// The reset sub-menu's entries.
+pub const RESET_MODES: [(ResetMode, &str); 3] = [
+    (ResetMode::Soft, "Soft: keep changes staged"),
+    (ResetMode::Mixed, "Mixed: keep changes unstaged"),
+    (ResetMode::Hard, "Hard: discard changes…"),
+];
+
+/// "Reset <branch> to this commit", and why it is disabled for this commit, if it is.
+/// Only commits on the checked-out branch's history are offered.
+fn reset_item(ctx: &MenuContext, on_head: bool) -> (String, Option<String>) {
+    let Some(branch) = &ctx.branch else {
+        return (
+            "Reset to this commit".into(),
+            Some("Check out a branch first".into()),
+        );
+    };
+    let label = format!("Reset {branch} to this commit");
+    let blocked = if let Some(op) = ctx.operation {
+        Some(format!("Finish or abort the {op} first"))
+    } else if !on_head {
+        Some(format!("This commit isn't on {branch}'s history"))
+    } else {
+        None
+    };
+    (label, blocked)
+}
+
 /// The commit menu's entries in groups (separated in the menu), with enabled states.
-pub fn menu_items(ctx: &MenuContext) -> Vec<Vec<MenuItem>> {
-    let item = |label, action, blocked: Option<String>| MenuItem {
-        label,
+/// `on_head`: the commit is HEAD or one of its ancestors.
+pub fn menu_items(ctx: &MenuContext, on_head: bool) -> Vec<Vec<MenuItem>> {
+    let item = |label: &str, action, blocked: Option<String>| MenuItem {
+        label: label.to_string(),
         action,
         blocked,
     };
+    let (reset_label, reset_blocked) = reset_item(ctx, on_head);
     let worktrees = ctx.layout == Layout::WorktreeRoot;
     // A normal clone's new branch is switched to, moving HEAD like a checkout.
     let branch_blocked = if worktrees { None } else { ctx.dirty.clone() };
@@ -164,17 +202,43 @@ pub fn menu_items(ctx: &MenuContext) -> Vec<Vec<MenuItem>> {
             item("Create branch here…", MenuAction::Branch, branch_blocked),
             item("New worktree here…", MenuAction::Worktree, worktree_blocked),
         ],
+        vec![item(&reset_label, MenuAction::Reset, reset_blocked)],
     ]
 }
 
-fn commit_menu(ui: &mut egui::Ui, row: &Row, ctx: &MenuContext, actions: &mut Vec<Action>) {
-    for (i, group) in menu_items(ctx).into_iter().enumerate() {
+fn commit_menu(
+    ui: &mut egui::Ui,
+    row: &Row,
+    on_head: bool,
+    ctx: &MenuContext,
+    actions: &mut Vec<Action>,
+) {
+    for (i, group) in menu_items(ctx, on_head).into_iter().enumerate() {
         if i > 0 {
             ui.separator();
         }
         for item in group {
+            if item.action == MenuAction::Reset {
+                let sha = &row.commit.sha;
+                ui.add_enabled_ui(item.blocked.is_none(), |ui| {
+                    ui.menu_button(item.label.as_str(), |ui| {
+                        for (mode, label) in RESET_MODES {
+                            if ui.button(label).clicked() {
+                                actions.push(Action::AskReset(sha.clone(), mode));
+                                ui.close();
+                            }
+                        }
+                    });
+                })
+                .response
+                .on_disabled_hover_text(item.blocked.unwrap_or_default());
+                continue;
+            }
             let r = ui
-                .add_enabled(item.blocked.is_none(), egui::Button::new(item.label))
+                .add_enabled(
+                    item.blocked.is_none(),
+                    egui::Button::new(item.label.as_str()),
+                )
                 .on_disabled_hover_text(item.blocked.unwrap_or_default());
             if r.clicked() {
                 actions.push(item.action.action(&row.commit.sha));
@@ -258,7 +322,8 @@ pub fn show(
                             }
                             branch_drop::drag_and_drop(ui, &label, name, &mut out.drops);
                         }
-                        resp.context_menu(|ui| commit_menu(ui, &rows[i], menu, actions));
+                        let on = menu.on_head.get(i).copied().unwrap_or(false);
+                        resp.context_menu(|ui| commit_menu(ui, &rows[i], on, menu, actions));
                     }
                 }
             }
@@ -506,43 +571,82 @@ mod tests {
         assert_eq!(op.as_deref(), Some("Finish or abort the rebase first"));
     }
 
-    fn enabled(ctx: &MenuContext) -> Vec<(&'static str, bool)> {
-        menu_items(ctx)
+    fn enabled(ctx: &MenuContext) -> Vec<(String, bool)> {
+        menu_items(ctx, true)
             .into_iter()
             .flatten()
             .map(|i| (i.label, i.blocked.is_none()))
             .collect()
     }
 
+    fn ctx(layout: Layout, dirty: Option<&str>) -> MenuContext<'static> {
+        MenuContext {
+            layout,
+            dirty: dirty.map(str::to_string),
+            branch: Some("main".into()),
+            operation: None,
+            on_head: &[],
+        }
+    }
+
     #[test]
-    fn commit_menu_disables_what_needs_a_clean_worktree() {
-        let clean = MenuContext {
-            layout: Layout::WorktreeRoot,
-            dirty: None,
+    fn reset_is_offered_only_on_the_current_branchs_history() {
+        let reset = |c: &MenuContext, on_head| {
+            let items = menu_items(c, on_head);
+            let it = items.into_iter().flatten().last().unwrap();
+            assert_eq!(it.action, MenuAction::Reset);
+            (it.label, it.blocked)
         };
-        assert!(enabled(&clean).iter().all(|(_, on)| *on), "all enabled");
-        let dirty = MenuContext {
-            layout: Layout::WorktreeRoot,
-            dirty: Some("Commit or stash your changes first".into()),
+        let c = ctx(Layout::WorktreeRoot, Some("dirty"));
+        assert_eq!(reset(&c, true), ("Reset main to this commit".into(), None));
+        assert_eq!(
+            reset(&c, false).1.as_deref(),
+            Some("This commit isn't on main's history")
+        );
+        let detached = MenuContext {
+            branch: None,
+            ..ctx(Layout::NormalClone, None)
         };
         assert_eq!(
-            enabled(&dirty),
-            [
-                ("Copy SHA", true),
-                ("Copy message", true),
-                ("Checkout this commit", false),
-                ("Create branch here…", true),
-                ("New worktree here…", true),
-            ]
+            reset(&detached, true).1.as_deref(),
+            Some("Check out a branch first")
         );
+        let rebasing = MenuContext {
+            operation: Some(Operation::Rebase),
+            ..ctx(Layout::NormalClone, None)
+        };
+        assert_eq!(
+            reset(&rebasing, true).1.as_deref(),
+            Some("Finish or abort the rebase first")
+        );
+    }
+
+    #[test]
+    fn commit_menu_disables_what_needs_a_clean_worktree() {
+        let clean = ctx(Layout::WorktreeRoot, None);
+        assert!(enabled(&clean).iter().all(|(_, on)| *on), "all enabled");
+        let dirty = ctx(
+            Layout::WorktreeRoot,
+            Some("Commit or stash your changes first"),
+        );
+        let want = [
+            ("Copy SHA", true),
+            ("Copy message", true),
+            ("Checkout this commit", false),
+            ("Create branch here…", true),
+            ("New worktree here…", true),
+            ("Reset main to this commit", true),
+        ];
+        let want: Vec<_> = want.iter().map(|(l, on)| (l.to_string(), *on)).collect();
+        assert_eq!(enabled(&dirty), want);
         let normal = MenuContext {
             layout: Layout::NormalClone,
             ..dirty
         };
         let got = enabled(&normal);
-        assert_eq!(got[3], ("Create branch here…", false), "it switches");
-        assert_eq!(got[4], ("New worktree here…", false));
-        let checkout = &menu_items(&normal)[1][0];
+        assert_eq!(got[3], ("Create branch here…".into(), false), "it switches");
+        assert_eq!(got[4], ("New worktree here…".into(), false));
+        let checkout = &menu_items(&normal, true)[1][0];
         assert_eq!(
             checkout.blocked.as_deref(),
             Some("Commit or stash your changes first")

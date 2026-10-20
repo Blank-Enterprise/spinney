@@ -117,6 +117,32 @@ impl Lanes {
     }
 }
 
+/// Which listed commits are on HEAD's history, decided row by row as pages arrive: in
+/// topo order every child comes before its parents, so one forward pass is enough.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ancestry {
+    /// Ancestors of HEAD not listed yet.
+    wanted: std::collections::HashSet<String>,
+}
+
+impl Ancestry {
+    /// Start from `head` (None: no commits, or nothing is on its history).
+    pub fn new(head: Option<&str>) -> Ancestry {
+        Ancestry {
+            wanted: head.into_iter().map(String::from).collect(),
+        }
+    }
+
+    /// Whether `c`, the next commit in topo order, is HEAD or one of its ancestors.
+    pub fn mark(&mut self, c: &Commit) -> bool {
+        if !self.wanted.remove(&c.sha) {
+            return false;
+        }
+        self.wanted.extend(c.parents.iter().cloned());
+        true
+    }
+}
+
 /// One long-running `git log`, read in pages. Dropping it kills git.
 pub struct LogStream {
     child: Child,
@@ -219,6 +245,26 @@ mod tests {
         assert_eq!(a.lanes_in, vec![a_, a_]);
         assert!(a.lanes_out.is_empty());
         assert!(l.ids.is_empty(), "pushed commits leave the intern map");
+    }
+
+    #[test]
+    fn ancestry_follows_head_through_merges_only() {
+        // m merges f into a; x is on another branch; HEAD is m.
+        let rows = [
+            commit("x", &["a"]),
+            commit("m", &["a", "f"]),
+            commit("f", &["a"]),
+            commit("a", &["r"]),
+            commit("r", &[]),
+        ];
+        let mut anc = Ancestry::new(Some("m"));
+        let on: Vec<bool> = rows.iter().map(|c| anc.mark(c)).collect();
+        assert_eq!(on, [false, true, true, true, true]);
+        let mut from_f = Ancestry::new(Some("f"));
+        let on: Vec<bool> = rows.iter().map(|c| from_f.mark(c)).collect();
+        assert_eq!(on, [false, false, true, true, true]);
+        let mut none = Ancestry::new(None);
+        assert!(rows.iter().all(|c| !none.mark(c)));
     }
 
     #[test]

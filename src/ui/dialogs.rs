@@ -5,7 +5,7 @@ use super::{
     actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
     toolbar::folder_name, visible_projects, JobKind, ProjectTab, SpinneyApp,
 };
-use crate::actions::{MergeMode, MergeOutcome};
+use crate::actions::{MergeMode, MergeOutcome, ResetMode, ResetPlan};
 use crate::convert::{self, Plan};
 use crate::{creds, github, refs};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
@@ -393,6 +393,63 @@ pub(super) struct Dialogs {
     /// The menu shown after dropping one branch onto another.
     pub(super) drop_menu: Option<super::branch_drop::DropMenu>,
     pub(super) leave_detached: Option<LeaveDetached>,
+    pub(super) reset: Option<ResetDialog>,
+}
+
+/// Reset the branch checked out in `worktree` as `plan` describes, in `mode`.
+pub(super) struct ResetDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) plan: ResetPlan,
+    pub(super) mode: ResetMode,
+}
+
+/// The reset confirmation: its question, what happens, and warnings naming what is lost.
+pub(super) fn reset_text(plan: &ResetPlan, mode: ResetMode) -> (String, String, Vec<String>) {
+    let branch = &plan.branch;
+    let short = &plan.target[..plan.target.len().min(8)];
+    let name = match mode {
+        ResetMode::Soft => "soft",
+        ResetMode::Mixed => "mixed",
+        ResetMode::Hard => "hard",
+    };
+    let question = format!("Reset {branch} to {short} ({name})?");
+    let moves = match plan.dropped {
+        0 => format!("{branch} stays at this commit."),
+        1 => format!("{branch} moves back 1 commit."),
+        n => format!("{branch} moves back {n} commits."),
+    };
+    let what = match mode {
+        ResetMode::Soft => "Their changes stay staged, and your uncommitted changes are kept.",
+        ResetMode::Mixed => {
+            "Their changes, and anything staged, become unstaged changes; no file is changed."
+        }
+        ResetMode::Hard => {
+            "Their changes and every uncommitted change to tracked files are removed from \
+             the files. Untracked files are kept."
+        }
+    };
+    let mut warnings = vec![];
+    if mode == ResetMode::Hard && !plan.changed.is_empty() {
+        let files = match plan.changed.len() {
+            1 => "1 file".to_string(),
+            n => format!("{n} files"),
+        };
+        warnings.push(format!(
+            "Uncommitted changes to {files} will be lost and can't be recovered: {}.",
+            conflict_list(&plan.changed)
+        ));
+    }
+    if plan.pushed > 0 {
+        let commits = match plan.pushed {
+            1 => "1 of these commits is".to_string(),
+            n => format!("{n} of these commits are"),
+        };
+        warnings.push(format!(
+            "{commits} already pushed. Pushing {branch} afterwards needs a force push."
+        ));
+    }
+    (question, format!("{moves} {what}"), warnings)
 }
 
 /// Leaving a detached HEAD at `head` would strand `lost` commits that no ref has.
@@ -448,6 +505,7 @@ impl Dialogs {
             || self.rebase.is_some()
             || self.drop_menu.is_some()
             || self.leave_detached.is_some()
+            || self.reset.is_some()
     }
 }
 
@@ -777,6 +835,36 @@ impl SpinneyApp {
                 None => self.dialogs.merge = Some(d),
             }
         }
+        if let Some(d) = self.dialogs.reset.take() {
+            let mut result = None;
+            let (question, what, warnings) = reset_text(&d.plan, d.mode);
+            egui::Modal::new(egui::Id::unique("reset")).show(ctx, |ui| {
+                ui.label(question);
+                ui.label(theme::caption(&what));
+                for w in &warnings {
+                    ui.colored_label(theme::WARN, format!("⚠ {w}"));
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let reset = if d.mode == ResetMode::Hard || !warnings.is_empty() {
+                        danger("Reset")
+                    } else {
+                        theme::primary("Reset")
+                    };
+                    if ui.add(reset).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.reset(d),
+                Some(false) => {}
+                None => self.dialogs.reset = Some(d),
+            }
+        }
         if let Some(d) = self.dialogs.leave_detached.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("leave_detached")).show(ctx, |ui| {
@@ -841,6 +929,53 @@ impl SpinneyApp {
                 None => self.dialogs.rebase = Some(d),
             }
         }
+    }
+
+    /// Open the reset confirmation, refusing now what would fail anyway.
+    pub(super) fn ask_reset(&mut self, sha: &str, mode: ResetMode, errors: &mut Vec<String>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        // A pull or push may be moving the same branch (the toolbar disables it too).
+        if self.jobs.network_busy(&tab.root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        match actions::reset_plan(&tab.active_worktree, sha) {
+            Ok(plan) => {
+                self.dialogs.reset = Some(ResetDialog {
+                    root: tab.root.clone(),
+                    worktree: tab.active_worktree.clone(),
+                    plan,
+                    mode,
+                })
+            }
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
+
+    /// Reset as confirmed; `actions::reset` refuses if anything shown has changed.
+    pub(super) fn reset(&mut self, d: ResetDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        if self.jobs.network_busy(&d.root) {
+            return self
+                .errors
+                .push("Wait for the running fetch, pull or push".into());
+        }
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.root == d.root && t.active_worktree == d.worktree);
+        let Some(tab) = tab else {
+            return self
+                .errors
+                .push("The project or worktree changed; try again".into());
+        };
+        if let Err(e) = actions::reset(&d.worktree, &d.plan, d.mode) {
+            errors.push(format!("{e:#}"));
+        }
+        tab.refresh(&ctx, &mut errors);
+        self.errors.extend(errors);
     }
 
     /// Leave the detached HEAD as confirmed, unless HEAD moved since it was asked.
@@ -1844,6 +1979,107 @@ mod tests {
         assert!(one.starts_with("1 commit of main already pushed"), "{one}");
         let two = rebase_warning(2, "main").unwrap();
         assert!(two.starts_with("2 commits of main"), "{two}");
+    }
+
+    fn reset_plan(dropped: usize, pushed: usize, changed: &[&str]) -> ResetPlan {
+        ResetPlan {
+            branch: "main".into(),
+            head: "h".repeat(40),
+            target: "83174b7246c76c9b6426a95147a715f0d26bf6c6".into(),
+            dropped,
+            pushed,
+            changed: changed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn reset_text_names_what_is_lost() {
+        let (q, what, warn) = reset_text(&reset_plan(2, 0, &["a.txt"]), ResetMode::Soft);
+        assert_eq!(q, "Reset main to 83174b72 (soft)?");
+        assert!(what.starts_with("main moves back 2 commits. Their changes stay staged"));
+        assert!(warn.is_empty(), "soft keeps the changes: {warn:?}");
+        let (_, _, warn) = reset_text(&reset_plan(1, 0, &["a.txt", "b.txt"]), ResetMode::Hard);
+        assert_eq!(
+            warn,
+            ["Uncommitted changes to 2 files will be lost and can't be recovered: a.txt, b.txt."]
+        );
+        let (_, what, warn) = reset_text(&reset_plan(0, 0, &[]), ResetMode::Hard);
+        assert!(what.starts_with("main stays at this commit."), "{what}");
+        assert!(warn.is_empty());
+        let (_, _, warn) = reset_text(&reset_plan(3, 1, &[]), ResetMode::Mixed);
+        assert_eq!(
+            warn,
+            ["1 of these commits is already pushed. Pushing main afterwards needs a force push."]
+        );
+        let (_, _, warn) = reset_text(&reset_plan(3, 2, &[]), ResetMode::Mixed);
+        assert!(warn[0].starts_with("2 of these commits are already pushed"));
+    }
+
+    #[test]
+    fn hard_reset_from_the_graph_asks_then_resets() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap().trim().to_string();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        let init = g(&["rev-parse", "HEAD"]);
+        g(&["switch", "-q", "-c", "side"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "side"]);
+        let side = g(&["rev-parse", "HEAD"]);
+        g(&["switch", "-q", "main"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "second"]);
+        std::fs::write(d.join("a.txt"), "edited\n").unwrap();
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+        for _ in 0..500 {
+            app.poll();
+            if app.tabs[0].rows.len() == 3 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let tab = &app.tabs[0];
+        let on: Vec<_> = (0..3)
+            .map(|i| (tab.rows[i].commit.subject.as_str(), tab.on_head[i]))
+            .collect();
+        assert!(
+            on.contains(&("side", false)) && on.contains(&("init", true)),
+            "{on:?}"
+        );
+
+        // Off the branch's history: refused before asking.
+        app.apply(Action::AskReset(side, ResetMode::Soft));
+        assert!(app
+            .errors
+            .iter()
+            .any(|e| e.contains("isn't on main's history")));
+        assert!(app.dialogs.reset.is_none());
+        app.errors.clear();
+
+        app.apply(Action::AskReset(init.clone(), ResetMode::Hard));
+        let r = app.dialogs.reset.take().expect("asked");
+        assert_eq!(
+            (r.plan.dropped, &r.plan.changed[..]),
+            (1, &["a.txt".to_string()][..])
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("a.txt")).unwrap(),
+            "edited\n"
+        );
+        app.reset(r);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(g(&["rev-parse", "HEAD"]), init);
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "a\n");
     }
 
     #[test]
