@@ -1,7 +1,6 @@
 use super::{branch_drop, theme, Action};
 use crate::actions::{Operation, ResetMode};
 use crate::graph::Row;
-use crate::project::Layout;
 use crate::status::{Change, Status};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::collections::HashSet;
@@ -88,7 +87,6 @@ pub fn parse_refs<'a>(refs: &'a str, remotes: &HashSet<&str>) -> Vec<Pill<'a>> {
 
 /// What the commit menu needs to know about the tab.
 pub struct MenuContext<'a> {
-    pub layout: Layout,
     /// Why entries that move HEAD are disabled, when they are (see `clean_blocked`).
     pub dirty: Option<String>,
     /// The checked-out branch; None when HEAD is detached.
@@ -266,9 +264,8 @@ pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<Me
     };
     let (reset_label, reset_blocked) = reset_item(ctx, on_head);
     let (pick_label, pick_blocked) = cherry_pick_item(ctx, picks);
-    let worktrees = ctx.layout == Layout::WorktreeRoot;
-    // A normal clone's new branch is switched to, moving HEAD like a checkout.
-    let branch_blocked = if worktrees { None } else { ctx.dirty.clone() };
+    // A new branch is switched to, moving HEAD like a checkout.
+    let branch_blocked = ctx.dirty.clone();
     vec![
         vec![
             item("Copy SHA", MenuAction::CopySha, None),
@@ -702,9 +699,8 @@ mod tests {
         merge: false,
     };
 
-    fn ctx(layout: Layout, dirty: Option<&str>) -> MenuContext<'static> {
+    fn ctx(dirty: Option<&str>) -> MenuContext<'static> {
         MenuContext {
-            layout,
             dirty: dirty.map(str::to_string),
             branch: Some("main".into()),
             operation: None,
@@ -740,7 +736,7 @@ mod tests {
             let it = it.unwrap();
             (it.label, it.blocked)
         };
-        let c = ctx(Layout::WorktreeRoot, None);
+        let c = ctx(None);
         assert_eq!(pick(&c, &[OFF]), ("Cherry-pick onto main".into(), None));
         assert_eq!(
             pick(&c, &[OFF, OFF, OFF]),
@@ -762,17 +758,14 @@ mod tests {
             pick(&c, &[OFF, merge]).1.as_deref(),
             Some("Cherry-picking a merge commit isn't supported")
         );
-        let dirty = ctx(
-            Layout::WorktreeRoot,
-            Some("Commit or stash your changes first"),
-        );
+        let dirty = ctx(Some("Commit or stash your changes first"));
         assert_eq!(
             pick(&dirty, &[OFF]).1.as_deref(),
             Some("Commit or stash your changes first")
         );
         let detached = MenuContext {
             branch: None,
-            ..ctx(Layout::WorktreeRoot, None)
+            ..ctx(None)
         };
         assert_eq!(
             pick(&detached, &[OFF]).1.as_deref(),
@@ -782,23 +775,20 @@ mod tests {
 
     #[test]
     fn revert_is_offered_only_on_the_current_branchs_history() {
-        let c = ctx(Layout::WorktreeRoot, None);
+        let c = ctx(None);
         assert_eq!(history_blocked(&c, ON), None);
         assert_eq!(
             history_blocked(&c, OFF).as_deref(),
             Some("This commit isn't on main's history")
         );
-        let dirty = ctx(
-            Layout::WorktreeRoot,
-            Some("Commit or stash your changes first"),
-        );
+        let dirty = ctx(Some("Commit or stash your changes first"));
         assert_eq!(
             history_blocked(&dirty, ON).as_deref(),
             Some("Commit or stash your changes first")
         );
         let detached = MenuContext {
             branch: None,
-            ..ctx(Layout::WorktreeRoot, None)
+            ..ctx(None)
         };
         assert_eq!(
             history_blocked(&detached, ON).as_deref(),
@@ -821,7 +811,7 @@ mod tests {
             let it = it.unwrap();
             (it.label, it.blocked)
         };
-        let c = ctx(Layout::WorktreeRoot, Some("dirty"));
+        let c = ctx(Some("dirty"));
         assert_eq!(reset(&c, true), ("Reset main to this commit".into(), None));
         assert_eq!(
             reset(&c, false).1.as_deref(),
@@ -829,7 +819,7 @@ mod tests {
         );
         let detached = MenuContext {
             branch: None,
-            ..ctx(Layout::NormalClone, None)
+            ..ctx(None)
         };
         assert_eq!(
             reset(&detached, true).1.as_deref(),
@@ -837,7 +827,7 @@ mod tests {
         );
         let rebasing = MenuContext {
             operation: Some(Operation::Rebase),
-            ..ctx(Layout::NormalClone, None)
+            ..ctx(None)
         };
         assert_eq!(
             reset(&rebasing, true).1.as_deref(),
@@ -847,17 +837,14 @@ mod tests {
 
     #[test]
     fn commit_menu_disables_what_needs_a_clean_worktree() {
-        let clean = ctx(Layout::WorktreeRoot, None);
+        let clean = ctx(None);
         assert!(enabled(&clean).iter().all(|(_, on)| *on), "all enabled");
-        let dirty = ctx(
-            Layout::WorktreeRoot,
-            Some("Commit or stash your changes first"),
-        );
+        let dirty = ctx(Some("Commit or stash your changes first"));
         let want = [
             ("Copy SHA", true),
             ("Copy message", true),
             ("Checkout this commit", false),
-            ("Create branch here…", true),
+            ("Create branch here…", false),
             ("New worktree here…", true),
             ("Create tag here…", true),
             ("Cherry-pick onto main", false),
@@ -867,14 +854,7 @@ mod tests {
         ];
         let want: Vec<_> = want.iter().map(|(l, on)| (l.to_string(), *on)).collect();
         assert_eq!(enabled(&dirty), want);
-        let normal = MenuContext {
-            layout: Layout::NormalClone,
-            ..dirty
-        };
-        let got = enabled(&normal);
-        assert_eq!(got[3], ("Create branch here…".into(), false), "it switches");
-        assert_eq!(got[4], ("New worktree here…".into(), true), "any repo");
-        let checkout = &menu_items(&normal, ON, &[ON])[1][0];
+        let checkout = &menu_items(&dirty, ON, &[ON])[1][0];
         assert_eq!(
             checkout.blocked.as_deref(),
             Some("Commit or stash your changes first")

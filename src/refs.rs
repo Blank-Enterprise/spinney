@@ -145,14 +145,7 @@ mod tests {
         let url = format!("file://{}", remote.display());
         let parent = tmp.path().join("clones");
         std::fs::create_dir(&parent).unwrap();
-        let root = clone_into(
-            &url,
-            &parent,
-            "proj",
-            &space(),
-            crate::project::Layout::WorktreeRoot,
-        )
-        .unwrap();
+        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
         (tmp, root)
     }
 
@@ -168,7 +161,7 @@ mod tests {
     #[test]
     fn branches_ahead_behind() {
         let (_tmp, root) = cloned();
-        let main = root.join("main");
+        let main = root.clone();
         git::run(&main, &["commit", "--allow-empty", "-q", "-m", "local"]).unwrap();
         let list = branches(&main).unwrap();
         let b = list.iter().find(|b| b.name == "main" && !b.remote).unwrap();
@@ -182,7 +175,7 @@ mod tests {
     #[test]
     fn current_branch_detached_none() {
         let (_tmp, root) = cloned();
-        let main = root.join("main");
+        let main = root.clone();
         assert_eq!(current_branch(&main).unwrap().as_deref(), Some("main"));
         git::run(&main, &["checkout", "-q", "--detach"]).unwrap();
         assert_eq!(current_branch(&main).unwrap(), None);
@@ -212,7 +205,7 @@ mod tests {
     #[test]
     fn tags_newest_first_and_peeled() {
         let (_tmp, root) = cloned();
-        let main = root.join("main");
+        let main = root.clone();
         let at = |date: &str, args: &[&str]| {
             git::run_env(&main, args, &[("GIT_COMMITTER_DATE", date)]).unwrap();
         };

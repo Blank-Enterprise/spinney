@@ -10,12 +10,6 @@ pub fn worktree_dir_name(branch: &str) -> String {
     branch.replace('/', "-")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Layout {
-    WorktreeRoot,
-    NormalClone,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -30,7 +24,7 @@ pub struct Worktree {
     pub prunable: bool,
 }
 
-pub fn detect(root: &Path) -> Result<Layout> {
+pub fn ensure_project(root: &Path) -> Result<()> {
     if !root.exists() {
         // Moved: opening it from the new place relinks its worktrees (`repair`).
         bail!(
@@ -38,14 +32,10 @@ pub fn detect(root: &Path) -> Result<Layout> {
             root.display()
         );
     }
-    let git = root.join(".git");
-    if root.join(".bare").is_dir() && git.is_file() {
-        Ok(Layout::WorktreeRoot)
-    } else if git.is_dir() {
-        Ok(Layout::NormalClone)
-    } else {
+    if !root.join(".git").exists() {
         bail!("{} is not a git project", root.display())
     }
+    Ok(())
 }
 
 /// Create `<parent>/<name>` for a new project. `name` must be one plain path segment (so
@@ -67,28 +57,17 @@ fn claim_root(parent: &Path, name: &str) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Clone `url` to `<parent>/<name>`: as `.bare` plus a worktree for the default branch, or
-/// as a normal clone.
-pub fn clone_into(
-    url: &str,
-    parent: &Path,
-    name: &str,
-    space: &Space,
-    layout: Layout,
-) -> Result<PathBuf> {
+/// Clone `url` to `<parent>/<name>` as a normal clone.
+pub fn clone_into(url: &str, parent: &Path, name: &str, space: &Space) -> Result<PathBuf> {
     let root = claim_root(parent, name)?;
-    let result = match layout {
-        Layout::WorktreeRoot => clone_steps(url, parent, &root, space),
-        Layout::NormalClone => clone_normal(url, parent, &root, space),
-    };
+    let result = clone_normal(url, parent, &root, space);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&root); // we created it, so clean it up
     }
     result.map(|()| root)
 }
 
-/// Plain `git clone` into the empty `root`, with the same credentials and identity as the
-/// worktree layout.
+/// Plain `git clone` into the empty `root`, with the space's credentials and identity.
 fn clone_normal(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<()> {
     let root_str = root.to_str().context("non-UTF-8 path")?;
     let mut args = creds::git_env_args(space)?;
@@ -96,59 +75,6 @@ fn clone_normal(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     git::run(parent, &refs)?;
     creds::configure_repo(&root.join(".git"), space)
-}
-
-fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<()> {
-    let bare = root.join(".bare");
-    let bare_str = bare.to_str().context("non-UTF-8 path")?;
-    let env = creds::git_env_args(space)?;
-    let with_env = |rest: &[&str]| -> Vec<String> {
-        env.iter()
-            .cloned()
-            .chain(rest.iter().map(|s| s.to_string()))
-            .collect()
-    };
-    let run_env = |dir: &Path, rest: &[&str]| -> Result<String> {
-        let args = with_env(rest);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        git::run(dir, &refs)
-    };
-
-    run_env(parent, &["clone", "--bare", url, bare_str])?;
-    std::fs::write(root.join(".git"), "gitdir: ./.bare\n")?;
-    git::run(
-        &bare,
-        &[
-            "config",
-            "remote.origin.fetch",
-            "+refs/heads/*:refs/remotes/origin/*",
-        ],
-    )?;
-    run_env(&bare, &["fetch", "origin"])?;
-    let default = git::run(&bare, &["symbolic-ref", "--short", "HEAD"])?
-        .trim()
-        .to_string();
-    // `clone --bare` copied every remote head into refs/heads/*: untracked branches that go
-    // stale. Keep only the default; git's DWIM later creates tracking branches on demand.
-    let keep = format!("refs/heads/{default}");
-    let heads = git::run(
-        &bare,
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-    )?;
-    for r in heads.lines().filter(|r| *r != keep) {
-        git::run(&bare, &["update-ref", "-d", r])?;
-    }
-    let dir = format!("./{}", worktree_dir_name(&default));
-    git::run(root, &["worktree", "add", &dir, &default])?;
-    git::run(
-        root,
-        &[
-            "branch",
-            &format!("--set-upstream-to=origin/{default}"),
-            &default,
-        ],
-    )?;
-    creds::configure_repo(&bare, space)
 }
 
 /// Check `branch` with `git check-ref-format --branch`.
@@ -179,8 +105,8 @@ fn create_steps(parent: &Path, root: &Path, branch: &str, space: &Space) -> Resu
 }
 
 /// The project a folder belongs to: the main repo of any of its worktrees, wherever that
-/// worktree lives (Spinney's, an agent's, an IDE's). A `.git` or `.bare` common dir means
-/// its parent; any other bare repo is the project itself.
+/// worktree lives (Spinney's, an agent's, an IDE's). A `.git` common dir means its parent;
+/// a bare repo elsewhere is the project itself.
 pub fn project_root(dir: &Path) -> Result<PathBuf> {
     let out = git::run(
         dir,
@@ -190,7 +116,7 @@ pub fn project_root(dir: &Path) -> Result<PathBuf> {
     let common = PathBuf::from(out.trim());
     let name = common.file_name().unwrap_or_default();
     Ok(match common.parent() {
-        Some(parent) if name == ".git" || name == ".bare" => parent.to_path_buf(),
+        Some(parent) if name == ".git" => parent.to_path_buf(),
         _ => common,
     })
 }
@@ -220,16 +146,13 @@ pub fn repair(root: &Path) -> Result<()> {
             }
         }
     }
-    let dir = worktrees_dir(root);
-    if dir != root {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            let renamed: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.join(".git").is_file() && !paths.contains(p))
-                .collect();
-            paths.extend(renamed);
-        }
+    if let Ok(entries) = std::fs::read_dir(worktrees_dir(root)) {
+        let renamed: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.join(".git").is_file() && !paths.contains(p))
+            .collect();
+        paths.extend(renamed);
     }
     relink(root, &paths)
 }
@@ -294,12 +217,8 @@ pub fn list_worktrees(root: &Path) -> Result<Vec<Worktree>> {
 }
 
 /// Where new worktrees go: `<parent>/<name>.worktrees`, beside the project and outside its
-/// working tree (so IDEs, search and builds don't see a copy). Old `.bare` projects keep
-/// theirs inside the root.
+/// working tree (so IDEs, search and builds don't see a copy).
 pub fn worktrees_dir(root: &Path) -> PathBuf {
-    if detect(root).ok() == Some(Layout::WorktreeRoot) {
-        return root.to_path_buf();
-    }
     let name = root.file_name().unwrap_or_default().to_string_lossy();
     root.with_file_name(format!("{name}.worktrees"))
 }
@@ -389,14 +308,7 @@ mod tests {
 
     fn cloned() -> (tempfile::TempDir, PathBuf) {
         let (tmp, url, parent) = fixture();
-        let root = clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).unwrap();
-        (tmp, root)
-    }
-
-    /// Normal clone of the fixture; returns (tmp, root).
-    fn normal() -> (tempfile::TempDir, PathBuf) {
-        let (tmp, url, parent) = fixture();
-        let root = clone_into(&url, &parent, "proj", &space(), Layout::NormalClone).unwrap();
+        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
         (tmp, root)
     }
 
@@ -419,7 +331,7 @@ mod tests {
 
     #[test]
     fn add_worktree_goes_beside_the_project() {
-        let (_tmp, root) = normal();
+        let (_tmp, root) = cloned();
         let p = add_worktree(&root, "feature/new", "main").unwrap();
         assert_eq!(p, root.with_file_name("proj.worktrees").join("feature-new"));
         assert_eq!(listed(&root, &p).branch.as_deref(), Some("feature/new"));
@@ -430,7 +342,7 @@ mod tests {
 
     #[test]
     fn worktrees_made_outside_spinney_are_listed_resolved_and_removable() {
-        let (tmp, root) = normal();
+        let (tmp, root) = cloned();
         let nested = root.join(".claude/worktrees/agent-1");
         let sibling = root.with_file_name("proj.feature-x");
         let elsewhere = tmp.path().join("elsewhere/wt");
@@ -466,17 +378,8 @@ mod tests {
     }
 
     #[test]
-    fn project_root_of_old_layout() {
-        let (_tmp, root) = cloned();
-        assert!(same_dir(&project_root(&root.join("main")).unwrap(), &root));
-        assert!(same_dir(&project_root(&root).unwrap(), &root));
-        let p = add_worktree(&root, "feature/new", "main").unwrap();
-        assert_eq!(p, root.join("feature-new"), "inside the root, as before");
-    }
-
-    #[test]
     fn repair_finds_a_worktree_renamed_beside_the_project() {
-        let (_tmp, root) = normal();
+        let (_tmp, root) = cloned();
         let p = add_worktree(&root, "feature/new", "main").unwrap();
         let renamed = p.with_file_name("renamed");
         std::fs::rename(&p, &renamed).unwrap();
@@ -490,7 +393,7 @@ mod tests {
 
     #[test]
     fn repair_after_the_project_folder_moves() {
-        let (tmp, root) = normal();
+        let (tmp, root) = cloned();
         let p = add_worktree(&root, "feature/new", "main").unwrap();
         // Claude Code's, inside the project: it moves along with it.
         let nested = root.join(".claude/worktrees/agent-1");
@@ -517,7 +420,7 @@ mod tests {
 
     #[test]
     fn a_worktree_moved_elsewhere_is_missing_until_located() {
-        let (tmp, root) = normal();
+        let (tmp, root) = cloned();
         let p = add_worktree(&root, "feature/new", "main").unwrap();
         let away = tmp.path().join("away");
         std::fs::rename(&p, &away).unwrap();
@@ -533,7 +436,7 @@ mod tests {
 
     #[test]
     fn remove_a_missing_worktree() {
-        let (tmp, root) = normal();
+        let (tmp, root) = cloned();
         let p = add_worktree(&root, "feature/new", "main").unwrap();
         std::fs::rename(&p, tmp.path().join("gone")).unwrap();
         remove_worktree(&root, &p, false).unwrap();
@@ -549,32 +452,10 @@ mod tests {
     }
 
     #[test]
-    fn clone_creates_layout() {
-        let (_tmp, root) = cloned();
-        assert_eq!(
-            std::fs::read_to_string(root.join(".git")).unwrap(),
-            "gitdir: ./.bare\n"
-        );
-        assert!(root.join("main").is_dir());
-        let main = root.join("main");
-        let up = git::run(&main, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
-        assert_eq!(up.trim(), "origin/main");
-        assert_eq!(detect(&root).unwrap(), Layout::WorktreeRoot);
-        let email = git::run(&main, &["config", "user.email"]).unwrap();
-        assert_eq!(email.trim(), space().author_email);
-        let heads = git::run(
-            &root,
-            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-        );
-        assert_eq!(heads.unwrap(), "refs/heads/main\n");
-    }
-
-    #[test]
     fn normal_clone_has_upstream_identity_and_helper() {
         let (_tmp, url, parent) = fixture();
-        let root = clone_into(&url, &parent, "proj", &space(), Layout::NormalClone).unwrap();
-        assert_eq!(detect(&root).unwrap(), Layout::NormalClone);
-        assert!(!root.join(".bare").exists());
+        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
+        ensure_project(&root).unwrap();
         let up = git::run(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
         assert_eq!(up.trim(), "origin/main");
         let email = git::run(&root, &["config", "--local", "user.email"]).unwrap();
@@ -594,7 +475,7 @@ mod tests {
     fn normal_clone_failure_cleans_up() {
         let (tmp, _url, parent) = fixture();
         let bad = format!("file://{}", tmp.path().join("missing").display());
-        assert!(clone_into(&bad, &parent, "proj", &space(), Layout::NormalClone).is_err());
+        assert!(clone_into(&bad, &parent, "proj", &space()).is_err());
         assert!(!parent.join("proj").exists());
     }
 
@@ -602,33 +483,21 @@ mod tests {
     fn clone_refuses_existing_dir() {
         let (_tmp, url, parent) = fixture();
         std::fs::create_dir(parent.join("proj")).unwrap();
-        assert!(clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).is_err());
+        assert!(clone_into(&url, &parent, "proj", &space()).is_err());
     }
 
     #[test]
     fn clone_failure_cleans_up() {
         let (tmp, _url, parent) = fixture();
         let bad = format!("file://{}", tmp.path().join("missing").display());
-        assert!(clone_into(&bad, &parent, "proj", &space(), Layout::WorktreeRoot).is_err());
+        assert!(clone_into(&bad, &parent, "proj", &space()).is_err());
         assert!(!parent.join("proj").exists());
-    }
-
-    #[test]
-    fn add_worktree_and_list() {
-        let (_tmp, root) = cloned();
-        let p = add_worktree(&root, "feature/new", "main").unwrap();
-        assert_eq!(p, root.join("feature-new"));
-        let list = list_worktrees(&root).unwrap();
-        let want = p.canonicalize().unwrap();
-        let wt = list.iter().find(|w| w.path == want).expect("listed");
-        assert_eq!(wt.branch.as_deref(), Some("feature/new"));
-        assert!(list.iter().any(|w| w.is_bare));
     }
 
     #[test]
     fn add_worktree_at_commit() {
         let (_tmp, root) = cloned();
-        let main = root.join("main");
+        let main = root.clone();
         let sha = git::run(&main, &["rev-parse", "origin/feature/x"]).unwrap();
         let sha = sha.trim();
         let p = add_worktree(&root, "topic", sha).unwrap();
@@ -660,7 +529,8 @@ mod tests {
     #[test]
     fn add_worktree_collision_refuses() {
         let (_tmp, root) = cloned();
-        let dir = root.join("feature-a-b");
+        let dir = worktrees_dir(&root).join("feature-a-b");
+        std::fs::create_dir(worktrees_dir(&root)).unwrap();
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("keep.txt"), "keep").unwrap();
         assert!(add_worktree(&root, "feature/a-b", "main").is_err());
@@ -692,7 +562,7 @@ mod tests {
         let wt = root.clone();
         let head = git::run(&wt, &["symbolic-ref", "--short", "HEAD"]).unwrap();
         assert_eq!(head.trim(), "feature/x");
-        assert_eq!(detect(&root).unwrap(), Layout::NormalClone);
+        ensure_project(&root).unwrap();
         let st = crate::status::status(&wt).unwrap();
         assert_eq!(st, crate::status::Status::default());
         let email = git::run(&wt, &["config", "user.email"]).unwrap();
@@ -781,13 +651,10 @@ mod tests {
         let abs = tmp.path().join("abs").display().to_string();
         for bad in ["a/..", "..", abs.as_str()] {
             assert!(
-                clone_into(&bad_url, &parent, bad, &space(), Layout::WorktreeRoot).is_err(),
+                clone_into(&bad_url, &parent, bad, &space()).is_err(),
                 "{bad:?}"
             );
-            assert!(
-                clone_into(&url, &parent, bad, &space(), Layout::WorktreeRoot).is_err(),
-                "{bad:?}"
-            );
+            assert!(clone_into(&url, &parent, bad, &space()).is_err(), "{bad:?}");
             assert_intact(&parent);
         }
         assert!(!tmp.path().join("abs").exists());
@@ -799,7 +666,7 @@ mod tests {
         let link = parent.join("proj");
         std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
         assert!(create_new(&parent, "proj", "main", &space()).is_err());
-        assert!(clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).is_err());
+        assert!(clone_into(&url, &parent, "proj", &space()).is_err());
         let meta = std::fs::symlink_metadata(&link).unwrap();
         assert!(meta.file_type().is_symlink(), "symlink untouched");
         assert!(!tmp.path().join("nowhere").exists());
