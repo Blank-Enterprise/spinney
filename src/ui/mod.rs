@@ -2,6 +2,7 @@ mod changes;
 mod dialogs;
 mod diff_view;
 mod graph_view;
+mod in_progress;
 mod new_tab;
 mod paths;
 mod sidebar;
@@ -9,7 +10,7 @@ mod spaces;
 mod theme;
 mod toolbar;
 
-use crate::actions::{self, CheckoutOutcome};
+use crate::actions::{self, CheckoutOutcome, MergeOutcome, Operation};
 use crate::config::{Config, Space};
 use crate::diff::FileDiff;
 use crate::graph::{LogStream, Row};
@@ -127,6 +128,8 @@ pub struct ProjectTab {
     amend: bool,
     /// Sidebar filter text.
     filter: String,
+    /// The merge, rebase, cherry-pick or revert stopped in `active_worktree`, if any.
+    operation: Option<Operation>,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -188,6 +191,7 @@ impl ProjectTab {
             commit_desc: String::new(),
             amend: false,
             filter: String::new(),
+            operation: None,
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -514,6 +518,12 @@ pub enum Action {
     CancelAmend,
     ToggleInline,
     CloseDiff,
+    /// From the in-progress banner: `ContinueOp` goes on; `AskOpStep` asks before a Skip
+    /// or Abort, which `ConfirmOpStep` runs and `CancelOpStep` drops.
+    ContinueOp,
+    AskOpStep(in_progress::Step),
+    ConfirmOpStep,
+    CancelOpStep,
 }
 
 pub struct SpinneyApp {
@@ -540,6 +550,8 @@ pub struct SpinneyApp {
     confirm_amend: Option<PathBuf>,
     /// The last push rejected as non-fast-forward, offering Pull or Force push… in the top bar.
     rejected_push: Option<RejectedPush>,
+    /// A Skip or Abort of the operation in progress, awaiting confirmation in its banner.
+    confirm_op: Option<in_progress::Pending>,
     /// Conversions in flight: (project root, worktree to activate afterwards).
     converting: Vec<(PathBuf, PathBuf)>,
 }
@@ -580,6 +592,7 @@ impl SpinneyApp {
             converting: vec![],
             confirm_amend: None,
             rejected_push: None,
+            confirm_op: None,
         };
         app.open_visible_tabs();
         app
@@ -734,6 +747,7 @@ impl SpinneyApp {
                 self.active_tab = i;
                 self.confirm_discard = None;
                 self.confirm_amend = None;
+                self.confirm_op = None;
                 self.new_tab = false;
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
@@ -859,6 +873,33 @@ impl SpinneyApp {
                 }
             }
             Action::CancelAmend => self.confirm_amend = None,
+            Action::ContinueOp => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    if let Some(op) = tab.operation {
+                        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+                        self.op_step(&root, &wt, op, None, &mut errors);
+                    }
+                }
+            }
+            Action::AskOpStep(step) => {
+                let tab = self.tabs.get(self.active_tab);
+                self.confirm_op = tab.and_then(|t| {
+                    Some(in_progress::Pending {
+                        root: t.root.clone(),
+                        worktree: t.active_worktree.clone(),
+                        op: t.operation?,
+                        step,
+                    })
+                });
+            }
+            Action::CancelOpStep => self.confirm_op = None,
+            Action::ConfirmOpStep => {
+                if let Some(p) = self.confirm_op.take() {
+                    if self.asking_tab(Some(p.root.clone())).is_some() {
+                        self.op_step(&p.root, &p.worktree, p.op, Some(p.step), &mut errors);
+                    }
+                }
+            }
             Action::ConfirmAmend => {
                 if let Some(tab) = self.asking_tab(self.confirm_amend.clone()) {
                     tab.commit(&ctx, &mut errors);
@@ -942,6 +983,7 @@ impl SpinneyApp {
             }
             Action::ActivateWorktree(path) => {
                 self.confirm_discard = None; // it was asked about the other worktree's files
+                self.confirm_op = None;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.active_worktree = path;
                     tab.refresh(&ctx, &mut errors);
@@ -1059,6 +1101,45 @@ impl SpinneyApp {
         }
         if self.rejected_push.as_ref().is_some_and(|r| r.root == root) {
             self.rejected_push = None;
+        }
+        if self.confirm_op.as_ref().is_some_and(|p| p.root == root) {
+            self.confirm_op = None;
+        }
+    }
+
+    /// Continue the operation stopped in `worktree`, or with `step` skip or abort it, then
+    /// refresh. Stopping again on the next commit's conflicts is a notice, not an error.
+    fn op_step(
+        &mut self,
+        root: &Path,
+        worktree: &Path,
+        op: Operation,
+        step: Option<in_progress::Step>,
+        errors: &mut Vec<String>,
+    ) {
+        // A pull or push may be moving the same branch (the banner disables it too).
+        if self.jobs.network_busy(root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let ctx = self.ctx.clone();
+        let tab = self.tabs.iter_mut().find(|t| t.root == root);
+        let Some(tab) = tab.filter(|t| t.active_worktree == worktree) else {
+            return;
+        };
+        let res = match step {
+            None => actions::continue_op(worktree, op),
+            Some(in_progress::Step::Skip) => actions::skip_op(worktree, op),
+            Some(in_progress::Step::Abort) => {
+                actions::abort_op(worktree, op).map(|()| MergeOutcome::Done)
+            }
+        };
+        tab.refresh(&ctx, errors);
+        match res {
+            Ok(MergeOutcome::Conflicts(files)) => self
+                .notices
+                .push(dialogs::conflict_message(&in_progress::title(op), &files)),
+            Ok(_) => {}
+            Err(e) => errors.push(format!("{op}: {e:#}")),
         }
     }
 
@@ -1250,6 +1331,40 @@ fn checkout(tab: &mut ProjectTab, name: &str, errors: &mut Vec<String>) {
 }
 
 impl SpinneyApp {
+    /// The in-progress banner for the active tab, or its Skip/Abort confirmation. A
+    /// confirmation for that tab whose operation finished or changed meanwhile is dropped.
+    fn op_banner(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        if self.showing_new_tab() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let pending = self.confirm_op.as_ref().filter(|p| p.root == tab.root);
+        let asking = pending
+            .filter(|p| p.worktree == tab.active_worktree && Some(p.op) == tab.operation)
+            .map(|p| p.step);
+        if pending.is_some() && asking.is_none() {
+            self.confirm_op = None;
+        }
+        let Some(op) = tab.operation else { return };
+        let (conflicts, busy) = (
+            tab.status.conflicted.len(),
+            self.jobs.network_busy(&tab.root),
+        );
+        let fill = if asking.is_some() {
+            theme::DIFF_DEL
+        } else {
+            theme::WARN.gamma_multiply(0.12)
+        };
+        let bar = egui::Frame::new()
+            .fill(fill)
+            .inner_margin(Margin::symmetric(14, 6));
+        egui::Panel::top("in_progress").frame(bar).show(ui, |ui| {
+            in_progress::bar(ui, op, conflicts, busy, asking, actions)
+        });
+    }
+
     /// Refuse to close while a conversion runs: its undo journal lives only in memory,
     /// so quitting would strand the repo half-converted.
     fn hold_close(&mut self, ctx: &egui::Context) {
@@ -1353,6 +1468,7 @@ impl eframe::App for SpinneyApp {
                     .show(ui, |ui| Self::amend_bar(ui, &mut actions));
             }
         }
+        self.op_banner(ui, &mut actions);
         if let Some(r) = self.push_tab() {
             let busy = self.jobs.network_busy(&r.root);
             let fill = if r.lease.is_some() {
@@ -1678,6 +1794,7 @@ mod tests {
             converting: vec![],
             confirm_amend: None,
             rejected_push: None,
+            confirm_op: None,
         }
     }
 

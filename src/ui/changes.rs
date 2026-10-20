@@ -333,6 +333,10 @@ impl ProjectTab {
             Ok(s) => self.status = s,
             Err(e) => errors.push(format!("status: {e:#}")),
         }
+        match actions::in_progress(&self.active_worktree) {
+            Ok(op) => self.operation = op,
+            Err(e) => errors.push(format!("in progress: {e:#}")),
+        }
         let Center::Diff(w) = &mut self.center else {
             return;
         };

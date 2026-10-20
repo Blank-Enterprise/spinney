@@ -61,9 +61,10 @@ Requires Rust 1.95 or newer.
 
 Spinney is early and under active development. The
 [roadmap (#31)](https://github.com/Blank-Enterprise/spinney/issues/31) lists what's planned, and the
-[milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's next. Merge and
-rebase conflicts currently abort and list the files rather than leaving a half-done operation
-([#53](https://github.com/Blank-Enterprise/spinney/issues/53)).
+[milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's next. A merge or
+rebase that stops on conflicts stays in progress, with Continue, Skip and Abort in a banner; resolving
+the files inside Spinney is planned
+([#12](https://github.com/Blank-Enterprise/spinney/issues/12)).
 
 ## Contributing
 
