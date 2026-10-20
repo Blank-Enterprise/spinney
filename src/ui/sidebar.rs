@@ -205,20 +205,24 @@ fn short_sha(sha: &str) -> &str {
 /// The sidebar's sections, top to bottom.
 pub const SECTIONS: usize = 5;
 const HEADER_H: f32 = 22.0;
-/// The divider between two sections, dragged to resize them.
+/// The divider under each section, dragged to resize it.
 const HANDLE_H: f32 = 6.0;
 /// The shortest an open section's body gets, however its neighbours are resized.
 const MIN_BODY: f32 = 150.0;
 /// The first split between open sections: Local gets the most.
 const FIRST_SHARES: [f32; SECTIONS] = [3.0, 2.0, 1.0, 1.0, 1.0];
 
-/// Which sidebar sections are open, and how tall each one's body is. A closed section
-/// keeps its height, to come back at that size.
+/// Which sidebar sections are open, and how tall each one's body is. Bodies needn't fill
+/// the sidebar: what's left is free space under the last section, used up before any
+/// section is squashed. A closed section keeps its height, to come back at that size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sections {
     pub open: [bool; SECTIONS],
     /// 0 until first laid out.
     pub heights: [f32; SECTIONS],
+    /// Each body's content height when last drawn (0 before then): a section grows no
+    /// taller than it needs to show all of it.
+    pub content: [f32; SECTIONS],
 }
 
 impl Default for Sections {
@@ -227,6 +231,7 @@ impl Default for Sections {
         Sections {
             open: [true, true, false, false, false],
             heights: [0.0; SECTIONS],
+            content: [0.0; SECTIONS],
         }
     }
 }
@@ -236,115 +241,123 @@ impl Sections {
         (0..SECTIONS).filter(|&k| self.open[k]).collect()
     }
 
-    /// Fit the open bodies to `space`. The first time, split it between them; after that
-    /// only the bottom open section takes up a change, and when the sidebar gets shorter
-    /// the ones above it give way in turn down to `min`, so the top ones stay put. With
-    /// no room for every minimum, they share it equally.
+    /// The tallest section `k` grows: its content, but never under `min`; unbounded
+    /// before it has been drawn.
+    fn max(&self, k: usize, min: f32) -> f32 {
+        if self.content[k] > 0.0 {
+            self.content[k].max(min)
+        } else {
+            f32::INFINITY
+        }
+    }
+
+    /// Space under the open bodies.
+    fn free(&self, space: f32) -> f32 {
+        let used: f32 = self.open_list().iter().map(|&k| self.heights[k]).sum();
+        (space - used).max(0.0)
+    }
+
+    /// Shrink the open sections in `order` in turn, none under `min`, by up to `want`;
+    /// returns what they gave.
+    fn squash(&mut self, order: &[usize], want: f32, min: f32) -> f32 {
+        let mut got = 0.0;
+        for &k in order {
+            let take = (self.heights[k] - min).max(0.0).min(want - got);
+            self.heights[k] -= take;
+            got += take;
+        }
+        got
+    }
+
+    /// Fit the open bodies in `space`. The first time, split it between them; after that
+    /// they keep their sizes while they fit, and when the sidebar gets too short the
+    /// bottom ones give way first, down to `min`. With no room for every minimum, they
+    /// share it equally.
     pub fn fit(&mut self, space: f32, min: f32) {
         let open = self.open_list();
-        let Some(&last) = open.last() else {
+        if open.is_empty() {
             return;
-        };
-        let h = &mut self.heights;
-        let sum: f32 = open.iter().map(|&k| h[k]).sum();
+        }
+        let sum: f32 = open.iter().map(|&k| self.heights[k]).sum();
         if sum <= 0.0 {
             let total: f32 = open.iter().map(|&k| FIRST_SHARES[k]).sum();
             for &k in &open {
-                h[k] = space * FIRST_SHARES[k] / total;
+                let share = space * FIRST_SHARES[k] / total;
+                self.heights[k] = share.min(self.max(k, min));
             }
             return;
         }
-        if space >= sum {
-            h[last] += space - sum;
+        if sum <= space {
             return;
         }
-        let mut want = sum - space;
-        for &k in open.iter().rev() {
-            let take = (h[k] - min).max(0.0).min(want);
-            h[k] -= take;
-            want -= take;
-        }
-        if want > 0.0 {
+        let bottom_up: Vec<usize> = open.iter().rev().copied().collect();
+        let got = self.squash(&bottom_up, sum - space, min);
+        if got < sum - space {
             for &k in &open {
-                h[k] = space / open.len() as f32;
+                self.heights[k] = space / open.len() as f32;
             }
         }
     }
 
-    /// Open or close section `k`, moving as little else as possible. A closing section's
-    /// height goes to the nearest open section below it (above, when none is below). An
-    /// opening one takes its old height back from the open sections below it, then above,
-    /// nearest first, none going under `min`. `fit` tidies up after.
+    /// Move the divider under section `i` by `delta` (down when positive), touching as
+    /// little else as possible. Down: the nearest open section at or above it grows, up
+    /// to its content; the sections below keep their size and slide into the free space,
+    /// and only once that's gone do they shrink, nearest first, to `min`. Up: the
+    /// sections at or above it shrink, nearest first, to `min`, and the ones below move
+    /// up with theirs. Either way the divider stops when nothing more can give.
+    pub fn drag(&mut self, i: usize, delta: f32, space: f32, min: f32) {
+        let above: Vec<usize> = (0..=i).rev().filter(|&k| self.open[k]).collect();
+        let Some(&grow) = above.first() else {
+            return;
+        };
+        if delta < 0.0 {
+            self.squash(&above, -delta, min);
+            return;
+        }
+        let room = (self.max(grow, min) - self.heights[grow]).max(0.0);
+        let want = delta.min(room);
+        let free = self.free(space).min(want);
+        let below: Vec<usize> = (i + 1..SECTIONS).filter(|&k| self.open[k]).collect();
+        let got = self.squash(&below, want - free, min);
+        self.heights[grow] += free + got;
+    }
+
+    /// Open or close section `k`. Closing frees its space, and the sections below move
+    /// up. Opening takes its old height back from the free space, then from the open
+    /// sections below it, then above, nearest first, none going under `min`.
     pub fn toggle(&mut self, k: usize, space: f32, min: f32) {
-        let h = &mut self.heights;
         if self.open[k] {
             self.open[k] = false;
-            let below = (k + 1..SECTIONS).find(|&o| self.open[o]);
-            if let Some(to) = below.or_else(|| (0..k).rev().find(|&o| self.open[o])) {
-                h[to] += h[k];
-            }
-        } else {
-            let others: Vec<usize> = (k + 1..SECTIONS)
-                .chain((0..k).rev())
-                .filter(|&o| self.open[o])
-                .collect();
-            self.open[k] = true;
-            let want = if h[k] > 0.0 {
-                h[k]
-            } else {
-                space / (others.len() + 1) as f32
-            }
-            .max(min);
-            let mut got = 0.0;
-            for &o in &others {
-                let take = (h[o] - min).max(0.0).min(want - got);
-                h[o] -= take;
-                got += take;
-            }
-            h[k] = if others.is_empty() {
-                space
-            } else {
-                got.max(min)
-            };
+            return;
         }
+        let free = self.free(space);
+        let others: Vec<usize> = (k + 1..SECTIONS)
+            .chain((0..k).rev())
+            .filter(|&o| self.open[o])
+            .collect();
+        let want = if self.heights[k] > 0.0 {
+            self.heights[k]
+        } else {
+            space / (others.len() + 1) as f32
+        };
+        let want = want.min(self.max(k, min)).max(min);
+        let from_free = free.min(want);
+        let got = self.squash(&others, want - from_free, min);
+        self.open[k] = true;
+        self.heights[k] = (from_free + got).max(min.min(space));
         self.fit(space, min);
     }
 }
 
-/// Move the divider below section `i` by `delta` (down when positive). The nearest open
-/// section on the side it moves away from grows; open sections on the side it moves into
-/// shrink in turn, nearest first, none below `min`. It stops when they are all at `min`.
-pub fn drag(h: &mut [f32], open: &[bool], i: usize, delta: f32, min: f32) {
-    let above: Vec<usize> = (0..=i).rev().filter(|&k| open[k]).collect();
-    let below: Vec<usize> = (i + 1..h.len()).filter(|&k| open[k]).collect();
-    let (grow, shrink) = if delta > 0.0 {
-        (above.first(), &below)
-    } else {
-        (below.first(), &above)
-    };
-    let Some(&grow) = grow else {
-        return;
-    };
-    let mut want = delta.abs();
-    let mut moved = 0.0;
-    for &k in shrink {
-        let take = (h[k] - min).max(0.0).min(want);
-        h[k] -= take;
-        want -= take;
-        moved += take;
-    }
-    h[grow] += moved;
-}
-
 /// Draws the sections one after another, each body in its own scroll area, with a
-/// divider between each pair.
+/// divider under each.
 struct Split {
     s: Sections,
     /// A header clicked this frame; it opens or closes after the frame is drawn.
     toggled: Option<usize>,
     /// Spacing for the bodies' contents (the split itself packs with none).
     spacing: egui::Vec2,
-    min: f32,
+    space: f32,
 }
 
 impl Split {
@@ -394,28 +407,26 @@ impl Split {
                     .max_rect(rect),
             );
             body.spacing_mut().item_spacing = self.spacing;
-            egui::ScrollArea::vertical()
+            let out = egui::ScrollArea::vertical()
                 .id_salt(("sidebar_section", title))
                 .auto_shrink([false, false])
                 .show(&mut body, add);
+            self.s.content[k] = out.content_size.y;
         }
-        if k + 1 < SECTIONS {
-            self.divider(ui, k);
-        }
+        self.divider(ui, k);
     }
 
-    /// The divider below section `k`; it drags only with an open section on each side.
+    /// The divider under section `k`; it drags only with an open section at or above it.
     fn divider(&mut self, ui: &mut egui::Ui, k: usize) {
         let w = ui.available_width();
         let (rect, r) = ui.allocate_exact_size(egui::vec2(w, HANDLE_H), egui::Sense::drag());
-        let open = self.s.open;
-        let live = open[..=k].contains(&true) && open[k + 1..].contains(&true);
+        let live = self.s.open[..=k].contains(&true);
         let hot = live && (r.hovered() || r.dragged());
         if hot {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         }
         if live && r.dragged() {
-            drag(&mut self.s.heights, &open, k, r.drag_delta().y, self.min);
+            self.s.drag(k, r.drag_delta().y, self.space, MIN_BODY);
         }
         let color = if hot { theme::ACCENT } else { theme::BORDER };
         ui.painter().hline(
@@ -435,16 +446,15 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
     ui.add_space(4.0);
     let spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.y = 0.0;
-    let fixed = SECTIONS as f32 * HEADER_H + (SECTIONS - 1) as f32 * HANDLE_H;
+    let fixed = SECTIONS as f32 * (HEADER_H + HANDLE_H);
     let space = (ui.available_height() - fixed).max(0.0);
-    let min = MIN_BODY;
     let mut s = tab.sections;
-    s.fit(space, min);
+    s.fit(space, MIN_BODY);
     let mut split = Split {
         s,
         toggled: None,
         spacing,
-        min,
+        space,
     };
     {
         let tab = &*tab;
@@ -569,7 +579,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
         });
     }
     if let Some(k) = split.toggled {
-        split.s.toggle(k, space, min);
+        split.s.toggle(k, space, MIN_BODY);
     }
     tab.sections = split.s;
 }
@@ -845,117 +855,162 @@ mod tests {
         assert_eq!(count(&nodes), 6);
     }
 
+    /// Open sections `open` with body heights `h`, content not yet measured.
+    fn secs(open: [bool; SECTIONS], h: [f32; SECTIONS]) -> Sections {
+        Sections {
+            open,
+            heights: h,
+            content: [0.0; SECTIONS],
+        }
+    }
+
+    const ALL: [bool; SECTIONS] = [true; SECTIONS];
+
     #[test]
     fn branches_start_open_and_the_rest_closed() {
         let mut s = Sections::default();
         assert_eq!(s.open, [true, true, false, false, false]);
-        s.fit(500.0, 40.0);
+        s.fit(500.0, 150.0);
         assert_eq!(s.heights, [300.0, 200.0, 0.0, 0.0, 0.0]);
+        // Content already measured caps the first split.
+        let mut s = Sections {
+            content: [120.0, 400.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        s.fit(500.0, 150.0);
+        assert_eq!(s.heights, [150.0, 200.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn fit_changes_only_the_bottom_until_it_hits_the_minimum() {
-        let mut s = Sections {
-            open: [true, false, true, false, true],
-            heights: [100.0, 50.0, 100.0, 0.0, 100.0],
-        };
-        s.fit(400.0, 40.0);
-        assert_eq!(s.heights, [100.0, 50.0, 100.0, 0.0, 200.0]);
-        s.fit(200.0, 40.0);
-        assert_eq!(s.heights, [100.0, 50.0, 60.0, 0.0, 40.0]);
-        // No room for every minimum: an equal share each.
-        s.fit(90.0, 40.0);
-        assert_eq!(s.heights, [30.0, 50.0, 30.0, 0.0, 30.0]);
-    }
-
-    #[test]
-    fn closing_gives_its_space_to_the_next_open_section_below() {
-        let mut s = Sections {
-            open: [true, true, true, false, true],
-            heights: [100.0, 100.0, 100.0, 0.0, 100.0],
-        };
-        s.toggle(1, 400.0, 40.0);
-        assert_eq!(s.open, [true, false, true, false, true]);
+    fn fit_keeps_sizes_and_squashes_the_bottom_first() {
+        let mut s = secs(
+            [true, false, true, false, true],
+            [200.0, 50.0, 200.0, 0.0, 200.0],
+        );
+        s.fit(800.0, 150.0);
         assert_eq!(
             s.heights,
-            [100.0, 100.0, 200.0, 0.0, 100.0],
-            "Local stays put"
+            [200.0, 50.0, 200.0, 0.0, 200.0],
+            "free space stays free"
         );
-        // The bottom one gives its space to the nearest above.
-        s.toggle(4, 400.0, 40.0);
-        assert_eq!(s.heights, [100.0, 100.0, 300.0, 0.0, 100.0]);
+        s.fit(520.0, 150.0);
+        assert_eq!(s.heights, [200.0, 50.0, 170.0, 0.0, 150.0]);
+        // No room for every minimum: an equal share each.
+        s.fit(300.0, 150.0);
+        assert_eq!(s.heights, [100.0, 50.0, 100.0, 0.0, 100.0]);
     }
 
     #[test]
-    fn opening_takes_its_old_height_back_from_below_first() {
-        let mut s = Sections {
-            open: [true, false, true, false, true],
-            heights: [100.0, 80.0, 200.0, 0.0, 100.0],
-        };
-        s.toggle(1, 400.0, 40.0);
-        assert_eq!(s.heights, [100.0, 80.0, 120.0, 0.0, 100.0]);
-        // More than below can spare: the rest comes from above.
-        let mut s = Sections {
-            open: [true, false, true, false, false],
-            heights: [200.0, 150.0, 100.0, 0.0, 0.0],
-        };
-        s.toggle(1, 300.0, 40.0);
-        assert_eq!(s.heights, [110.0, 150.0, 40.0, 0.0, 0.0]);
+    fn dragging_down_uses_free_space_before_touching_the_next_section() {
+        let mut s = secs(
+            [true, true, false, false, false],
+            [150.0, 200.0, 0.0, 0.0, 0.0],
+        );
+        s.drag(0, 100.0, 500.0, 150.0);
+        assert_eq!(s.heights[..2], [250.0, 200.0], "Remote keeps its size");
+        // Free space gone (500 - 450 = 50): Remote gives the rest, down to its minimum.
+        s.drag(0, 200.0, 500.0, 150.0);
+        assert_eq!(s.heights[..2], [350.0, 150.0]);
+        // Then it locks.
+        s.drag(0, 100.0, 500.0, 150.0);
+        assert_eq!(s.heights[..2], [350.0, 150.0]);
     }
 
     #[test]
-    fn opening_never_squashes_others_below_the_minimum() {
-        // Never opened: it asks for an equal share; the others only give down to 40.
-        let mut s = Sections {
-            open: [true, true, false, false, false],
-            heights: [60.0, 60.0, 0.0, 0.0, 0.0],
-        };
-        s.toggle(2, 120.0, 40.0);
-        assert_eq!(s.heights, [40.0, 40.0, 40.0, 0.0, 0.0]);
-        // Alone, it takes everything.
-        let mut s = Sections {
-            open: [false; SECTIONS],
-            heights: [0.0; SECTIONS],
-        };
-        s.toggle(3, 300.0, 40.0);
-        assert_eq!(s.heights[3], 300.0);
+    fn dragging_down_squashes_below_nearest_first() {
+        let mut s = secs(ALL, [150.0, 200.0, 200.0, 200.0, 150.0]);
+        s.drag(0, 120.0, 900.0, 150.0);
+        assert_eq!(s.heights, [270.0, 150.0, 150.0, 180.0, 150.0]);
     }
 
     #[test]
-    fn dragging_down_grows_above_and_shrinks_below_in_turn() {
-        let open = [true; SECTIONS];
-        let mut h = [100.0, 100.0, 100.0, 100.0, 100.0];
-        drag(&mut h, &open, 1, 30.0, 40.0);
-        assert_eq!(h, [100.0, 130.0, 70.0, 100.0, 100.0]);
-        // Past the next section's minimum, the one after it gives way too.
-        drag(&mut h, &open, 1, 50.0, 40.0);
-        assert_eq!(h, [100.0, 180.0, 40.0, 80.0, 100.0]);
-        // All below at the minimum: it stops, and the total never changes.
-        drag(&mut h, &open, 1, 1000.0, 40.0);
-        assert_eq!(h, [100.0, 280.0, 40.0, 40.0, 40.0]);
-        assert_eq!(h.iter().sum::<f32>(), 500.0);
+    fn a_section_grows_no_taller_than_its_content() {
+        let mut s = secs(
+            [true, true, false, false, false],
+            [150.0, 150.0, 0.0, 0.0, 0.0],
+        );
+        s.content[0] = 220.0;
+        s.drag(0, 200.0, 800.0, 150.0);
+        assert_eq!(s.heights[..2], [220.0, 150.0]);
+        // Short content still gets the minimum.
+        s.content[1] = 40.0;
+        s.drag(1, 50.0, 800.0, 150.0);
+        assert_eq!(s.heights[1], 150.0);
     }
 
     #[test]
-    fn dragging_up_shrinks_above_nearest_first() {
-        let open = [true; SECTIONS];
-        let mut h = [100.0, 60.0, 100.0, 100.0, 100.0];
-        drag(&mut h, &open, 1, -50.0, 40.0);
-        assert_eq!(h, [70.0, 40.0, 150.0, 100.0, 100.0]);
+    fn dragging_up_shrinks_above_nearest_first_and_leaves_below_alone() {
+        let mut s = secs(ALL, [300.0, 200.0, 200.0, 0.0, 0.0]);
+        s.open = [true, true, true, false, false];
+        s.drag(1, -100.0, 900.0, 150.0);
+        assert_eq!(s.heights[..3], [250.0, 150.0, 200.0]);
+        s.drag(1, -500.0, 900.0, 150.0);
+        assert_eq!(
+            s.heights[..3],
+            [150.0, 150.0, 200.0],
+            "locked at the minimum"
+        );
     }
 
     #[test]
     fn dragging_skips_closed_sections() {
         let open = [true, false, true, false, true];
-        let mut h = [100.0, 0.0, 100.0, 0.0, 100.0];
-        // The divider under closed Remote moves Local and Worktrees.
-        drag(&mut h, &open, 1, 20.0, 40.0);
-        assert_eq!(h, [120.0, 0.0, 80.0, 0.0, 100.0]);
-        // With nothing open below, there is nothing to move.
-        let open = [true, false, false, false, false];
-        let mut h = [300.0, 0.0, 0.0, 0.0, 0.0];
-        drag(&mut h, &open, 0, 20.0, 40.0);
-        assert_eq!(h, [300.0, 0.0, 0.0, 0.0, 0.0]);
+        let mut s = secs(open, [200.0, 0.0, 200.0, 0.0, 200.0]);
+        // The divider under closed Remote resizes Local, squashing Worktrees when full.
+        s.drag(1, 30.0, 600.0, 150.0);
+        assert_eq!(s.heights, [230.0, 0.0, 170.0, 0.0, 200.0]);
+        // A divider with nothing open above it does nothing.
+        let mut s = secs(
+            [false, true, false, false, false],
+            [0.0, 200.0, 0.0, 0.0, 0.0],
+        );
+        s.drag(0, 30.0, 600.0, 150.0);
+        assert_eq!(s.heights[1], 200.0);
+    }
+
+    #[test]
+    fn closing_leaves_the_others_as_they_are() {
+        let mut s = secs(ALL, [150.0, 200.0, 150.0, 0.0, 0.0]);
+        s.open = [true, true, true, false, false];
+        s.toggle(1, 600.0, 150.0);
+        assert_eq!(s.open, [true, false, true, false, false]);
+        assert_eq!(
+            s.heights[..3],
+            [150.0, 200.0, 150.0],
+            "Remote remembers 200"
+        );
+    }
+
+    #[test]
+    fn opening_takes_free_space_first_then_below_then_above() {
+        let mut s = secs(
+            [true, false, true, false, false],
+            [150.0, 200.0, 150.0, 0.0, 0.0],
+        );
+        s.toggle(1, 600.0, 150.0);
+        assert_eq!(s.heights[..3], [150.0, 200.0, 150.0], "all from free space");
+        let mut s = secs(
+            [true, false, true, false, false],
+            [300.0, 200.0, 200.0, 0.0, 0.0],
+        );
+        s.toggle(1, 600.0, 150.0);
+        // 100 free, 50 from Worktrees below, 50 from Local above.
+        assert_eq!(s.heights[..3], [250.0, 200.0, 150.0]);
+    }
+
+    #[test]
+    fn opening_never_squashes_others_below_the_minimum() {
+        let mut s = secs(
+            [true, true, false, false, false],
+            [200.0, 200.0, 0.0, 0.0, 0.0],
+        );
+        s.toggle(2, 450.0, 150.0);
+        // Only 50 free and 100 to spare: it still opens at the minimum, and fit makes
+        // room bottom-up.
+        assert_eq!(s.heights[..3], [150.0, 150.0, 150.0]);
+        let mut s = secs([false; SECTIONS], [0.0; SECTIONS]);
+        s.toggle(3, 300.0, 150.0);
+        assert_eq!(s.heights[3], 300.0, "alone, it can have everything");
     }
 
     #[test]
