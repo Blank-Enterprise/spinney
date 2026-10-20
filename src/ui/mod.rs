@@ -2165,12 +2165,16 @@ impl eframe::App for SpinneyApp {
             self.tabs.get_mut(self.active_tab)
         };
         let merge_tool = self.config.merge_tool;
+        let tips = branch_drop::row_tips_shown(
+            branch_drop::dragging(ui.ctx()),
+            self.dialogs.drop_menu.is_some(),
+        );
         if let Some(tab) = tab {
             egui::Panel::left("sidebar")
                 .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(220.0)
-                .show(ui, |ui| sidebar::show(ui, tab, &mut actions));
+                .show(ui, |ui| sidebar::show(ui, tab, tips, &mut actions));
             egui::Panel::right("changes")
                 .frame(theme::side_panel())
                 .resizable(true)

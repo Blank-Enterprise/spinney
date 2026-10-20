@@ -9,6 +9,17 @@ use eframe::egui::{self, Pos2};
 #[derive(Clone, Debug, PartialEq)]
 pub struct BranchDrag(pub String);
 
+/// Whether rows show their hover tooltips: not while a branch is dragged or its drop menu
+/// is open, since a tooltip draws above everything and would cover the menu.
+pub fn row_tips_shown(dragging: bool, menu_open: bool) -> bool {
+    !dragging && !menu_open
+}
+
+/// A branch is being dragged right now.
+pub fn dragging(ctx: &egui::Context) -> bool {
+    egui::DragAndDrop::has_payload_of_type::<BranchDrag>(ctx)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DropChoice {
     /// Merge the dragged branch into the target, which is checked out.
@@ -167,6 +178,20 @@ pub fn menu(ctx: &egui::Context, m: &DropMenu) -> Option<Option<DropChoice>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_tips_hide_while_dragging_or_the_menu_is_open() {
+        assert!(row_tips_shown(false, false));
+        assert!(!row_tips_shown(true, false));
+        assert!(!row_tips_shown(false, true));
+        assert!(!row_tips_shown(true, true));
+        let ctx = egui::Context::default();
+        assert!(!dragging(&ctx));
+        egui::DragAndDrop::set_payload(&ctx, BranchDrag("main".into()));
+        assert!(dragging(&ctx));
+        egui::DragAndDrop::clear_payload(&ctx);
+        assert!(!dragging(&ctx));
+    }
 
     fn facts(current: Option<&str>) -> DropFacts<'_> {
         DropFacts {
