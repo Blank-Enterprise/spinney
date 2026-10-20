@@ -118,7 +118,7 @@ pub enum Center {
     Merge(Box<merge_view::MergeEditor>),
     /// A file a worktree changed since it branched, read-only, with where the change lives
     /// ("committed", "uncommitted"…).
-    Review(Box<FileDiff>, &'static str),
+    Review(Box<FileDiff>, String),
 }
 
 pub struct ProjectTab {
@@ -666,6 +666,8 @@ pub enum Action {
     ReviewFile(usize),
     /// "Open in Git view": make a worktree active and show its graph.
     OpenInGit(PathBuf),
+    /// The Worktrees view's Refresh: reload worktrees, standings and agents.
+    RefreshWorktrees,
     /// From the in-progress banner: `ContinueOp` goes on; `AskOpStep` asks before a Skip
     /// or Abort, which `ConfirmOpStep` runs and `CancelOpStep` drops.
     ContinueOp,
@@ -1329,6 +1331,11 @@ impl SpinneyApp {
                     }
                 }
             }
+            Action::RefreshWorktrees => {
+                if let Some(root) = self.tabs.get(self.active_tab).map(|t| t.root.clone()) {
+                    self.refresh_tab(&root);
+                }
+            }
             Action::OpenInGit(path) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.view = worktrees_view::View::Git;
@@ -1848,8 +1855,17 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
             let Some((wt, base)) = tab.review.base() else {
                 return;
             };
+            let name = tab
+                .worktrees
+                .iter()
+                .find(|w| w.path == wt)
+                .map(|w| sidebar::worktree_label(w).0)
+                .unwrap_or_default();
             match crate::review::file_since(wt, base, &change) {
-                Ok(fd) => tab.center = Center::Review(Box::new(fd), change.origin.label()),
+                Ok(fd) => {
+                    let label = worktrees_view::review_label(change.origin.label(), &name);
+                    tab.center = Center::Review(Box::new(fd), label);
+                }
                 Err(e) => errors.push(format!("{e:#}")),
             }
         }
@@ -2546,7 +2562,10 @@ mod tests {
         let Center::Review(fd, origin) = &app.tabs[0].center else {
             panic!("no review diff")
         };
-        assert_eq!((fd.path.as_str(), *origin), ("done.txt", "committed"));
+        assert_eq!(
+            (fd.path.as_str(), origin.as_str()),
+            ("done.txt", "committed · in agent-1")
+        );
         app.apply(Action::CloseDiff);
         assert!(matches!(app.tabs[0].center, Center::Graph));
         assert_eq!(app.tabs[0].view, View::Worktrees, "back to the list");

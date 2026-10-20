@@ -1,4 +1,5 @@
 mod actions;
+mod agents;
 mod config;
 mod conflict;
 mod creds;

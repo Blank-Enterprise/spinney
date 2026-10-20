@@ -31,12 +31,13 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 | `src/mergetool.rs` | "Open in merge tool": runs `git mergetool --no-prompt` for a conflicted file with the configured tool, stdin closed. |
 | `src/project.rs` | Clone and create, worktrees (where they go, listing, repair and relink), and finding the project for any worktree folder. |
 | `src/review.rs` | The Worktrees view's data: default branch, ahead/behind, and what a worktree changed since it branched (committed, uncommitted, untracked). |
+| `src/agents.rs` | Agents running in each worktree (Claude Code, Codex…), found by their process's working directory (`ps`, `lsof`). |
 | `src/refs.rs`, `src/status.rs`, `src/diff.rs`, `src/graph.rs` | Parse `for-each-ref`, `status`, `diff` and `log` output. |
 | `src/conflict.rs` | Parses a conflicted file's `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` blocks, and writes them back with a side picked for each (the built-in merge tool). |
 | `src/creds.rs`, `src/ssh.rs`, `src/github.rs` | Keychain tokens and the credential helper; per-space SSH keys; the GitHub API and device-flow sign-in. |
 | `src/config.rs` | `config.toml`: spaces and settings. New fields need `#[serde(default)]`, so older configs still load. |
 | `src/ui/mod.rs` | `SpinneyApp`, the `Action` enum and `apply()`, background `Jobs`, and the top confirmation bars. |
-| `src/ui/*.rs` | Panels: `toolbar`, `sidebar`, `graph_view`, `changes`, `diff_view`, `conflict_view`, `merge_view` (built-in merge tool), `worktrees_view` (Git | Worktrees toggle: every worktree and its changes), `dialogs` (modals), `in_progress` (merge/rebase banner), `branch_drop` (drag a branch onto another), `spaces` (account editor), `new_tab`, `theme`. |
+| `src/ui/*.rs` | Panels: `toolbar`, `sidebar`, `graph_view`, `changes`, `diff_view`, `conflict_view`, `merge_view` (built-in merge tool), `worktrees_view` (Git | Worktrees toggle: every worktree and its agents; the selected one's changes go in the right panel), `dialogs` (modals), `in_progress` (merge/rebase banner), `branch_drop` (drag a branch onto another), `spaces` (account editor), `new_tab`, `theme`. |
 
 ## Patterns to follow
 

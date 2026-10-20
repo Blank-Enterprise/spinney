@@ -152,8 +152,8 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
         actions.push(Action::CloseDiff);
     }
     let origin = match center {
-        Center::Review(_, origin) => *origin,
-        _ => "committed",
+        Center::Review(_, origin) => origin.clone(),
+        _ => "committed".to_string(),
     };
     let (fd, work) = match center {
         Center::Diff(w) => {
@@ -163,7 +163,6 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
         Center::CommitFile(fd) | Center::Review(fd, _) => (&**fd, None),
         Center::Graph | Center::Conflict(_) | Center::Merge(_) => return,
     };
-
     let blocked = work
         .as_ref()
         .and_then(|(_, change, ..)| line_actions_blocked(change, fd));
@@ -183,7 +182,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
     });
     ui.horizontal(|ui| {
         let Some((staged, change, dir, sel)) = &work else {
-            ui.weak(origin);
+            ui.weak(&origin);
             return;
         };
         ui.weak(if *staged { "staged" } else { "unstaged" });
