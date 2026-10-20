@@ -152,6 +152,9 @@ pub struct ProjectTab {
     previous_branch: Option<String>,
     /// The commit HEAD points at, and which of `rows` are on its history (`on_head[i]`).
     head: Option<String>,
+    /// `refs::stamp` of `active_worktree` when its branches were loaded, to tell on focus
+    /// whether anything outside Spinney moved HEAD or a branch.
+    refs_stamp: Option<String>,
     ancestry: Ancestry,
     on_head: Vec<bool>,
     /// Rows ⌘-clicked into a multi-selection (for cherry-picking several commits).
@@ -176,6 +179,12 @@ fn error_lines(e: &str) -> (&str, Option<&str>) {
         Some((line, rest)) if !rest.trim().is_empty() => (line, Some(rest.trim())),
         _ => (e.trim_end(), None),
     }
+}
+
+/// Whether what git says `now` differs from what a tab `loaded`. Git failing to answer
+/// (`None`) counts as unchanged, so a hiccup doesn't restart history paging on every focus.
+fn changed_outside<T: PartialEq>(loaded: &T, now: Option<&T>) -> bool {
+    now.is_some_and(|now| now != loaded)
 }
 
 fn needs_commit_graph(common: &Path) -> bool {
@@ -240,6 +249,7 @@ impl ProjectTab {
             detached: None,
             previous_branch: None,
             head: None,
+            refs_stamp: None,
             ancestry: Ancestry::default(),
             on_head: vec![],
             picked: vec![],
@@ -262,12 +272,18 @@ impl ProjectTab {
     }
 
     /// The window is back: reload what may have changed meanwhile. A changed worktree list
-    /// (an agent added, removed or moved one) needs the full refresh; otherwise only the
-    /// active worktree's changes and stashes, so history paging isn't restarted.
+    /// (an agent added, removed or moved one), or a HEAD or branch tip moved by a commit,
+    /// checkout or reset outside Spinney, needs the full refresh; otherwise only the active
+    /// worktree's changes and stashes, so history paging isn't restarted.
     fn refocus(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
         let listed = project::list_worktrees(&self.root)
             .map(|w| w.into_iter().filter(|w| !w.is_bare).collect::<Vec<_>>());
-        if listed.is_ok_and(|w| w != self.worktrees) {
+        if changed_outside(&self.worktrees, listed.ok().as_ref())
+            || changed_outside(
+                &self.refs_stamp,
+                refs::stamp(&self.active_worktree).ok().map(Some).as_ref(),
+            )
+        {
             return self.refresh(ctx, errors);
         }
         self.reload_changes(errors);
@@ -312,6 +328,8 @@ impl ProjectTab {
                     open_review_file(self, i, errors);
                 }
             }
+        } else if matches!(self.center, Center::Review(..)) {
+            self.center = Center::Graph; // only the Worktrees view shows one
         }
     }
 
@@ -326,6 +344,7 @@ impl ProjectTab {
             Err(e) => errors.push(format!("tags: {e:#}")),
         }
         let wt = &self.active_worktree;
+        self.refs_stamp = refs::stamp(wt).ok();
         self.head = actions::head_commit(wt).unwrap_or_else(|e| {
             errors.push(format!("HEAD: {e:#}"));
             None
@@ -403,14 +422,16 @@ impl ProjectTab {
         };
         self.refresh(ctx, errors);
         if let Err(e) = res {
-            // A conflicted apply/pop exits non-zero; the Conflicted list shows the files.
-            let new_conflicts = self
+            // A conflicted apply/pop exits non-zero; name the files it conflicted.
+            let new_conflicts: Vec<String> = self
                 .status
                 .conflicted
                 .iter()
-                .any(|f| !before.contains(&f.path));
-            if applies && new_conflicts {
-                notice = Some("Stash applied with conflicts".to_string());
+                .filter(|f| !before.contains(&f.path))
+                .map(|f| f.path.clone())
+                .collect();
+            if applies && !new_conflicts.is_empty() {
+                notice = Some(dialogs::stash_conflict_notice(&new_conflicts));
             } else {
                 errors.push(format!("{e:#}"));
             }
@@ -734,6 +755,36 @@ pub enum Action {
     TagAt(String),
 }
 
+/// A notice about the operation stopped in `worktree`, shown under its banner.
+struct StoppedNotice {
+    worktree: PathBuf,
+    op: Operation,
+    text: String,
+}
+
+/// Show `text` for the `op` stopped in `worktree`, in place of that worktree's earlier
+/// one: a rebase stopping again on its next commit replaces the last commit's notice.
+fn note_stopped(notices: &mut Vec<StoppedNotice>, worktree: &Path, op: Operation, text: String) {
+    notices.retain(|n| n.worktree != worktree);
+    notices.push(StoppedNotice {
+        worktree: worktree.to_path_buf(),
+        op,
+        text,
+    });
+}
+
+/// Drop the notices whose operation has ended, however it ended (continued, skipped past,
+/// aborted, or finished outside Spinney). `shown` is each tab's worktree and the operation
+/// in progress there; a worktree no tab shows keeps its notice, since nothing has looked.
+fn prune_stopped(notices: &mut Vec<StoppedNotice>, shown: &[(&Path, Option<Operation>)]) {
+    notices.retain(|n| {
+        shown
+            .iter()
+            .filter(|(wt, _)| *wt == n.worktree)
+            .all(|(_, op)| *op == Some(n.op))
+    });
+}
+
 pub struct SpinneyApp {
     config: Config,
     /// None when the config file failed to load, so a broken file is never overwritten.
@@ -744,6 +795,8 @@ pub struct SpinneyApp {
     errors: Vec<String>,
     /// Non-error banner messages.
     notices: Vec<String>,
+    /// "… stopped on conflicts" notices, at most one per worktree, until that operation ends.
+    stopped: Vec<StoppedNotice>,
     dialogs: Dialogs,
     /// The New Tab page is showing over the open tabs (it always shows when there are none).
     new_tab: bool,
@@ -791,6 +844,7 @@ impl SpinneyApp {
             jobs: Jobs::new(ctx.clone()),
             errors,
             notices: vec![],
+            stopped: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
@@ -866,9 +920,8 @@ impl SpinneyApp {
                 Ok(c) => {
                     self.refresh_tab(&root);
                     let what = format!("Pull ({})", c.strategy.label().to_lowercase());
-                    return self
-                        .notices
-                        .push(dialogs::conflict_message(&what, &c.files));
+                    let text = dialogs::conflict_message(&what, &c.files);
+                    return note_stopped(&mut self.stopped, &c.worktree, c.operation(), text);
                 }
                 Err(e) => e,
             };
@@ -981,9 +1034,12 @@ impl SpinneyApp {
             root,
             String::new(),
             move || match actions::pull(&wt, strategy) {
-                Ok(MergeOutcome::Conflicts(files)) => {
-                    Err(actions::PullConflicts { strategy, files }.into())
+                Ok(MergeOutcome::Conflicts(files)) => Err(actions::PullConflicts {
+                    worktree: wt,
+                    strategy,
+                    files,
                 }
+                .into()),
                 Ok(_) => Ok(()),
                 Err(e) => Err(actions::explain_sync(&wt, e)),
             },
@@ -1371,6 +1427,7 @@ impl SpinneyApp {
             Action::OpenInGit(path) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.view = worktrees_view::View::Git;
+                    tab.center = Center::Graph; // a review diff belongs to the Worktrees view
                 }
                 self.apply(Action::ActivateWorktree(path));
             }
@@ -1425,13 +1482,31 @@ impl SpinneyApp {
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
                 if ask {
-                    self.dialogs.confirm_remove = Some(path);
+                    // Named in the confirmation; a missing one has none to lose.
+                    let files = match path.is_dir() {
+                        true => status::status(&path)
+                            .map(|s| s.changed_paths())
+                            .unwrap_or_default(),
+                        false => vec![],
+                    };
+                    self.dialogs.confirm_remove = Some((path, files));
                 } else {
                     self.remove_worktree(&path, false, &mut errors);
                 }
             }
         }
         self.errors.extend(errors);
+        self.prune_stopped();
+    }
+
+    /// Drop the stopped-on-conflicts notices of operations the tabs no longer show.
+    fn prune_stopped(&mut self) {
+        let shown: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|t| (t.active_worktree.as_path(), t.operation))
+            .collect();
+        prune_stopped(&mut self.stopped, &shown);
     }
 
     /// Fast-forward `branch` to `to`, or to its upstream when `to` is None.
@@ -1606,9 +1681,10 @@ impl SpinneyApp {
         };
         tab.refresh(&ctx, errors);
         match res {
-            Ok(MergeOutcome::Conflicts(files)) => self
-                .notices
-                .push(dialogs::conflict_message(&in_progress::title(op), &files)),
+            Ok(MergeOutcome::Conflicts(files)) => {
+                let text = dialogs::conflict_message(&in_progress::title(op), &files);
+                note_stopped(&mut self.stopped, worktree, op, text)
+            }
             Ok(_) => {}
             Err(e) => errors.push(format!("{op}: {e:#}")),
         }
@@ -1711,18 +1787,7 @@ impl SpinneyApp {
                 None => format!(
                     "Push of {branch} was rejected: the remote has commits this branch doesn't."
                 ),
-                Some(l) => {
-                    let lost = match l.lost {
-                        0 => "Commits on the remote that aren't on this branch".to_string(),
-                        1 => format!("1 commit on {} that isn't on this branch", l.tracking),
-                        n => format!("{n} commits on {} that aren't on this branch", l.tracking),
-                    };
-                    format!(
-                        "Force push {}? {lost} will be lost. If someone pushed since your \
-                         last fetch, the push is refused.",
-                        l.branch
-                    )
-                }
+                Some(l) => force_push_question(l),
             };
             let icon = if r.lease.is_some() { "⚠" } else { "↑" };
             ui.label(egui::RichText::new(icon).color(theme::WARN));
@@ -1782,6 +1847,18 @@ impl SpinneyApp {
         }
         if let Some(i) = dismiss {
             self.errors.remove(i);
+        }
+        let mut dismiss = None;
+        for (i, n) in self.stopped.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::ACCENT_TEXT, &n.text);
+                if ui.small_button("Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
+        if let Some(i) = dismiss {
+            self.stopped.remove(i);
         }
         let mut dismiss = None;
         for (i, n) in self.notices.iter().enumerate() {
@@ -1954,6 +2031,28 @@ pub enum LeaveTo {
     Commit(String),
 }
 
+/// The force push confirmation, naming the commits it drops (newest first, the rest
+/// counted). Subjects can hold commas, so they're separated by semicolons.
+pub fn force_push_question(l: &actions::Lease) -> String {
+    let lost = match l.lost {
+        0 => "Commits on the remote that aren't on this branch".to_string(),
+        1 => format!("1 commit on {} that isn't on this branch", l.tracking),
+        n => format!("{n} commits on {} that aren't on this branch", l.tracking),
+    };
+    let mut named = l.lost_commits.join("; ");
+    if !named.is_empty() {
+        named = format!(": {named}");
+        if l.lost > l.lost_commits.len() {
+            named += &format!(" and {} more", l.lost - l.lost_commits.len());
+        }
+    }
+    format!(
+        "Force push {}? {lost} will be lost{named}. If someone pushed since your last fetch, \
+         the push is refused.",
+        l.branch
+    )
+}
+
 /// "Detached at 1a2b3c4".
 pub fn detached_text(head: &str) -> String {
     format!("Detached at {}", &head[..head.len().min(7)])
@@ -2078,6 +2177,8 @@ impl eframe::App for SpinneyApp {
             }
         }
         self.focused = focused;
+        // A refresh or a finished job may have seen an operation end.
+        self.prune_stopped();
         let mut actions = vec![];
         let strip = egui::Frame::new().fill(theme::TABS).inner_margin(Margin {
             left: 10,
@@ -2177,7 +2278,7 @@ impl eframe::App for SpinneyApp {
                 .frame(bar)
                 .show(ui, |ui| Self::push_bar(ui, r, busy, pull, &mut actions));
         }
-        if !self.errors.is_empty() || !self.notices.is_empty() {
+        if !self.errors.is_empty() || !self.notices.is_empty() || !self.stopped.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
         let shortcuts = !self.dialogs.any_open();
@@ -2187,12 +2288,16 @@ impl eframe::App for SpinneyApp {
             self.tabs.get_mut(self.active_tab)
         };
         let merge_tool = self.config.merge_tool;
+        let tips = branch_drop::row_tips_shown(
+            branch_drop::dragging(ui.ctx()),
+            self.dialogs.drop_menu.is_some(),
+        );
         if let Some(tab) = tab {
             egui::Panel::left("sidebar")
                 .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(220.0)
-                .show(ui, |ui| sidebar::show(ui, tab, &mut actions));
+                .show(ui, |ui| sidebar::show(ui, tab, tips, &mut actions));
             egui::Panel::right("changes")
                 .frame(theme::side_panel())
                 .resizable(true)
@@ -2480,6 +2585,37 @@ mod tests {
         assert!(needs_commit_graph(&got));
     }
 
+    fn texts(n: &[StoppedNotice]) -> Vec<&str> {
+        n.iter().map(|n| n.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_worktree_shows_only_its_latest_stop() {
+        let (a, b) = (Path::new("/p/proj"), Path::new("/p/proj.worktrees/x"));
+        let mut n = vec![];
+        note_stopped(&mut n, a, Operation::Rebase, "chapter1".into());
+        note_stopped(&mut n, b, Operation::Merge, "other".into());
+        note_stopped(&mut n, a, Operation::Rebase, "chapter2".into());
+        assert_eq!(texts(&n), ["other", "chapter2"]);
+    }
+
+    #[test]
+    fn ending_the_operation_clears_its_notice() {
+        let (a, b) = (Path::new("/p/proj"), Path::new("/p/proj.worktrees/x"));
+        let mut n = vec![];
+        note_stopped(&mut n, a, Operation::Merge, "merge".into());
+        note_stopped(&mut n, b, Operation::Rebase, "rebase".into());
+
+        // Still stopped, or in no tab: kept.
+        prune_stopped(&mut n, &[(a, Some(Operation::Merge))]);
+        assert_eq!(texts(&n), ["merge", "rebase"]);
+        // Continued, skipped past or aborted: gone, as is one replaced by another kind.
+        prune_stopped(&mut n, &[(a, None), (b, Some(Operation::Rebase))]);
+        assert_eq!(texts(&n), ["rebase"]);
+        prune_stopped(&mut n, &[(b, Some(Operation::CherryPick))]);
+        assert!(n.is_empty());
+    }
+
     pub(super) fn test_app(config: Config, cfg_path: &Path) -> SpinneyApp {
         let ctx = egui::Context::default();
         SpinneyApp {
@@ -2490,6 +2626,7 @@ mod tests {
             jobs: Jobs::new(ctx.clone()),
             errors: vec![],
             notices: vec![],
+            stopped: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
@@ -2556,7 +2693,11 @@ mod tests {
         app.apply(Action::OpenProject(root.clone()));
         std::fs::rename(&wt, tmp.path().join("moved")).unwrap();
         app.apply(Action::RemoveWorktree(wt.clone()));
-        assert_eq!(app.dialogs.confirm_remove.as_ref(), Some(&wt), "asks");
+        assert_eq!(
+            app.dialogs.confirm_remove.as_ref(),
+            Some(&(wt.clone(), vec![])),
+            "asks"
+        );
         let listed = |app: &SpinneyApp| {
             project::list_worktrees(&app.tabs[0].root)
                 .unwrap()
@@ -2568,7 +2709,7 @@ mod tests {
         app.remove_worktree(&wt, true, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!listed(&app), "removed once confirmed");
-        let q = dialogs::remove_question(&wt, true);
+        let q = dialogs::remove_question(&wt, true, &[]);
         assert!(q.contains("is missing") && q.contains("Locate"), "{q}");
     }
 
@@ -2659,9 +2800,27 @@ mod tests {
         assert!(matches!(app.tabs[0].center, Center::Graph));
         assert_eq!(app.tabs[0].view, View::Worktrees, "back to the list");
 
+        // Open in Git view with a review file open: the graph, not that file (#179).
+        app.apply(Action::ReviewFile(0));
+        assert!(matches!(app.tabs[0].center, Center::Review(..)));
         app.apply(Action::OpenInGit(agent.clone()));
         assert_eq!(app.tabs[0].view, View::Git);
         assert_eq!(app.tabs[0].active_worktree, agent);
+        assert!(
+            matches!(app.tabs[0].center, Center::Graph),
+            "graph, not review"
+        );
+
+        // Nor does switching to the Git view, or worktree once there.
+        app.apply(Action::SetView(View::Worktrees));
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        app.apply(Action::SetView(View::Git));
+        assert!(matches!(app.tabs[0].center, Center::Graph));
+        app.apply(Action::SetView(View::Worktrees));
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        app.tabs[0].view = View::Git; // however it got there
+        app.apply(Action::ActivateWorktree(root.clone()));
+        assert!(matches!(app.tabs[0].center, Center::Graph));
         assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 
@@ -2692,6 +2851,54 @@ mod tests {
         tab.refocus(&ctx, &mut errors);
         assert!(tab.worktrees.iter().any(|w| w.path == wt && w.prunable));
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn refocus_picks_up_head_moved_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        app.apply(Action::OpenProject(root.clone()));
+        let ctx = app.ctx.clone();
+        let mut errors = vec![];
+        let tab = &mut app.tabs[0];
+        let g = |args: &[&str]| crate::git::run(&root, args).unwrap();
+        let sha = |rev: &str| g(&["rev-parse", rev]).trim().to_string();
+
+        // A commit made in the terminal.
+        g(&["commit", "-q", "--allow-empty", "-m", "outside"]);
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, None, "changed: full refresh");
+        assert_eq!(tab.head, Some(sha("HEAD")));
+        assert_eq!(wait(&mut tab.log).unwrap()[0].commit.subject, "outside");
+
+        // A detached checkout at the same commit: no sha moves, but HEAD leaves main.
+        g(&["checkout", "-q", "--detach"]);
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, None, "detached: full refresh");
+        assert_eq!(tab.detached, Some(sha("HEAD")));
+        assert!(tab.branches.iter().all(|b| !b.head));
+
+        // Then a commit on the detached HEAD: the banner names the new one.
+        g(&["commit", "-q", "--allow-empty", "-m", "detached"]);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.detached, Some(sha("HEAD")));
+        assert_eq!(wait(&mut tab.log).unwrap()[0].commit.subject, "detached");
+
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, Some(0), "unchanged: no full refresh");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn changed_outside_ignores_git_failing() {
+        assert!(!changed_outside(&1, Some(&1)));
+        assert!(changed_outside(&1, Some(&2)));
+        assert!(!changed_outside(&1, None), "unreadable counts as unchanged");
     }
 
     #[test]
@@ -2822,6 +3029,39 @@ mod tests {
         );
         app.apply(Action::DismissPush);
         assert!(app.rejected_push.is_none());
+    }
+
+    #[test]
+    fn force_push_question_names_the_lost_commits() {
+        let mut l = actions::Lease {
+            worktree: "/tmp/x".into(),
+            branch: "feature/x".into(),
+            remote: "origin".into(),
+            remote_ref: "refs/heads/feature/x".into(),
+            tracking: "origin/feature/x".into(),
+            expect: "1a2b3c4d".into(),
+            lost: 1,
+            lost_commits: vec!["1a2b3c4 Fix the parser, again".into()],
+        };
+        assert_eq!(
+            force_push_question(&l),
+            "Force push feature/x? 1 commit on origin/feature/x that isn't on this branch \
+             will be lost: 1a2b3c4 Fix the parser, again. If someone pushed since your last \
+             fetch, the push is refused."
+        );
+        l.lost = 7;
+        l.lost_commits = (0..5).map(|i| format!("abc000{i} c{i}")).collect();
+        assert!(
+            force_push_question(&l).contains(
+                "7 commits on origin/feature/x that aren't on this branch will be lost: \
+                 abc0000 c0; abc0001 c1; abc0002 c2; abc0003 c3; abc0004 c4 and 2 more. If"
+            ),
+            "{}",
+            force_push_question(&l)
+        );
+        l.lost = 0;
+        l.lost_commits.clear();
+        assert!(force_push_question(&l).contains("branch will be lost. If"));
     }
 
     #[test]

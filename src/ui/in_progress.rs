@@ -23,6 +23,10 @@ pub struct Pending {
     pub step: Step,
 }
 
+/// The banner's icon, the confirmation bars' warning sign. The first choice, ⑂ (U+2442),
+/// has no glyph in the fonts the app draws with, so it showed as an empty box.
+pub const ICON: &str = "⚠";
+
 /// "Merge", "Cherry-pick": the operation at the start of a sentence.
 pub fn title(op: Operation) -> String {
     let name = op.command();
@@ -75,7 +79,7 @@ pub fn bar(
 ) {
     ui.horizontal(|ui| {
         if let Some(step) = asking {
-            ui.label(RichText::new("⚠").color(theme::DELETED));
+            ui.label(RichText::new(ICON).color(theme::DELETED));
             ui.label(RichText::new(question(op, step)).color(theme::TEXT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Cancel").clicked() {
@@ -98,7 +102,7 @@ pub fn bar(
             });
             return;
         }
-        ui.label(RichText::new("⑂").color(theme::WARN));
+        ui.label(RichText::new(ICON).color(theme::WARN));
         ui.label(RichText::new(banner_text(op, conflicts)).color(theme::TEXT));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let r = ui
@@ -173,5 +177,11 @@ mod tests {
         );
         let q = question(Operation::CherryPick, Step::Skip);
         assert!(q.contains("left out of the cherry-pick"), "{q}");
+    }
+
+    #[test]
+    fn banner_icon_is_one_that_renders() {
+        // Pinned to the glyph the other confirmation bars use, which draws on screen.
+        assert_eq!(ICON, "⚠");
     }
 }
