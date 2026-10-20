@@ -152,6 +152,9 @@ pub struct ProjectTab {
     previous_branch: Option<String>,
     /// The commit HEAD points at, and which of `rows` are on its history (`on_head[i]`).
     head: Option<String>,
+    /// `refs::stamp` of `active_worktree` when its branches were loaded, to tell on focus
+    /// whether anything outside Spinney moved HEAD or a branch.
+    refs_stamp: Option<String>,
     ancestry: Ancestry,
     on_head: Vec<bool>,
     /// Rows ⌘-clicked into a multi-selection (for cherry-picking several commits).
@@ -168,6 +171,12 @@ pub struct ProjectTab {
 fn common_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let out = git::run(root, &["rev-parse", "--git-common-dir"])?;
     Ok(root.join(out.trim()))
+}
+
+/// Whether what git says `now` differs from what a tab `loaded`. Git failing to answer
+/// (`None`) counts as unchanged, so a hiccup doesn't restart history paging on every focus.
+fn changed_outside<T: PartialEq>(loaded: &T, now: Option<&T>) -> bool {
+    now.is_some_and(|now| now != loaded)
 }
 
 fn needs_commit_graph(common: &Path) -> bool {
@@ -232,6 +241,7 @@ impl ProjectTab {
             detached: None,
             previous_branch: None,
             head: None,
+            refs_stamp: None,
             ancestry: Ancestry::default(),
             on_head: vec![],
             picked: vec![],
@@ -254,12 +264,18 @@ impl ProjectTab {
     }
 
     /// The window is back: reload what may have changed meanwhile. A changed worktree list
-    /// (an agent added, removed or moved one) needs the full refresh; otherwise only the
-    /// active worktree's changes and stashes, so history paging isn't restarted.
+    /// (an agent added, removed or moved one), or a HEAD or branch tip moved by a commit,
+    /// checkout or reset outside Spinney, needs the full refresh; otherwise only the active
+    /// worktree's changes and stashes, so history paging isn't restarted.
     fn refocus(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
         let listed = project::list_worktrees(&self.root)
             .map(|w| w.into_iter().filter(|w| !w.is_bare).collect::<Vec<_>>());
-        if listed.is_ok_and(|w| w != self.worktrees) {
+        if changed_outside(&self.worktrees, listed.ok().as_ref())
+            || changed_outside(
+                &self.refs_stamp,
+                refs::stamp(&self.active_worktree).ok().map(Some).as_ref(),
+            )
+        {
             return self.refresh(ctx, errors);
         }
         self.reload_changes(errors);
@@ -304,6 +320,8 @@ impl ProjectTab {
                     open_review_file(self, i, errors);
                 }
             }
+        } else if matches!(self.center, Center::Review(..)) {
+            self.center = Center::Graph; // only the Worktrees view shows one
         }
     }
 
@@ -318,6 +336,7 @@ impl ProjectTab {
             Err(e) => errors.push(format!("tags: {e:#}")),
         }
         let wt = &self.active_worktree;
+        self.refs_stamp = refs::stamp(wt).ok();
         self.head = actions::head_commit(wt).unwrap_or_else(|e| {
             errors.push(format!("HEAD: {e:#}"));
             None
@@ -1353,6 +1372,7 @@ impl SpinneyApp {
             Action::OpenInGit(path) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.view = worktrees_view::View::Git;
+                    tab.center = Center::Graph; // a review diff belongs to the Worktrees view
                 }
                 self.apply(Action::ActivateWorktree(path));
             }
@@ -2176,12 +2196,16 @@ impl eframe::App for SpinneyApp {
             self.tabs.get_mut(self.active_tab)
         };
         let merge_tool = self.config.merge_tool;
+        let tips = branch_drop::row_tips_shown(
+            branch_drop::dragging(ui.ctx()),
+            self.dialogs.drop_menu.is_some(),
+        );
         if let Some(tab) = tab {
             egui::Panel::left("sidebar")
                 .frame(theme::side_panel())
                 .resizable(true)
                 .default_size(220.0)
-                .show(ui, |ui| sidebar::show(ui, tab, &mut actions));
+                .show(ui, |ui| sidebar::show(ui, tab, tips, &mut actions));
             egui::Panel::right("changes")
                 .frame(theme::side_panel())
                 .resizable(true)
@@ -2648,9 +2672,27 @@ mod tests {
         assert!(matches!(app.tabs[0].center, Center::Graph));
         assert_eq!(app.tabs[0].view, View::Worktrees, "back to the list");
 
+        // Open in Git view with a review file open: the graph, not that file (#179).
+        app.apply(Action::ReviewFile(0));
+        assert!(matches!(app.tabs[0].center, Center::Review(..)));
         app.apply(Action::OpenInGit(agent.clone()));
         assert_eq!(app.tabs[0].view, View::Git);
         assert_eq!(app.tabs[0].active_worktree, agent);
+        assert!(
+            matches!(app.tabs[0].center, Center::Graph),
+            "graph, not review"
+        );
+
+        // Nor does switching to the Git view, or worktree once there.
+        app.apply(Action::SetView(View::Worktrees));
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        app.apply(Action::SetView(View::Git));
+        assert!(matches!(app.tabs[0].center, Center::Graph));
+        app.apply(Action::SetView(View::Worktrees));
+        app.apply(Action::ReviewWorktree(agent.clone()));
+        app.tabs[0].view = View::Git; // however it got there
+        app.apply(Action::ActivateWorktree(root.clone()));
+        assert!(matches!(app.tabs[0].center, Center::Graph));
         assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 
@@ -2681,6 +2723,54 @@ mod tests {
         tab.refocus(&ctx, &mut errors);
         assert!(tab.worktrees.iter().any(|w| w.path == wt && w.prunable));
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn refocus_picks_up_head_moved_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        app.apply(Action::OpenProject(root.clone()));
+        let ctx = app.ctx.clone();
+        let mut errors = vec![];
+        let tab = &mut app.tabs[0];
+        let g = |args: &[&str]| crate::git::run(&root, args).unwrap();
+        let sha = |rev: &str| g(&["rev-parse", rev]).trim().to_string();
+
+        // A commit made in the terminal.
+        g(&["commit", "-q", "--allow-empty", "-m", "outside"]);
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, None, "changed: full refresh");
+        assert_eq!(tab.head, Some(sha("HEAD")));
+        assert_eq!(wait(&mut tab.log).unwrap()[0].commit.subject, "outside");
+
+        // A detached checkout at the same commit: no sha moves, but HEAD leaves main.
+        g(&["checkout", "-q", "--detach"]);
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, None, "detached: full refresh");
+        assert_eq!(tab.detached, Some(sha("HEAD")));
+        assert!(tab.branches.iter().all(|b| !b.head));
+
+        // Then a commit on the detached HEAD: the banner names the new one.
+        g(&["commit", "-q", "--allow-empty", "-m", "detached"]);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.detached, Some(sha("HEAD")));
+        assert_eq!(wait(&mut tab.log).unwrap()[0].commit.subject, "detached");
+
+        tab.selected_commit = Some(0);
+        tab.refocus(&ctx, &mut errors);
+        assert_eq!(tab.selected_commit, Some(0), "unchanged: no full refresh");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn changed_outside_ignores_git_failing() {
+        assert!(!changed_outside(&1, Some(&1)));
+        assert!(changed_outside(&1, Some(&2)));
+        assert!(!changed_outside(&1, None), "unreadable counts as unchanged");
     }
 
     #[test]

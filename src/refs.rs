@@ -114,6 +114,24 @@ pub fn current_branch(worktree: &Path) -> Result<Option<String>> {
     Ok((!name.is_empty()).then(|| name.to_string()))
 }
 
+/// Every branch and tag tip, which branch the worktree has checked out (`*`) and the commit
+/// HEAD is at: what a commit, checkout, reset or fetch made outside Spinney changes. Two
+/// cheap git calls, so it can be compared on every focus.
+pub fn stamp(worktree: &Path) -> Result<String> {
+    let tips = git::run(
+        worktree,
+        &[
+            "for-each-ref",
+            "--format=%(HEAD)%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    )?;
+    let head = git::run_ok_codes(worktree, &["rev-parse", "--verify", "-q", "HEAD"], &[0, 1])?;
+    Ok(format!("HEAD {}\n{tips}", head.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

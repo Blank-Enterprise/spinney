@@ -602,11 +602,12 @@ pub fn fetch(dir: &Path) -> Result<()> {
 
 /// `git pull` arguments for `strategy`, all explicit so the user's `pull.rebase`,
 /// `pull.ff` or `branch.<name>.rebase` cannot turn it into a different kind of pull.
+/// `--prune` drops remote branches deleted on the remote, as Fetch does; tags stay.
 pub fn pull_args(strategy: PullStrategy) -> &'static [&'static str] {
     match strategy {
-        PullStrategy::FastForwardOnly => &["pull", "--no-rebase", "--ff-only"],
-        PullStrategy::Merge => &["pull", "--no-rebase", "--ff", "--no-edit"],
-        PullStrategy::Rebase => &["pull", "--rebase=true"],
+        PullStrategy::FastForwardOnly => &["pull", "--prune", "--no-rebase", "--ff-only"],
+        PullStrategy::Merge => &["pull", "--prune", "--no-rebase", "--ff", "--no-edit"],
+        PullStrategy::Rebase => &["pull", "--prune", "--rebase=true"],
     }
 }
 
@@ -1727,13 +1728,16 @@ mod tests {
     fn pull_args_are_explicit() {
         assert_eq!(
             pull_args(PullStrategy::FastForwardOnly),
-            ["pull", "--no-rebase", "--ff-only"]
+            ["pull", "--prune", "--no-rebase", "--ff-only"]
         );
         assert_eq!(
             pull_args(PullStrategy::Merge),
-            ["pull", "--no-rebase", "--ff", "--no-edit"]
+            ["pull", "--prune", "--no-rebase", "--ff", "--no-edit"]
         );
-        assert_eq!(pull_args(PullStrategy::Rebase), ["pull", "--rebase=true"]);
+        assert_eq!(
+            pull_args(PullStrategy::Rebase),
+            ["pull", "--prune", "--rebase=true"]
+        );
     }
 
     #[test]
@@ -1875,6 +1879,58 @@ mod tests {
         assert_eq!(err.worktree, ours);
         fetch(&ours).unwrap();
         rejected(push(&ours).unwrap_err());
+    }
+
+    #[test]
+    fn fetch_prunes_branches_deleted_on_the_remote() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        let g = |dir: &Path, args: &[&str]| git::run(dir, args).unwrap();
+        g(
+            &theirs,
+            &["push", "-q", "origin", "main:refs/heads/feature/gone"],
+        );
+        g(&theirs, &["tag", "v1"]);
+        g(&theirs, &["push", "-q", "origin", "v1"]);
+        // The app fetches in the common dir; packed refs must be pruned too.
+        let common = ours.join(".git");
+        fetch(&common).unwrap();
+        g(&ours, &["pack-refs", "--all"]);
+        let has = |r: &str| git::run(&ours, &["rev-parse", "--verify", "--quiet", r]).is_ok();
+        assert!(has("refs/remotes/origin/feature/gone"));
+        assert!(has("refs/tags/v1"));
+
+        g(
+            &theirs,
+            &["push", "-q", "origin", "--delete", "feature/gone", "v1"],
+        );
+        fetch(&common).unwrap();
+        assert!(!has("refs/remotes/origin/feature/gone"));
+        assert!(has("refs/remotes/origin/main"));
+        // Tags are left alone: one deleted on the remote stays here.
+        assert!(has("refs/tags/v1"));
+    }
+
+    #[test]
+    fn pull_prunes_branches_deleted_on_the_remote() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        let g = |dir: &Path, args: &[&str]| git::run(dir, args).unwrap();
+        g(
+            &theirs,
+            &["push", "-q", "origin", "main:refs/heads/feature/gone"],
+        );
+        g(&theirs, &["tag", "v1"]);
+        g(&theirs, &["push", "-q", "origin", "v1"]);
+        fetch(&ours.join(".git")).unwrap();
+        let has = |r: &str| git::run(&ours, &["rev-parse", "--verify", "--quiet", r]).is_ok();
+        assert!(has("refs/remotes/origin/feature/gone"));
+
+        g(
+            &theirs,
+            &["push", "-q", "origin", "--delete", "feature/gone", "v1"],
+        );
+        pull(&ours, PullStrategy::FastForwardOnly).unwrap();
+        assert!(!has("refs/remotes/origin/feature/gone"));
+        assert!(has("refs/tags/v1"));
     }
 
     #[test]
