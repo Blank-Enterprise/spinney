@@ -2,10 +2,10 @@
 //! merge and rebase.
 
 use super::{
-    actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
-    toolbar::folder_name, JobKind, ProjectTab, SpinneyApp,
+    actions, add_project, checkout, graph_view, note_stopped, paths, project, repo_name_from_url,
+    spaces, theme, toolbar::folder_name, JobKind, ProjectTab, SpinneyApp,
 };
-use crate::actions::{MergeMode, MergeOutcome, ResetMode, ResetPlan};
+use crate::actions::{MergeMode, MergeOutcome, Operation, ResetMode, ResetPlan};
 use crate::todo::{self, TodoAction, TodoItem, TodoPlan};
 use crate::{creds, github, refs};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
@@ -1407,7 +1407,8 @@ impl SpinneyApp {
         tab.refresh(&ctx, &mut errors);
         match res {
             Ok(MergeOutcome::Conflicts(files)) => {
-                self.notices.push(conflict_message("Rebase", &files))
+                let text = conflict_message("Rebase", &files);
+                note_stopped(&mut self.stopped, &d.worktree, Operation::Rebase, text)
             }
             Ok(_) => {}
             Err(e) => {
@@ -1509,7 +1510,8 @@ impl SpinneyApp {
         tab.refresh(&ctx, errors);
         match res {
             Ok(MergeOutcome::Conflicts(files)) => {
-                self.notices.push(conflict_message("Revert", &files))
+                let text = conflict_message("Revert", &files);
+                note_stopped(&mut self.stopped, worktree, Operation::Revert, text)
             }
             Ok(_) => {}
             Err(e) => errors.push(format!("{e:#}")),
@@ -1530,7 +1532,11 @@ impl SpinneyApp {
         tab.refresh(&ctx, errors);
         match res {
             Ok(MergeOutcome::Conflicts(files)) => {
-                self.notices.push(conflict_message("Cherry-pick", &files))
+                let (wt, text) = (
+                    &tab.active_worktree,
+                    conflict_message("Cherry-pick", &files),
+                );
+                note_stopped(&mut self.stopped, wt, Operation::CherryPick, text)
             }
             Ok(_) => {}
             Err(e) => errors.push(format!("{e:#}")),
@@ -1682,7 +1688,7 @@ impl SpinneyApp {
         };
         let res = actions::merge(&d.worktree, &d.branch, d.mode);
         tab.refresh(&ctx, &mut errors);
-        let mut notice = None;
+        let (mut notice, mut stopped) = (None, None);
         match res {
             Ok(MergeOutcome::Done) if d.mode == MergeMode::Squash => {
                 // Committed through the normal card, never as an amend of HEAD.
@@ -1701,13 +1707,16 @@ impl SpinneyApp {
                     d.into, d.branch
                 ))
             }
-            Ok(MergeOutcome::Conflicts(files)) => notice = Some(conflict_message("Merge", &files)),
+            Ok(MergeOutcome::Conflicts(files)) => stopped = Some(conflict_message("Merge", &files)),
             Ok(MergeOutcome::SquashConflicts(files)) => {
                 errors.push(squash_conflict_message(&files))
             }
             Err(e) => errors.push(format!("{e:#}")),
         }
         self.notices.extend(notice);
+        if let Some(text) = stopped {
+            note_stopped(&mut self.stopped, &d.worktree, Operation::Merge, text);
+        }
         self.errors.extend(errors);
     }
 
@@ -1728,7 +1737,8 @@ impl SpinneyApp {
                 d.current, d.onto
             )),
             Ok(MergeOutcome::Conflicts(files)) => {
-                self.notices.push(conflict_message("Rebase", &files))
+                let text = conflict_message("Rebase", &files);
+                note_stopped(&mut self.stopped, &d.worktree, Operation::Rebase, text)
             }
             // Only a squash merge undoes itself.
             Ok(MergeOutcome::SquashConflicts(_)) => {}
@@ -2636,9 +2646,9 @@ mod tests {
         assert_eq!(app.tabs[0].operation, Some(Operation::CherryPick));
         assert_eq!(app.tabs[0].status.conflicted.len(), 1);
         assert!(app
-            .notices
+            .stopped
             .iter()
-            .any(|n| n.starts_with("Cherry-pick stopped")));
+            .any(|n| n.text.starts_with("Cherry-pick stopped")));
     }
 
     #[test]
@@ -2690,7 +2700,10 @@ mod tests {
         assert!(app.dialogs.revert.is_none());
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, Some(Operation::Revert));
-        assert!(app.notices.iter().any(|n| n.starts_with("Revert stopped")));
+        assert!(app
+            .stopped
+            .iter()
+            .any(|n| n.text.starts_with("Revert stopped")));
     }
 
     #[test]
@@ -2967,7 +2980,7 @@ mod tests {
 
         merge(&mut app);
         assert!(app.errors.is_empty(), "{:?}", app.errors);
-        assert!(app.notices.iter().any(|n| n.contains("Resolve them")));
+        assert!(app.stopped.iter().any(|n| n.text.contains("Resolve them")));
         assert_eq!(app.tabs[0].operation, Some(Operation::Merge));
         assert_eq!(app.tabs[0].status.conflicted.len(), 1);
 
@@ -2980,6 +2993,7 @@ mod tests {
         app.apply(Action::ConfirmOpStep);
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, None);
+        assert!(app.stopped.is_empty(), "aborting drops its notice");
         assert!(app.tabs[0].status.conflicted.is_empty());
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "main\n");
 
@@ -2996,9 +3010,11 @@ mod tests {
         let f = app.tabs[0].status.conflicted[0].clone();
         app.apply(Action::StageFile(f, false));
         assert_eq!(app.tabs[0].operation, Some(Operation::Merge));
+        assert_eq!(app.stopped.len(), 1, "the second merge's notice only");
         app.apply(Action::ContinueOp);
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, None);
+        assert!(app.stopped.is_empty(), "continuing drops its notice");
         assert_eq!(g(&["log", "-1", "--format=%P"]).split(' ').count(), 2);
     }
 
