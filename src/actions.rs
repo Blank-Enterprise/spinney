@@ -66,6 +66,12 @@ pub fn head_pushed(worktree: &Path) -> Result<bool> {
 /// Commits that rebasing HEAD onto `onto` rewrites although they are already on the
 /// upstream: reachable from HEAD and `@{u}` but not from `onto`. No upstream means none.
 pub fn rebase_rewrites_pushed(worktree: &Path, onto: &str) -> Result<usize> {
+    pushed_not_on(worktree, onto)
+}
+
+/// Commits on both HEAD and its upstream that `onto` lacks: what moving the branch to (or
+/// replaying it on) `onto` takes off pushed history. No upstream means none.
+fn pushed_not_on(worktree: &Path, onto: &str) -> Result<usize> {
     if !has_upstream(worktree) {
         return Ok(0);
     }
@@ -78,6 +84,93 @@ pub fn rebase_rewrites_pushed(worktree: &Path, onto: &str) -> Result<usize> {
     let range = format!("{onto}..{base}");
     let n = git::run(worktree, &["rev-list", "--count", &range])?;
     Ok(n.trim().parse()?)
+}
+
+/// How `reset` moves the current branch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResetMode {
+    /// Keep the index and files: the dropped commits' changes end up staged.
+    Soft,
+    /// Keep the files but reset the index: the dropped commits' changes end up unstaged.
+    Mixed,
+    /// Reset the index and tracked files: uncommitted changes to them are lost.
+    Hard,
+}
+
+impl ResetMode {
+    pub fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
+/// What resetting `branch` from `head` to `target` would do, worked out before asking so
+/// the confirmation can name it and `reset` can refuse if anything changed since.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResetPlan {
+    pub branch: String,
+    pub head: String,
+    pub target: String,
+    /// Commits on the branch after `target`: no longer on it after the reset.
+    pub dropped: usize,
+    /// Of `dropped`, those already on the upstream: pushing afterwards needs a force push.
+    pub pushed: usize,
+    /// Tracked files with uncommitted (staged or unstaged) changes: what a hard reset loses.
+    pub changed: Vec<String>,
+}
+
+/// Plan resetting the checked-out branch to `target`, which must be on its history.
+pub fn reset_plan(worktree: &Path, target: &str) -> Result<ResetPlan> {
+    let Some(branch) = refs::current_branch(worktree)? else {
+        bail!("Check out a branch first");
+    };
+    if let Some(op) = in_progress(worktree)? {
+        bail!("A {op} is in progress; finish or abort it first");
+    }
+    let head = rev_parse(worktree, "HEAD")?;
+    let target = rev_parse(worktree, &format!("{target}^{{commit}}"))?;
+    if !is_ancestor(worktree, &target, "HEAD")? {
+        bail!("{} isn't on {branch}'s history", &target[..8]);
+    }
+    let range = format!("{target}..{head}");
+    let dropped = git::run(worktree, &["rev-list", "--count", &range])?;
+    Ok(ResetPlan {
+        dropped: dropped.trim().parse()?,
+        pushed: pushed_not_on(worktree, &target)?,
+        changed: changed_tracked(worktree)?,
+        branch,
+        head,
+        target,
+    })
+}
+
+/// Tracked files that differ from HEAD in the index or the worktree.
+fn changed_tracked(worktree: &Path) -> Result<Vec<String>> {
+    let args = ["-c", "core.quotepath=off", "diff", "HEAD", "--name-only"];
+    Ok(git::run(worktree, &args)?
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Reset as planned in `plan`, refusing when the branch, HEAD or (for a hard reset) the
+/// uncommitted changes are no longer what the user was shown.
+pub fn reset(worktree: &Path, plan: &ResetPlan, mode: ResetMode) -> Result<()> {
+    let branch = refs::current_branch(worktree)?;
+    if branch.as_deref() != Some(&plan.branch) || rev_parse(worktree, "HEAD")? != plan.head {
+        bail!("{} moved since you were asked; try again", plan.branch);
+    }
+    if let Some(op) = in_progress(worktree)? {
+        bail!("A {op} is in progress; finish or abort it first");
+    }
+    if mode == ResetMode::Hard && changed_tracked(worktree)? != plan.changed {
+        bail!("Your uncommitted changes changed since you were asked; try again");
+    }
+    git::run(worktree, &["reset", "-q", mode.flag(), &plan.target])?;
+    Ok(())
 }
 
 /// How `merge` brings the branch in.
@@ -631,6 +724,11 @@ pub fn detached_head(worktree: &Path) -> Result<Option<String>> {
     if refs::current_branch(worktree)?.is_some() {
         return Ok(None);
     }
+    head_commit(worktree)
+}
+
+/// The commit HEAD points at, or None before the first commit.
+pub fn head_commit(worktree: &Path) -> Result<Option<String>> {
     let out = git::run_ok_codes(worktree, &["rev-parse", "--verify", "-q", "HEAD"], &[0, 1])?;
     let sha = out.trim();
     Ok((!sha.is_empty()).then(|| sha.to_string()))
@@ -1335,6 +1433,117 @@ mod tests {
         // A deleted branch is not offered.
         g(&main, &["branch", "-q", "-D", "topic"]);
         assert_eq!(previous_branch(&main).unwrap().as_deref(), Some("main"));
+    }
+
+    /// `main` with `c.txt` and `d.txt` committed on top of `init`; returns `init`.
+    fn two_ahead(main: &Path) -> String {
+        let init = head(main, "HEAD");
+        write_commit(main, "c.txt");
+        write_commit(main, "d.txt");
+        init
+    }
+
+    #[test]
+    fn reset_soft_keeps_dropped_changes_staged() {
+        let (_tmp, _root, main) = cloned();
+        let init = two_ahead(&main);
+        let plan = reset_plan(&main, &init).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.dropped), ("main", 2));
+        reset(&main, &plan, ResetMode::Soft).unwrap();
+        assert_eq!(head(&main, "HEAD"), init);
+        assert_eq!(
+            g(&main, &["diff", "--cached", "--name-only"]),
+            "c.txt\nd.txt"
+        );
+        assert!(g(&main, &["diff", "--name-only"]).is_empty());
+        assert!(main.join("c.txt").exists());
+    }
+
+    #[test]
+    fn reset_mixed_keeps_dropped_changes_unstaged() {
+        let (_tmp, _root, main) = cloned();
+        let init = two_ahead(&main);
+        std::fs::write(main.join("a.txt"), "edited\n").unwrap();
+        g(&main, &["add", "a.txt"]);
+        let plan = reset_plan(&main, &init).unwrap();
+        reset(&main, &plan, ResetMode::Mixed).unwrap();
+        assert_eq!(head(&main, "HEAD"), init);
+        assert!(g(&main, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(
+            g(&main, &["diff", "--name-only"]),
+            "a.txt",
+            "unstaged, kept"
+        );
+        let status = g(&main, &["status", "--porcelain"]);
+        assert!(
+            status.contains("?? c.txt") && status.contains("?? d.txt"),
+            "{status}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(main.join("a.txt")).unwrap(),
+            "edited\n"
+        );
+    }
+
+    #[test]
+    fn reset_hard_drops_changes_it_named_and_keeps_untracked() {
+        let (_tmp, _root, main) = cloned();
+        let init = two_ahead(&main);
+        std::fs::write(main.join("a.txt"), "edited\n").unwrap();
+        std::fs::write(main.join("new.txt"), "staged new\n").unwrap();
+        g(&main, &["add", "new.txt"]);
+        std::fs::write(main.join("untracked.txt"), "u\n").unwrap();
+        let plan = reset_plan(&main, &init).unwrap();
+        assert_eq!(plan.changed, ["a.txt", "new.txt"]);
+        // Another change after asking: refused, nothing touched.
+        std::fs::write(main.join("c.txt"), "more\n").unwrap();
+        let err = reset(&main, &plan, ResetMode::Hard).unwrap_err();
+        assert!(err.to_string().contains("changed since"), "{err}");
+        assert_eq!(head(&main, "HEAD~2"), init);
+        g(&main, &["checkout", "--", "c.txt"]);
+        reset(&main, &plan, ResetMode::Hard).unwrap();
+        assert_eq!(head(&main, "HEAD"), init);
+        assert!(g(&main, &["status", "--porcelain", "--untracked-files=no"]).is_empty());
+        assert_eq!(std::fs::read_to_string(main.join("a.txt")).unwrap(), "a\n");
+        assert!(!main.join("c.txt").exists() && !main.join("new.txt").exists());
+        assert!(main.join("untracked.txt").exists(), "untracked kept");
+    }
+
+    #[test]
+    fn reset_refuses_off_history_detached_or_moved() {
+        let (_tmp, _root, main) = cloned();
+        let x = head(&main, "origin/feature/x");
+        let err = reset_plan(&main, &x).unwrap_err();
+        assert!(err.to_string().contains("isn't on main's history"), "{err}");
+        let init = two_ahead(&main);
+        let plan = reset_plan(&main, &init).unwrap();
+        write_commit(&main, "e.txt");
+        let err = reset(&main, &plan, ResetMode::Soft).unwrap_err();
+        assert!(err.to_string().contains("moved since"), "{err}");
+        g(&main, &["checkout", "-q", "--detach"]);
+        let err = reset_plan(&main, &init).unwrap_err();
+        assert!(
+            err.to_string().contains("Check out a branch first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reset_counts_pushed_commits_it_drops() {
+        let (_tmp, _root, main) = cloned();
+        let init = head(&main, "HEAD");
+        write_commit(&main, "c.txt");
+        let plan = reset_plan(&main, &init).unwrap();
+        assert_eq!((plan.dropped, plan.pushed), (1, 0), "not pushed");
+        push(&main).unwrap();
+        write_commit(&main, "d.txt");
+        let plan = reset_plan(&main, &init).unwrap();
+        assert_eq!((plan.dropped, plan.pushed), (2, 1), "c is pushed, d is not");
+        let one_back = head(&main, "HEAD~1");
+        let plan = reset_plan(&main, &one_back).unwrap();
+        assert_eq!((plan.dropped, plan.pushed), (1, 0), "only d is dropped");
+        g(&main, &["switch", "-q", "-c", "topic"]);
+        assert_eq!(reset_plan(&main, &init).unwrap().pushed, 0, "no upstream");
     }
 
     #[test]

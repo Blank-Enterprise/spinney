@@ -16,7 +16,7 @@ mod toolbar;
 use crate::actions::{self, CheckoutOutcome, MergeOutcome, Operation};
 use crate::config::{Config, Space};
 use crate::diff::FileDiff;
-use crate::graph::{LogStream, Row};
+use crate::graph::{Ancestry, LogStream, Row};
 use crate::project::{self, Layout, Worktree};
 use crate::refs::{self, Branch};
 use crate::stage::Direction;
@@ -143,6 +143,10 @@ pub struct ProjectTab {
     detached: Option<String>,
     /// The branch to go back to from a detached HEAD.
     previous_branch: Option<String>,
+    /// The commit HEAD points at, and which of `rows` are on its history (`on_head[i]`).
+    head: Option<String>,
+    ancestry: Ancestry,
+    on_head: Vec<bool>,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -207,6 +211,9 @@ impl ProjectTab {
             operation: None,
             detached: None,
             previous_branch: None,
+            head: None,
+            ancestry: Ancestry::default(),
+            on_head: vec![],
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -253,6 +260,10 @@ impl ProjectTab {
             Err(e) => errors.push(format!("branches: {e:#}")),
         }
         let wt = &self.active_worktree;
+        self.head = actions::head_commit(wt).unwrap_or_else(|e| {
+            errors.push(format!("HEAD: {e:#}"));
+            None
+        });
         self.detached = actions::detached_head(wt).unwrap_or_else(|e| {
             errors.push(format!("HEAD: {e:#}"));
             None
@@ -335,6 +346,13 @@ impl ProjectTab {
     fn poll_log(&mut self) -> Option<String> {
         match self.log.poll()? {
             Ok(rows) => {
+                if self.rows.is_empty() {
+                    self.ancestry = Ancestry::new(self.head.as_deref());
+                    self.on_head.clear();
+                }
+                let anc = &mut self.ancestry;
+                self.on_head
+                    .extend(rows.iter().map(|r| anc.mark(&r.commit)));
                 self.rows.extend(rows);
                 None
             }
@@ -601,6 +619,8 @@ pub enum Action {
     CopyCommitMessage(String),
     /// Check out the commit with this SHA, detaching HEAD.
     CheckoutCommit(String),
+    /// Ask before resetting the checked-out branch to the commit with this SHA.
+    AskReset(String, actions::ResetMode),
     /// "Create branch here…" on the detached-HEAD banner: a new branch at HEAD, switched to.
     AttachBranch,
     /// "Create branch here…" on a commit: the new-branch dialog with the commit as base,
@@ -1130,6 +1150,7 @@ impl SpinneyApp {
                     });
                 }
             }
+            Action::AskReset(sha, mode) => self.ask_reset(&sha, mode, &mut errors),
             Action::AttachBranch => {
                 let head = self
                     .tabs
@@ -2030,9 +2051,13 @@ impl eframe::App for SpinneyApp {
                     remotes: &remotes,
                     branches: &branches,
                 };
+                let branch = tab.branches.iter().find(|b| b.head && !b.remote);
                 let menu = graph_view::MenuContext {
                     layout: tab.layout,
                     dirty: graph_view::clean_blocked(&tab.status, tab.operation),
+                    branch: branch.map(|b| b.name.clone()),
+                    operation: tab.operation,
+                    on_head: &tab.on_head,
                 };
                 let out = graph_view::show(
                     ui,
