@@ -301,6 +301,29 @@ pub fn commit_detail(c: &Commit) -> String {
     )
 }
 
+/// The Commits section's last line, under its commits. A `HEAD` base (detached, or a branch
+/// with nothing to compare with) has no commits, so it says so rather than "branched from HEAD".
+pub fn base_text(base: &str) -> String {
+    match base {
+        "HEAD" => "No commits: comparing with HEAD, uncommitted changes only".into(),
+        "@{upstream}" => "since its upstream".into(),
+        b => format!("branched from {b}"),
+    }
+}
+
+/// The "All changes" row's detail: "3 files since it branched, uncommitted too".
+pub fn all_changes_text(files: usize, base: &str) -> String {
+    let what = match files {
+        1 => "1 file".to_string(),
+        k => format!("{k} files"),
+    };
+    match base {
+        "HEAD" => format!("{what}, uncommitted"),
+        "@{upstream}" => format!("{what} since its upstream, uncommitted too"),
+        _ => format!("{what} since it branched, uncommitted too"),
+    }
+}
+
 /// The Commits section: one line of dots, "All changes" on top, then each commit, newest
 /// first, then the commit it branched from.
 fn commit_graph(ui: &mut egui::Ui, review: &Review, base: &str, actions: &mut Vec<Action>) {
@@ -331,16 +354,12 @@ fn commit_graph(ui: &mut egui::Ui, review: &Review, base: &str, actions: &mut Ve
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            let what = match review.changes.len() {
-                1 => "1 file".to_string(),
-                k => format!("{k} files"),
-            };
             let (r, rect) = two_line_row(
                 ui,
                 review.commit.is_none(),
                 LANE,
                 "All changes",
-                &format!("{what} since it branched, uncommitted too"),
+                &all_changes_text(review.changes.len(), base),
                 "",
             );
             lane(ui, rect, false, true, true);
@@ -357,10 +376,6 @@ fn commit_graph(ui: &mut egui::Ui, review: &Review, base: &str, actions: &mut Ve
                 }
             }
             // Where it branched: the base, muted and not selectable.
-            let base = match base {
-                "@{upstream}" => "its upstream",
-                b => b,
-            };
             let width = ui.available_width();
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), Sense::hover());
             let c = egui::pos2(rect.left() + 8.0 + LANE / 2.0, rect.center().y);
@@ -373,7 +388,7 @@ fn commit_graph(ui: &mut egui::Ui, review: &Review, base: &str, actions: &mut Ve
             p.text(
                 egui::pos2(rect.left() + 8.0 + LANE + 8.0, c.y),
                 egui::Align2::LEFT_CENTER,
-                format!("branched from {base}"),
+                base_text(base),
                 egui::FontId::proportional(11.5),
                 theme::MUTED,
             );
@@ -529,12 +544,16 @@ pub fn files(ui: &mut egui::Ui, tab: &ProjectTab, actions: &mut Vec<Action>) {
     };
     let wt = tab.worktrees.iter().find(|w| &w.path == selected);
     let name = wt.map(|w| worktree_label(w).0).unwrap_or_default();
+    // The button first, so a long name is cut to the space left of it, not drawn under it.
     ui.horizontal(|ui| {
-        ui.label(RichText::new(&name).strong());
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             if wt.is_some_and(here) && ui.small_button("Open in Git view").clicked() {
                 actions.push(Action::OpenInGit(selected.clone()));
             }
+            ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(&name).strong()).truncate())
+                    .on_hover_text(&name);
+            });
         });
     });
     if let Some(base) = review.standing(selected).map(|s| s.base.as_str()) {
@@ -699,6 +718,21 @@ mod tests {
             review_label("committed", "agent-1"),
             "committed · in agent-1"
         );
+    }
+
+    #[test]
+    fn commits_section_names_the_base_sensibly() {
+        assert_eq!(base_text("main"), "branched from main");
+        assert_eq!(base_text("@{upstream}"), "since its upstream");
+        assert_eq!(
+            base_text("HEAD"),
+            "No commits: comparing with HEAD, uncommitted changes only"
+        );
+        assert_eq!(
+            all_changes_text(3, "main"),
+            "3 files since it branched, uncommitted too"
+        );
+        assert_eq!(all_changes_text(1, "HEAD"), "1 file, uncommitted");
     }
 
     #[test]

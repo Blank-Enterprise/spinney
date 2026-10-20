@@ -259,13 +259,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
                 .max()
                 .unwrap_or(0);
             let text_w = char_w * (longest + 3) as f32;
-            let avail = ui.available_width();
-            let (width, half) = if inline {
-                ((2.0 * gutter + text_w).max(avail), 0.0)
-            } else {
-                let half = (gutter + text_w).max(avail / 2.0);
-                (2.0 * half, half)
-            };
+            let (width, half) = row_widths(ui.available_width(), gutter, text_w, inline);
             for row in &rows[range] {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::hover());
                 let mut cell = Cell {
@@ -317,6 +311,19 @@ fn segmented(ui: &mut egui::Ui, inline: bool) -> bool {
             }
         });
     toggle
+}
+
+/// A diff row's width and, side by side, each column's width. Inline rows grow to the
+/// longest line and scroll sideways; side-by-side columns split the available width
+/// evenly and each clips its own lines, so a long line on one side can't push the
+/// other out of view.
+fn row_widths(avail: f32, gutter: f32, text_w: f32, inline: bool) -> (f32, f32) {
+    if inline {
+        ((2.0 * gutter + text_w).max(avail), 0.0)
+    } else {
+        let half = (avail / 2.0).max(2.0 * gutter);
+        (2.0 * half, half)
+    }
 }
 
 fn split(r: Rect, at: f32) -> (Rect, Rect) {
@@ -498,6 +505,18 @@ mod tests {
     }
 
     use LineKind::{Add, Context as Ctx, Del};
+
+    #[test]
+    fn side_by_side_columns_split_the_width_evenly() {
+        // Long lines don't widen either column: both halves fill the panel exactly.
+        assert_eq!(row_widths(800.0, 40.0, 5000.0, false), (800.0, 400.0));
+        assert_eq!(row_widths(800.0, 40.0, 10.0, false), (800.0, 400.0));
+        // A very narrow panel still leaves each column room for its gutter and some text.
+        assert_eq!(row_widths(100.0, 40.0, 10.0, false), (160.0, 80.0));
+        // Inline rows still grow to the longest line and scroll sideways.
+        assert_eq!(row_widths(800.0, 40.0, 5000.0, true), (5080.0, 0.0));
+        assert_eq!(row_widths(800.0, 40.0, 10.0, true), (800.0, 0.0));
+    }
 
     /// Hunk 0: ctx del del add ctx; hunk 1: ctx add ctx.
     fn fd() -> FileDiff {

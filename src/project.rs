@@ -32,10 +32,30 @@ pub fn ensure_project(root: &Path) -> Result<()> {
             root.display()
         );
     }
+    if let Some(old) = old_bare_layout(root) {
+        bail!(
+            "{} uses the old .bare layout, which Spinney no longer supports. Clone it again to use it",
+            old.display()
+        );
+    }
     if !root.join(".git").exists() {
         bail!("{} is not a git project", root.display())
     }
     Ok(())
+}
+
+/// The root of a project in the `.bare` layout Spinney used to make (removed in #163): a
+/// bare repo in `x/.bare`, an `x/.git` file pointing at it, and worktrees inside `x`. Any
+/// folder of one finds it, since they all share `x/.bare` as their common dir.
+pub fn old_bare_layout(dir: &Path) -> Option<PathBuf> {
+    let out = git::run(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let common = PathBuf::from(out.trim());
+    let root = common.parent()?;
+    (common.file_name()? == ".bare" && root.join(".git").is_file()).then(|| root.to_path_buf())
 }
 
 /// Create `<parent>/<name>` for a new project. `name` must be one plain path segment (so
@@ -314,6 +334,54 @@ mod tests {
         let (tmp, url, parent) = fixture();
         let root = clone_into(&url, &parent, "proj", &space()).unwrap();
         (tmp, root)
+    }
+
+    /// The old layout: `x/.bare` bare clone, `x/.git` pointing at it, `x/main` a worktree.
+    fn old_layout() -> (tempfile::TempDir, PathBuf) {
+        let (tmp, url, parent) = fixture();
+        let x = parent.join("x");
+        let bare = x.join(".bare");
+        git::run(
+            &parent,
+            &["clone", "-q", "--bare", &url, bare.to_str().unwrap()],
+        )
+        .unwrap();
+        std::fs::write(x.join(".git"), "gitdir: ./.bare\n").unwrap();
+        git::run(&x, &["worktree", "add", "-q", "main", "main"]).unwrap();
+        (tmp, x)
+    }
+
+    #[test]
+    fn old_bare_layout_found_from_any_folder() {
+        let (_tmp, x) = old_layout();
+        for dir in [x.clone(), x.join("main"), x.join(".bare")] {
+            let got = old_bare_layout(&dir).unwrap_or_else(|| panic!("{}", dir.display()));
+            assert!(same_dir(&got, &x), "{}", got.display());
+        }
+    }
+
+    #[test]
+    fn opening_old_bare_layout_says_to_clone_again() {
+        let (_tmp, x) = old_layout();
+        // What `open_folder` does: the picked folder's project, then open it.
+        for picked in [x.clone(), x.join("main")] {
+            let root = project_root(&picked).unwrap();
+            let err = ensure_project(&root).unwrap_err().to_string();
+            assert!(err.contains("old .bare layout"), "{err}");
+            assert!(err.contains("Clone it again"), "{err}");
+            assert!(!err.contains("not a git project"), "{err}");
+        }
+        // A tab saved before #163 opens `x` itself.
+        assert!(ensure_project(&x).is_err());
+    }
+
+    #[test]
+    fn normal_clone_is_not_old_bare_layout() {
+        let (_tmp, root) = cloned();
+        assert_eq!(old_bare_layout(&root), None);
+        let p = add_worktree(&root, "feature/new", "main").unwrap();
+        assert_eq!(old_bare_layout(&p), None);
+        ensure_project(&root).unwrap();
     }
 
     /// `git worktree add` run directly, as an agent or another tool would.
