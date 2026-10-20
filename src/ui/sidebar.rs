@@ -202,18 +202,178 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
-fn section(
-    ui: &mut egui::Ui,
-    id: &str,
-    title: &str,
-    n: usize,
-    open: bool,
-    add: impl FnOnce(&mut egui::Ui),
-) {
-    egui::CollapsingHeader::new(theme::section(&format!("{title} · {n}")))
-        .id_salt(id)
-        .default_open(open)
-        .show(ui, add);
+/// The sidebar's sections, top to bottom.
+pub const SECTIONS: usize = 5;
+const HEADER_H: f32 = 22.0;
+/// The divider between two sections, dragged to resize them.
+const HANDLE_H: f32 = 6.0;
+/// The shortest an open section's body gets from dragging a divider.
+const MIN_BODY: f32 = 40.0;
+
+/// Which sidebar sections are open, and how they share the height.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sections {
+    pub open: [bool; SECTIONS],
+    /// Each section's share of the height left for open bodies; kept while one is closed,
+    /// so reopening it brings back its size.
+    pub weights: [f32; SECTIONS],
+}
+
+impl Default for Sections {
+    fn default() -> Self {
+        Sections {
+            open: [true; SECTIONS],
+            weights: [3.0, 2.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+impl Sections {
+    /// Body heights: `space` shared among the open sections by weight; 0 for closed ones.
+    pub fn heights(&self, space: f32) -> [f32; SECTIONS] {
+        let total: f32 = (0..SECTIONS)
+            .filter(|&k| self.open[k])
+            .map(|k| self.weights[k])
+            .sum();
+        let mut h = [0.0; SECTIONS];
+        for k in (0..SECTIONS).filter(|&k| self.open[k]) {
+            h[k] = if total > 0.0 {
+                space * self.weights[k] / total
+            } else {
+                0.0
+            };
+        }
+        h
+    }
+
+    /// Take the open sections' weights from body heights `h` (after a drag), keeping
+    /// their total so closed sections' shares are unchanged.
+    pub fn set_heights(&mut self, h: &[f32; SECTIONS]) {
+        let open: Vec<usize> = (0..SECTIONS).filter(|&k| self.open[k]).collect();
+        let total: f32 = open.iter().map(|&k| self.weights[k]).sum();
+        let sum: f32 = open.iter().map(|&k| h[k]).sum();
+        if sum <= 0.0 {
+            return;
+        }
+        for k in open {
+            self.weights[k] = h[k] / sum * total;
+        }
+    }
+}
+
+/// Move the divider below section `i` by `delta` (down when positive). The nearest open
+/// section on the side it moves away from grows; open sections on the side it moves into
+/// shrink in turn, nearest first, none below `min`. It stops when they are all at `min`.
+pub fn drag(h: &mut [f32], open: &[bool], i: usize, delta: f32, min: f32) {
+    let above: Vec<usize> = (0..=i).rev().filter(|&k| open[k]).collect();
+    let below: Vec<usize> = (i + 1..h.len()).filter(|&k| open[k]).collect();
+    let (grow, shrink) = if delta > 0.0 {
+        (above.first(), &below)
+    } else {
+        (below.first(), &above)
+    };
+    let Some(&grow) = grow else {
+        return;
+    };
+    let mut want = delta.abs();
+    let mut moved = 0.0;
+    for &k in shrink {
+        let take = (h[k] - min).max(0.0).min(want);
+        h[k] -= take;
+        want -= take;
+        moved += take;
+    }
+    h[grow] += moved;
+}
+
+/// Draws the sections one after another, each body in its own scroll area, with a
+/// divider between each pair.
+struct Split {
+    s: Sections,
+    /// Open state at the start of the frame; a header click applies from the next one.
+    open: [bool; SECTIONS],
+    h: [f32; SECTIONS],
+    dragged: bool,
+    /// Spacing for the bodies' contents (the split itself packs with none).
+    spacing: egui::Vec2,
+}
+
+impl Split {
+    fn section(
+        &mut self,
+        ui: &mut egui::Ui,
+        k: usize,
+        title: &str,
+        n: usize,
+        add: impl FnOnce(&mut egui::Ui),
+    ) {
+        let w = ui.available_width();
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(w, HEADER_H), egui::Sense::click());
+        if r.clicked() {
+            self.s.open[k] = !self.s.open[k];
+        }
+        if r.hovered() {
+            ui.painter()
+                .rect_filled(rect, theme::WIDGET_R, theme::HOVER);
+        }
+        let icon = egui::Rect::from_center_size(
+            rect.left_center() + egui::vec2(9.0, 0.0),
+            egui::vec2(8.0, 8.0),
+        );
+        let rotation = if self.open[k] {
+            0.0
+        } else {
+            -std::f32::consts::FRAC_PI_2
+        };
+        ui.painter()
+            .add(egui::Shape::rotated_triangle(icon, rotation, theme::MUTED));
+        let text = egui::WidgetText::from(theme::section(&format!("{title} · {n}"))).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            w - 20.0,
+            egui::TextStyle::Body,
+        );
+        let pos = egui::pos2(rect.left() + 20.0, rect.center().y - text.size().y / 2.0);
+        ui.painter().galley(pos, text, theme::MUTED);
+
+        if self.open[k] {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, self.h[k]), egui::Sense::hover());
+            let mut body = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("sidebar_section", k))
+                    .max_rect(rect),
+            );
+            body.spacing_mut().item_spacing = self.spacing;
+            egui::ScrollArea::vertical()
+                .id_salt(("sidebar_section", title))
+                .auto_shrink([false, false])
+                .show(&mut body, add);
+        }
+        if k + 1 < SECTIONS {
+            self.divider(ui, k);
+        }
+    }
+
+    /// The divider below section `k`; it drags only with an open section on each side.
+    fn divider(&mut self, ui: &mut egui::Ui, k: usize) {
+        let w = ui.available_width();
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(w, HANDLE_H), egui::Sense::drag());
+        let live = self.open[..=k].contains(&true) && self.open[k + 1..].contains(&true);
+        let hot = live && (r.hovered() || r.dragged());
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if live && r.dragged() {
+            drag(&mut self.h, &self.open, k, r.drag_delta().y, MIN_BODY);
+            self.dragged = true;
+        }
+        let color = if hot { theme::ACCENT } else { theme::BORDER };
+        ui.painter().hline(
+            rect.x_range(),
+            rect.center().y,
+            egui::Stroke::new(1.0, color),
+        );
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) {
@@ -223,9 +383,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .desired_width(f32::INFINITY),
     );
     ui.add_space(4.0);
-    let tab = &*tab;
-    let q = tab.filter.as_str();
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    let spacing = ui.spacing().item_spacing;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let fixed = SECTIONS as f32 * HEADER_H + (SECTIONS - 1) as f32 * HANDLE_H;
+    let space = (ui.available_height() - fixed).max(0.0);
+    let s = tab.sections;
+    let mut split = Split {
+        s,
+        open: s.open,
+        h: s.heights(space),
+        dragged: false,
+        spacing,
+    };
+    {
+        let tab = &*tab;
+        let q = tab.filter.as_str();
         let local: Vec<_> = tab
             .branches
             .iter()
@@ -248,7 +420,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             current,
             checked_out: &checked_out,
         };
-        section(ui, "local", "Local", local.len(), true, |ui| {
+        split.section(ui, 0, "Local", local.len(), |ui| {
             let nodes = branch_tree(&local);
             tree(ui, "local", &nodes, filtering, cx, actions);
         });
@@ -257,7 +429,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .iter()
             .filter(|b| b.remote && filter_matches(q, &b.name))
             .collect();
-        section(ui, "remote", "Remote", remote.len(), true, |ui| {
+        split.section(ui, 1, "Remote", remote.len(), |ui| {
             // `origin/feat/x`: the remote is the first folder level.
             let nodes = branch_tree(&remote);
             tree(ui, "remote", &nodes, filtering, cx, actions);
@@ -270,7 +442,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                     || w.branch.as_deref().is_some_and(|b| filter_matches(q, b))
             })
             .collect();
-        section(ui, "worktrees", "Worktrees", worktrees.len(), true, |ui| {
+        split.section(ui, 2, "Worktrees", worktrees.len(), |ui| {
             for wt in worktrees {
                 let (text, tag) = worktree_label(wt);
                 let on = wt.path == tab.active_worktree;
@@ -306,7 +478,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
-        section(ui, "stashes", "Stashes", tab.stashes.len(), true, |ui| {
+        split.section(ui, 3, "Stashes", tab.stashes.len(), |ui| {
             for st in &tab.stashes {
                 let r = row(
                     ui,
@@ -334,18 +506,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
-        // Last: a long tag list shouldn't push worktrees and stashes out of view.
         let tags: Vec<_> = tab
             .tags
             .iter()
             .filter(|t| filter_matches(q, &t.name))
             .collect();
-        section(ui, "tags", "Tags", tags.len(), true, |ui| {
+        split.section(ui, 4, "Tags", tags.len(), |ui| {
             for t in tags {
                 tag_row(ui, t, actions);
             }
         });
-    });
+    }
+    if split.dragged {
+        split.s.set_heights(&split.h);
+    }
+    tab.sections = split.s;
 }
 
 /// "v1.0 · Annotated tag at 1a2b3c4", or "· Tag at …" for a lightweight one.
@@ -617,6 +792,65 @@ mod tests {
         assert_eq!(path, "feat");
         assert!(matches!(&children[0], Node::Folder { path, .. } if path == "feat/ui"));
         assert_eq!(count(&nodes), 6);
+    }
+
+    #[test]
+    fn open_sections_share_the_height_by_weight() {
+        let mut s = Sections {
+            open: [true, true, false, true, true],
+            weights: [2.0, 1.0, 5.0, 1.0, 0.0],
+        };
+        assert_eq!(s.heights(400.0), [200.0, 100.0, 0.0, 100.0, 0.0]);
+        s.open = [false; SECTIONS];
+        assert_eq!(s.heights(400.0), [0.0; SECTIONS]);
+    }
+
+    #[test]
+    fn dragging_down_grows_above_and_shrinks_below_in_turn() {
+        let open = [true; SECTIONS];
+        let mut h = [100.0, 100.0, 100.0, 100.0, 100.0];
+        drag(&mut h, &open, 1, 30.0, 40.0);
+        assert_eq!(h, [100.0, 130.0, 70.0, 100.0, 100.0]);
+        // Past the next section's minimum, the one after it gives way too.
+        drag(&mut h, &open, 1, 50.0, 40.0);
+        assert_eq!(h, [100.0, 180.0, 40.0, 80.0, 100.0]);
+        // All below at the minimum: it stops, and the total never changes.
+        drag(&mut h, &open, 1, 1000.0, 40.0);
+        assert_eq!(h, [100.0, 280.0, 40.0, 40.0, 40.0]);
+        assert_eq!(h.iter().sum::<f32>(), 500.0);
+    }
+
+    #[test]
+    fn dragging_up_shrinks_above_nearest_first() {
+        let open = [true; SECTIONS];
+        let mut h = [100.0, 60.0, 100.0, 100.0, 100.0];
+        drag(&mut h, &open, 1, -50.0, 40.0);
+        assert_eq!(h, [70.0, 40.0, 150.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn dragging_skips_closed_sections() {
+        let open = [true, false, true, false, true];
+        let mut h = [100.0, 0.0, 100.0, 0.0, 100.0];
+        // The divider under closed Remote moves Local and Worktrees.
+        drag(&mut h, &open, 1, 20.0, 40.0);
+        assert_eq!(h, [120.0, 0.0, 80.0, 0.0, 100.0]);
+        // With nothing open below, there is nothing to move.
+        let open = [true, false, false, false, false];
+        let mut h = [300.0, 0.0, 0.0, 0.0, 0.0];
+        drag(&mut h, &open, 0, 20.0, 40.0);
+        assert_eq!(h, [300.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn set_heights_keeps_closed_sections_shares() {
+        let mut s = Sections {
+            open: [true, true, false, true, true],
+            weights: [1.0, 1.0, 3.0, 1.0, 1.0],
+        };
+        s.set_heights(&[300.0, 100.0, 0.0, 0.0, 0.0]);
+        assert_eq!(s.weights, [3.0, 1.0, 3.0, 0.0, 0.0]);
+        assert_eq!(s.heights(400.0), [300.0, 100.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
