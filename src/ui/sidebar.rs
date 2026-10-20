@@ -79,6 +79,31 @@ fn count(nodes: &[Node]) -> usize {
         .sum()
 }
 
+/// The branches under these nodes, in the order they are drawn.
+pub fn leaves<'a>(nodes: &[Node<'a>]) -> Vec<&'a Branch> {
+    let mut out = vec![];
+    for n in nodes {
+        match n {
+            Node::Branch(b) => out.push(*b),
+            Node::Folder { children, .. } => out.extend(leaves(children)),
+        }
+    }
+    out
+}
+
+/// "Delete N branches in feat…" for a folder's menu; None for a remote's own folder
+/// (`origin`), which holds every branch on that remote.
+pub fn folder_delete_label(remote: bool, path: &str, n: usize) -> Option<String> {
+    let s = if n == 1 { "" } else { "es" };
+    if !remote {
+        Some(format!("Delete {n} branch{s} in {path}…"))
+    } else if path.contains('/') {
+        Some(format!("Delete {n} remote branch{s} in {path}…"))
+    } else {
+        None
+    }
+}
+
 /// What a branch's menu needs to know about the project.
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
@@ -115,8 +140,24 @@ fn tree(
                     header
                 };
                 let r = header.show(ui, |ui| tree(ui, id, children, filtering, cx, actions));
-                r.header_response
+                let r = r
+                    .header_response
                     .on_hover_text(format!("{path} · {}", count(children)));
+                // Only the branches drawn under it: with a filter on, the ones that match.
+                let branches = leaves(children);
+                let remote = branches.first().is_some_and(|b| b.remote);
+                if let Some(label) = folder_delete_label(remote, path, branches.len()) {
+                    r.context_menu(|ui| {
+                        if ui.button(label).clicked() {
+                            actions.push(Action::AskDeleteFolder {
+                                folder: path.clone(),
+                                branches: branches.iter().map(|b| b.name.clone()).collect(),
+                                remote,
+                            });
+                            ui.close();
+                        }
+                    });
+                }
             }
             Node::Branch(b) => branch_row(ui, b, cx, actions),
         }
@@ -617,6 +658,35 @@ mod tests {
         assert_eq!(path, "feat");
         assert!(matches!(&children[0], Node::Folder { path, .. } if path == "feat/ui"));
         assert_eq!(count(&nodes), 6);
+    }
+
+    #[test]
+    fn folder_leaves_include_subfolders() {
+        let bs: Vec<Branch> = ["feat/ui/a", "feat/b", "main"]
+            .into_iter()
+            .map(branch)
+            .collect();
+        let refs: Vec<&Branch> = bs.iter().collect();
+        let nodes = branch_tree(&refs);
+        let Node::Folder { children, .. } = &nodes[0] else {
+            panic!("feat folder first: {nodes:?}")
+        };
+        let names: Vec<_> = leaves(children).iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["feat/ui/a", "feat/b"]);
+        assert_eq!(leaves(&nodes).len(), 3);
+    }
+
+    #[test]
+    fn folder_delete_skips_a_remote_root() {
+        assert_eq!(
+            folder_delete_label(false, "feat", 2).as_deref(),
+            Some("Delete 2 branches in feat…")
+        );
+        assert_eq!(
+            folder_delete_label(true, "origin/feat", 1).as_deref(),
+            Some("Delete 1 remote branch in origin/feat…")
+        );
+        assert_eq!(folder_delete_label(true, "origin", 5), None);
     }
 
     #[test]
