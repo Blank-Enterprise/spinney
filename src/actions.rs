@@ -1019,6 +1019,27 @@ pub fn delete_remote_branch(worktree: &Path, remote_branch: &str) -> Result<()> 
     Ok(())
 }
 
+/// `git push <remote> refs/tags/<tag>`: the full ref, so a branch with the same name is
+/// never the one pushed. A tag already on the remote at another commit is rejected.
+pub fn push_tag(worktree: &Path, remote: &str, tag: &str) -> Result<()> {
+    let full = format!("refs/tags/{tag}");
+    git::run(worktree, &["push", remote, &format!("{full}:{full}")])?;
+    Ok(())
+}
+
+/// `git tag -d`: only the name goes; the commit stays on its branches.
+pub fn delete_tag(worktree: &Path, tag: &str) -> Result<()> {
+    git::run(worktree, &["tag", "-d", tag])?;
+    Ok(())
+}
+
+/// `git push <remote> --delete refs/tags/<tag>`.
+pub fn delete_remote_tag(worktree: &Path, remote: &str, tag: &str) -> Result<()> {
+    let full = format!("refs/tags/{tag}");
+    git::run(worktree, &["push", remote, "--delete", &full])?;
+    Ok(())
+}
+
 /// Fails when a worktree other than `worktree` has `branch` checked out: renaming it would
 /// change that worktree's branch under it.
 pub fn ensure_not_checked_out_elsewhere(worktree: &Path, branch: &str) -> Result<()> {
@@ -1964,6 +1985,55 @@ mod tests {
         git::run(&main, &["rev-parse", "--verify", "feature/x"]).unwrap();
         let err = delete_branch(&main, "main", true).unwrap_err();
         assert!(err.to_string().contains("worktree main"), "{err}");
+    }
+
+    /// Whether `refs/tags/<tag>` exists in `dir`.
+    fn has_tag(dir: &Path, tag: &str) -> bool {
+        let r = format!("refs/tags/{tag}");
+        git::run(dir, &["rev-parse", "--verify", "-q", &r]).is_ok()
+    }
+
+    #[test]
+    fn push_tag_to_file_remote() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        // A branch with the tag's name must not be what gets pushed.
+        git::run(&main, &["tag", "-a", "-m", "release", "v1"]).unwrap();
+        git::run(&main, &["branch", "v1"]).unwrap();
+        push_tag(&main, "origin", "v1").unwrap();
+        assert!(has_tag(&remote, "v1"));
+        assert!(git::run(&remote, &["rev-parse", "--verify", "-q", "refs/heads/v1"]).is_err());
+        let kind = git::run(&remote, &["cat-file", "-t", "refs/tags/v1"]).unwrap();
+        assert_eq!(kind.trim(), "tag", "pushed as the annotated tag");
+        assert!(push_tag(&main, "origin", "nope").is_err());
+    }
+
+    #[test]
+    fn delete_tag_locally_keeps_remote() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        git::run(&main, &["tag", "v1"]).unwrap();
+        push_tag(&main, "origin", "v1").unwrap();
+        let head = rev_parse(&main, "HEAD").unwrap();
+        delete_tag(&main, "v1").unwrap();
+        assert!(!has_tag(&main, "v1"));
+        assert_eq!(rev_parse(&main, "HEAD").unwrap(), head, "commit untouched");
+        assert!(has_tag(&remote, "v1"), "only local");
+        assert!(delete_tag(&main, "v1").is_err());
+    }
+
+    #[test]
+    fn delete_tag_on_file_remote() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        git::run(&main, &["tag", "v1"]).unwrap();
+        git::run(&main, &["branch", "v1"]).unwrap();
+        push_tag(&main, "origin", "v1").unwrap();
+        git::run(&main, &["push", "-q", "origin", "refs/heads/v1"]).unwrap();
+        delete_remote_tag(&main, "origin", "v1").unwrap();
+        assert!(!has_tag(&remote, "v1"));
+        git::run(&remote, &["rev-parse", "--verify", "-q", "refs/heads/v1"]).unwrap();
+        assert!(has_tag(&main, "v1"), "local tag stays");
     }
 
     #[test]

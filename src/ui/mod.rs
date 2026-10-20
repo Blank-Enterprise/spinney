@@ -396,6 +396,8 @@ enum JobKind {
     DeleteRemote,
     /// Renaming a branch on its remote after renaming it locally, run like a push.
     RenameRemote,
+    /// `git push origin refs/tags/<name>`.
+    PushTag,
     CommitGraph,
     /// Normal clone to worktree layout; the project's tab is closed while it runs.
     Convert,
@@ -485,7 +487,8 @@ impl Jobs {
         self.active.iter().any(|(_, r)| r == root)
     }
 
-    /// A fetch, pull, push, remote branch delete or remote rename is in flight for `root`.
+    /// A fetch, pull, push, remote branch or tag delete, remote rename or tag push is in
+    /// flight for `root`.
     fn network_busy(&self, root: &Path) -> bool {
         [
             JobKind::Fetch,
@@ -493,6 +496,7 @@ impl Jobs {
             JobKind::Push,
             JobKind::DeleteRemote,
             JobKind::RenameRemote,
+            JobKind::PushTag,
         ]
         .into_iter()
         .any(|k| self.running(k, root))
@@ -645,6 +649,10 @@ pub enum Action {
     CopyCommitMessage(String),
     /// Check out the commit with this SHA, detaching HEAD.
     CheckoutCommit(String),
+    /// Push the tag to origin, as a job.
+    PushTag(String),
+    /// Ask before deleting the tag, locally and maybe on origin.
+    AskDeleteTag(Tag),
     /// ⌘-click on a row: add it to the multi-selection, or take it out.
     TogglePick(usize),
     /// Cherry-pick these commits (SHAs, oldest first) onto the checked-out branch.
@@ -855,6 +863,7 @@ impl SpinneyApp {
             | JobKind::Push
             | JobKind::DeleteRemote
             | JobKind::RenameRemote
+            | JobKind::PushTag
             | JobKind::MergeTool => {
                 if kind == JobKind::Fetch {
                     if let Ok(common) = common_dir(&root) {
@@ -1193,6 +1202,27 @@ impl SpinneyApp {
                 }
             }
             Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
+            Action::PushTag(name) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+                    if self.jobs.network_busy(&root) {
+                        errors.push("Wait for the running fetch, pull or push".into());
+                    } else {
+                        let work = move || actions::push_tag(&wt, "origin", &name);
+                        self.jobs.spawn(JobKind::PushTag, root, String::new(), work);
+                    }
+                }
+            }
+            Action::AskDeleteTag(tag) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    self.dialogs.delete_tag = Some(dialogs::DeleteTagDialog {
+                        root: tab.root.clone(),
+                        worktree: tab.active_worktree.clone(),
+                        tag,
+                        also_remote: false,
+                    });
+                }
+            }
             Action::AskRename(branch) => self.ask_rename(branch, &mut errors),
             Action::FastForward(branch) => self.fast_forward(branch, None, &mut errors),
             Action::FastForwardTo(branch, to) => self.fast_forward(branch, Some(to), &mut errors),
