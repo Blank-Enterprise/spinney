@@ -329,6 +329,40 @@ pub fn rebase(worktree: &Path, onto: &str) -> Result<MergeOutcome> {
     })
 }
 
+/// Apply `shas` onto the current branch in the order given (the caller puts the oldest
+/// first). Conflicts are left to resolve: see `MergeOutcome::Conflicts`. Merge commits are
+/// refused: picking one needs a mainline parent.
+pub fn cherry_pick(worktree: &Path, shas: &[String]) -> Result<MergeOutcome> {
+    if shas.is_empty() {
+        bail!("No commits to cherry-pick");
+    }
+    if refs::current_branch(worktree)?.is_none() {
+        bail!("Check out a branch first");
+    }
+    ensure_clean(worktree)?;
+    for sha in shas {
+        if parent_count(worktree, sha)? > 1 {
+            bail!(
+                "{} is a merge commit; cherry-picking merges isn't supported",
+                &sha[..8.min(sha.len())]
+            );
+        }
+    }
+    let before = rev_parse(worktree, "HEAD")?;
+    let mut args = vec!["cherry-pick"];
+    args.extend(shas.iter().map(String::as_str));
+    if let Err(e) = git::run(worktree, &args) {
+        return stopped(worktree, e, false, &before);
+    }
+    Ok(MergeOutcome::Done)
+}
+
+/// Number of parents of commit `rev`.
+fn parent_count(worktree: &Path, rev: &str) -> Result<usize> {
+    let out = git::run(worktree, &["rev-list", "--parents", "-n", "1", rev, "--"])?;
+    Ok(out.split_whitespace().count().saturating_sub(1))
+}
+
 /// Anything staged (`diff --cached --quiet` exits 1 when there is).
 fn has_staged(worktree: &Path) -> Result<bool> {
     let out = git::output(worktree, &["diff", "--cached", "--quiet"])?;
@@ -1892,6 +1926,67 @@ mod tests {
         g(&main, &["commit", "-qam", "other edit"]);
         g(&main, &["switch", "-q", "main"]);
         (tmp, root, main)
+    }
+
+    #[test]
+    fn cherry_pick_one_commit() {
+        let (_tmp, _root, main) = cloned();
+        let x = head(&main, "origin/feature/x");
+        let before = head(&main, "HEAD");
+        assert_eq!(cherry_pick(&main, &[x]).unwrap(), MergeOutcome::Done);
+        assert_eq!(head(&main, "HEAD~1"), before);
+        assert_eq!(head_message(&main).unwrap(), "x");
+        assert!(main.join("b.txt").exists());
+        assert_eq!(in_progress(&main).unwrap(), None);
+    }
+
+    #[test]
+    fn cherry_pick_several_in_the_order_given() {
+        let (_tmp, _root, main) = cloned();
+        g(&main, &["switch", "-q", "-c", "topic"]);
+        write_commit(&main, "c.txt");
+        let c = head(&main, "HEAD");
+        std::fs::write(main.join("c.txt"), "c2\n").unwrap();
+        g(&main, &["commit", "-qam", "edit c"]);
+        let c2 = head(&main, "HEAD");
+        g(&main, &["switch", "-q", "main"]);
+        let out = cherry_pick(&main, &[c, c2]).unwrap();
+        assert_eq!(out, MergeOutcome::Done);
+        let log = g(&main, &["log", "-3", "--format=%s"]);
+        assert_eq!(log, "edit c\nadd file\ninit");
+        assert_eq!(std::fs::read_to_string(main.join("c.txt")).unwrap(), "c2\n");
+    }
+
+    #[test]
+    fn conflicting_cherry_pick_is_left_in_progress() {
+        let (_tmp, _root, main) = conflicting();
+        let other = head(&main, "other");
+        let out = cherry_pick(&main, &[other]).unwrap();
+        assert_eq!(out, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(in_progress(&main).unwrap(), Some(Operation::CherryPick));
+        abort_op(&main, Operation::CherryPick).unwrap();
+        assert_eq!(head_message(&main).unwrap(), "main edit");
+    }
+
+    #[test]
+    fn cherry_pick_refuses_dirty_detached_and_merges() {
+        let (_tmp, _root, main) = cloned();
+        let x = head(&main, "origin/feature/x");
+        std::fs::write(main.join("a.txt"), "changed\n").unwrap();
+        let err = cherry_pick(&main, std::slice::from_ref(&x)).unwrap_err();
+        assert!(err.to_string().contains("Commit or stash"), "{err}");
+        g(&main, &["checkout", "--", "a.txt"]);
+        g(
+            &main,
+            &["merge", "-q", "--no-ff", "--no-edit", "origin/feature/x"],
+        );
+        let m = head(&main, "HEAD");
+        g(&main, &["reset", "-q", "--hard", "HEAD~1"]);
+        let err = cherry_pick(&main, &[m]).unwrap_err();
+        assert!(err.to_string().contains("merge commit"), "{err}");
+        g(&main, &["checkout", "-q", "--detach"]);
+        let err = cherry_pick(&main, &[x]).unwrap_err();
+        assert!(err.to_string().contains("Check out a branch"), "{err}");
     }
 
     /// HEAD, branch and `status` (untracked files included) before an operation.
