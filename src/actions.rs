@@ -692,9 +692,12 @@ pub fn pull(worktree: &Path, strategy: PullStrategy) -> Result<MergeOutcome> {
     }
     let before = rev_parse(worktree, "HEAD")?;
     if let Err(e) = git::run(worktree, pull_args(strategy)) {
-        let ff_refused = format!("{e:#}").contains("fast-forward");
-        if strategy == PullStrategy::FastForwardOnly && ff_refused && diverged(worktree) {
-            bail!("The branch and its upstream have diverged; pull with Merge or Rebase (▾)");
+        if strategy == PullStrategy::FastForwardOnly {
+            // It never starts an operation, so one in progress is the user's: leave it.
+            if format!("{e:#}").contains("fast-forward") && diverged(worktree) {
+                bail!("The branch and its upstream have diverged; pull with Merge or Rebase (▾)");
+            }
+            return Err(e);
         }
         return stopped(worktree, e, false, &before);
     }
@@ -1591,6 +1594,24 @@ mod tests {
             MergeOutcome::Done
         );
         assert_eq!(head(&ours, "HEAD~1"), head(&ours, "origin/main"));
+    }
+
+    #[test]
+    fn pull_ff_only_never_aborts_an_operation_in_progress() {
+        let (_tmp, ours, _theirs) = diverged_clones(true);
+        let outcome = pull(&ours, PullStrategy::Merge).unwrap();
+        assert_eq!(outcome, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        // Conflicted, then resolved but not continued: both times git refuses the pull.
+        pull(&ours, PullStrategy::FastForwardOnly).unwrap_err();
+        assert_eq!(in_progress(&ours).unwrap(), Some(Operation::Merge));
+        std::fs::write(ours.join("a.txt"), "both\n").unwrap();
+        assert!(mark_resolved(&ours, "a.txt", false).unwrap());
+        pull(&ours, PullStrategy::FastForwardOnly).unwrap_err();
+        assert_eq!(in_progress(&ours).unwrap(), Some(Operation::Merge));
+        assert_eq!(
+            std::fs::read_to_string(ours.join("a.txt")).unwrap(),
+            "both\n"
+        );
     }
 
     #[test]
