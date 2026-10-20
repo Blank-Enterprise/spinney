@@ -330,6 +330,8 @@ enum JobKind {
     Push,
     /// `git push <remote> --delete`, run like a push.
     DeleteRemote,
+    /// Renaming a branch on its remote after renaming it locally, run like a push.
+    RenameRemote,
     CommitGraph,
     /// Normal clone to worktree layout; the project's tab is closed while it runs.
     Convert,
@@ -417,13 +419,14 @@ impl Jobs {
         self.active.iter().any(|(_, r)| r == root)
     }
 
-    /// A fetch, pull, push or remote branch delete is in flight for `root`.
+    /// A fetch, pull, push, remote branch delete or remote rename is in flight for `root`.
     fn network_busy(&self, root: &Path) -> bool {
         [
             JobKind::Fetch,
             JobKind::Pull,
             JobKind::Push,
             JobKind::DeleteRemote,
+            JobKind::RenameRemote,
         ]
         .into_iter()
         .any(|k| self.running(k, root))
@@ -490,6 +493,8 @@ pub enum Action {
     AskDeleteBranch(String),
     /// Ask before deleting `remote/branch` on its remote.
     AskDeleteRemote(String),
+    /// Ask for a new name for a local branch (refused when another worktree has it out).
+    AskRename(String),
     /// Ask how to merge the branch (local or remote) into the checked-out one.
     AskMerge(String),
     /// Ask before rebasing the checked-out branch onto the branch (local or remote).
@@ -721,7 +726,11 @@ impl SpinneyApp {
                     self.open_tab(&root, &space);
                 }
             }
-            JobKind::Fetch | JobKind::Pull | JobKind::Push | JobKind::DeleteRemote => {
+            JobKind::Fetch
+            | JobKind::Pull
+            | JobKind::Push
+            | JobKind::DeleteRemote
+            | JobKind::RenameRemote => {
                 if kind == JobKind::Fetch {
                     if let Ok(common) = common_dir(&root) {
                         self.jobs.commit_graph(root.clone(), common);
@@ -1000,6 +1009,7 @@ impl SpinneyApp {
                 }
             }
             Action::AskDeleteRemote(name) => self.dialogs.delete_remote = Some(name),
+            Action::AskRename(branch) => self.ask_rename(branch, &mut errors),
             Action::AskMerge(branch) => self.ask_merge(branch, false, &mut errors),
             Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
             Action::NewBranch(base) => {

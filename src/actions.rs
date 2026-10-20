@@ -645,6 +645,104 @@ pub fn delete_remote_branch(worktree: &Path, remote_branch: &str) -> Result<()> 
     Ok(())
 }
 
+/// Fails when a worktree other than `worktree` has `branch` checked out: renaming it would
+/// change that worktree's branch under it.
+pub fn ensure_not_checked_out_elsewhere(worktree: &Path, branch: &str) -> Result<()> {
+    let here = worktree.canonicalize()?;
+    let other = list_worktrees(worktree)?.into_iter().find(|w| {
+        w.branch.as_deref() == Some(branch) && w.path.canonicalize().ok().as_ref() != Some(&here)
+    });
+    if let Some(w) = other {
+        let name = w.path.file_name().unwrap_or(w.path.as_os_str());
+        bail!(
+            "{branch} is checked out in worktree {}",
+            name.to_string_lossy()
+        );
+    }
+    Ok(())
+}
+
+/// `git branch -m old new`, refusing an invalid name or a branch checked out in another
+/// worktree. `-m`, not `-M`: an existing `new` is refused, never overwritten.
+pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<()> {
+    if new == old {
+        bail!("{old} already has that name");
+    }
+    if crate::project::check_branch_name(new).is_err() {
+        bail!("{new} is not a valid branch name");
+    }
+    ensure_not_checked_out_elsewhere(worktree, old)?;
+    git::run(worktree, &["branch", "-m", old, new])?;
+    Ok(())
+}
+
+/// A branch whose upstream has its own name on `remote`, so it can be renamed there too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteRename {
+    pub remote: String,
+    /// The remote-tracking branch, e.g. `origin/feature/x`.
+    pub tracking: String,
+    /// Where `tracking` pointed when the user asked: the commit the new name gets, and the
+    /// lease on deleting the old one.
+    pub expect: String,
+}
+
+/// The remote rename on offer for `branch`: when its upstream is `<remote>/<branch>` and
+/// the remote-tracking ref exists.
+pub fn remote_rename(worktree: &Path, branch: &str) -> Result<Option<RemoteRename>> {
+    let format = "--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00\
+                  %(upstream:remoteref)";
+    let local = format!("refs/heads/{branch}");
+    let up = git::run(worktree, &["for-each-ref", format, &local])?;
+    let fields: Vec<&str> = up.trim_end().split('\0').collect();
+    let [tip, tracking, remote, remote_ref] = fields[..] else {
+        return Ok(None);
+    };
+    if !tip.starts_with("refs/remotes/") || remote_ref != local {
+        return Ok(None);
+    }
+    let Ok(expect) = git::run(worktree, &["rev-parse", "--verify", "--quiet", tip]) else {
+        return Ok(None); // the upstream is gone
+    };
+    Ok(Some(RemoteRename {
+        remote: remote.to_string(),
+        tracking: tracking.to_string(),
+        expect: expect.trim().to_string(),
+    }))
+}
+
+/// After renaming `old` to `new` locally: push `r.expect` as `new` and delete `old` on the
+/// remote in one atomic push, then track the new name. Both refs are leased: `old` must
+/// still be at `r.expect` and `new` must not exist yet, or nothing changes.
+pub fn rename_on_remote(worktree: &Path, r: &RemoteRename, old: &str, new: &str) -> Result<()> {
+    let (old_ref, new_ref) = (format!("refs/heads/{old}"), format!("refs/heads/{new}"));
+    let args = [
+        "push",
+        "--porcelain",
+        "--atomic",
+        &format!("--force-with-lease={old_ref}:{}", r.expect),
+        &format!("--force-with-lease={new_ref}:"),
+        &r.remote,
+        &format!("{}:{new_ref}", r.expect),
+        &format!(":{old_ref}"),
+    ];
+    let out = git::output(worktree, &args)?;
+    if !out.status.success() {
+        if porcelain_rejected(&out.stdout, &["(stale info)"]) {
+            bail!(
+                "{old} or {new} changed on {} since the last fetch; fetch and try again \
+                 (renamed locally only)",
+                r.remote
+            );
+        }
+        bail!("renamed locally only; git push failed: {}", stderr(&out));
+    }
+    let key = |k: &str| format!("branch.{new}.{k}");
+    git::run(worktree, &["config", &key("remote"), &r.remote])?;
+    git::run(worktree, &["config", &key("merge"), &new_ref])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1111,93 @@ mod tests {
             "{list:?}"
         );
         assert!(delete_remote_branch(&main, "nope").is_err());
+    }
+
+    #[test]
+    fn rename_local_only_branch() {
+        let (_tmp, _root, main) = cloned();
+        create_branch(&main, "topic", "main").unwrap();
+        let tip = head(&main, "topic");
+        assert_eq!(remote_rename(&main, "topic").unwrap(), None, "no upstream");
+        rename_branch(&main, "topic", "feat/topic").unwrap();
+        assert!(git::run(&main, &["rev-parse", "--verify", "-q", "topic"]).is_err());
+        assert_eq!(head(&main, "feat/topic"), tip);
+        // The checked-out branch of this very worktree may be renamed.
+        rename_branch(&main, "main", "trunk").unwrap();
+        assert_eq!(
+            refs::current_branch(&main).unwrap().as_deref(),
+            Some("trunk")
+        );
+        for (new, why) in [
+            ("feat/topic", "exists"),
+            ("a..b", "invalid"),
+            ("trunk", "same"),
+        ] {
+            assert!(rename_branch(&main, "trunk", new).is_err(), "{why}");
+        }
+        assert_eq!(head(&main, "feat/topic"), tip, "an existing name is kept");
+    }
+
+    #[test]
+    fn rename_with_remote() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        g(&main, &["branch", "feature/x", "origin/feature/x"]);
+        let tip = head(&main, "feature/x");
+        // An unpushed local commit is not published by the rename: the remote keeps its tip.
+        let tree = format!("{tip}^{{tree}}");
+        let local = g(&main, &["commit-tree", &tree, "-p", &tip, "-m", "local"]);
+        g(&main, &["update-ref", "refs/heads/feature/x", &local]);
+        let r = remote_rename(&main, "feature/x").unwrap().expect("offered");
+        assert_eq!(
+            (r.remote.as_str(), r.tracking.as_str()),
+            ("origin", "origin/feature/x")
+        );
+        assert_eq!(r.expect, tip);
+        rename_branch(&main, "feature/x", "feature/y").unwrap();
+        rename_on_remote(&main, &r, "feature/x", "feature/y").unwrap();
+        assert_eq!(head(&remote, "feature/y"), tip);
+        assert_eq!(head(&main, "feature/y"), local);
+        assert!(git::run(&remote, &["rev-parse", "--verify", "-q", "feature/x"]).is_err());
+        let up = g(&main, &["rev-parse", "--abbrev-ref", "feature/y@{u}"]);
+        assert_eq!(up, "origin/feature/y");
+        let list = refs::branches(&main).unwrap();
+        assert!(
+            list.iter().all(|b| b.name != "origin/feature/x"),
+            "{list:?}"
+        );
+    }
+
+    #[test]
+    fn rename_on_remote_refuses_when_remote_moved() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        g(&main, &["branch", "feature/x", "origin/feature/x"]);
+        let r = remote_rename(&main, "feature/x").unwrap().unwrap();
+        g(&remote, &["config", "user.name", "Test User"]);
+        g(&remote, &["switch", "-q", "feature/x"]);
+        write_commit(&remote, "r.txt");
+        let moved = head(&remote, "feature/x");
+        fetch(&main).unwrap();
+        rename_branch(&main, "feature/x", "feature/y").unwrap();
+        let err = rename_on_remote(&main, &r, "feature/x", "feature/y").unwrap_err();
+        assert!(err.to_string().contains("renamed locally only"), "{err}");
+        assert_eq!(head(&remote, "feature/x"), moved, "their commit is kept");
+        assert!(git::run(&remote, &["rev-parse", "--verify", "-q", "feature/y"]).is_err());
+    }
+
+    #[test]
+    fn rename_refuses_branch_checked_out_elsewhere() {
+        let (_tmp, root, main) = cloned();
+        add_worktree_existing(&root, "feature/x").unwrap();
+        let err = rename_branch(&main, "feature/x", "feature/y").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("checked out in worktree feature-x"),
+            "{err}"
+        );
+        git::run(&main, &["rev-parse", "--verify", "feature/x"]).unwrap();
+        assert!(git::run(&main, &["rev-parse", "--verify", "-q", "feature/y"]).is_err());
     }
 
     /// `main` and a local `other`, both from `init`, each changing `a.txt` differently.
