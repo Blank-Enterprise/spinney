@@ -38,7 +38,7 @@ Requires macOS on Apple Silicon.
 This installs the latest release into `/Applications` after checking it against its published
 SHA-256 checksum. To install a specific release, set `SPINNEY_VERSION`:
 
-    curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | SPINNEY_VERSION=v1.1.0 bash
+    curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | SPINNEY_VERSION=v1.0.0 bash
 
 The app isn't notarized yet ([#18](https://github.com/Blank-Enterprise/spinney/issues/18)). The
 install script is the supported way in. If you download the zip from the releases page in a
