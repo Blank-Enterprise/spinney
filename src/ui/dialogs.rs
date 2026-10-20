@@ -386,6 +386,7 @@ pub(super) struct Dialogs {
     pub(super) delete_branch: Option<DeleteBranchDialog>,
     /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
     pub(super) delete_remote: Option<String>,
+    pub(super) delete_tag: Option<DeleteTagDialog>,
     pub(super) rename_branch: Option<RenameBranchDialog>,
     pub(super) confirm_drop_stash: Option<DropStash>,
     pub(super) convert: Option<ConvertDialog>,
@@ -538,6 +539,29 @@ pub(super) struct ConvertDialog {
     pub plan: Result<Plan, String>,
 }
 
+/// A tag delete awaiting confirmation, bound to the tab and worktree it was asked in.
+pub(super) struct DeleteTagDialog {
+    pub root: PathBuf,
+    pub worktree: PathBuf,
+    pub tag: refs::Tag,
+    /// Also `git push origin --delete refs/tags/<name>`, as a job.
+    pub also_remote: bool,
+}
+
+/// What deleting `tag` loses: the name (and an annotated tag's message), never the commit.
+pub fn delete_tag_prompt(tag: &refs::Tag) -> String {
+    let sha = tag.target.get(..7).unwrap_or(&tag.target);
+    let what = if tag.annotated {
+        "The tag and its message will be lost"
+    } else {
+        "The tag will be lost"
+    };
+    format!(
+        "Delete tag {} at {sha}? {what}; the commit stays.",
+        tag.name
+    )
+}
+
 /// A stash drop awaiting confirmation, bound to the tab and worktree it was requested in.
 pub(super) struct DropStash {
     pub root: PathBuf,
@@ -559,6 +583,7 @@ impl Dialogs {
             || self.convert.is_some()
             || self.delete_branch.is_some()
             || self.delete_remote.is_some()
+            || self.delete_tag.is_some()
             || self.rename_branch.is_some()
             || self.merge.is_some()
             || self.rebase.is_some()
@@ -906,6 +931,26 @@ impl SpinneyApp {
                 Some(true) => self.delete_remote(name),
                 Some(false) => {}
                 None => self.dialogs.delete_remote = Some(name),
+            }
+        }
+        if let Some(mut d) = self.dialogs.delete_tag.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("delete_tag")).show(ctx, |ui| {
+                ui.label(delete_tag_prompt(&d.tag));
+                ui.checkbox(&mut d.also_remote, "Also delete on origin");
+                ui.horizontal(|ui| {
+                    if ui.add(danger("Delete")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.delete_tag(d),
+                Some(false) => {}
+                None => self.dialogs.delete_tag = Some(d),
             }
         }
         if let Some(mut d) = self.dialogs.rename_branch.take() {
@@ -1636,6 +1681,35 @@ impl SpinneyApp {
             });
     }
 
+    /// `git tag -d` now (local and fast); deleting it on origin runs as a job, like a push.
+    pub(super) fn delete_tag(&mut self, d: DeleteTagDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.root == d.root) else {
+            return;
+        };
+        // Same rule as the remote branch delete: one network job per project at a time.
+        if d.also_remote && self.jobs.network_busy(&d.root) {
+            return self
+                .errors
+                .push("Wait for the running fetch, pull or push".into());
+        }
+        let res = actions::delete_tag(&d.worktree, &d.tag.name);
+        tab.refresh(&ctx, &mut errors);
+        match res {
+            Ok(()) if d.also_remote => {
+                let (wt, name) = (d.worktree, d.tag.name);
+                self.jobs
+                    .spawn(JobKind::DeleteRemote, d.root, String::new(), move || {
+                        actions::delete_remote_tag(&wt, "origin", &name)
+                    });
+            }
+            Ok(()) => {}
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        self.errors.extend(errors);
+    }
+
     /// Open `root` as a tab (or focus its tab) and add it to the active space.
     pub(super) fn open_folder(&mut self, root: PathBuf) {
         let Some(space) = self.space() else { return };
@@ -2267,6 +2341,18 @@ mod tests {
         d.delete_remote = Some("origin/topic".into());
         assert!(d.any_open());
         d.delete_remote = None;
+        d.delete_tag = Some(DeleteTagDialog {
+            root: PathBuf::from("/tmp/r"),
+            worktree: PathBuf::from("/tmp/r"),
+            tag: refs::Tag {
+                name: "v1".into(),
+                target: "abc".into(),
+                annotated: false,
+            },
+            also_remote: false,
+        });
+        assert!(d.any_open());
+        d.delete_tag = None;
         d.rename_branch = Some(RenameBranchDialog::new(
             PathBuf::from("/tmp/r"),
             PathBuf::from("/tmp/r"),
@@ -2960,6 +3046,84 @@ mod tests {
             "{names:?}"
         );
         assert!(!app.jobs.any(JobKind::RenameRemote));
+    }
+
+    #[test]
+    fn delete_tag_prompt_names_what_is_lost() {
+        let mut t = refs::Tag {
+            name: "v1.2".into(),
+            target: "83174b7246c76c9b6426a95147a715f0d26bf6c6".into(),
+            annotated: false,
+        };
+        assert_eq!(
+            delete_tag_prompt(&t),
+            "Delete tag v1.2 at 83174b7? The tag will be lost; the commit stays."
+        );
+        t.annotated = true;
+        assert!(delete_tag_prompt(&t).contains("The tag and its message will be lost"));
+    }
+
+    /// Apply finished jobs, as `poll` does, until one of `kind` has (a commit-graph job may
+    /// finish first).
+    fn finish_job(app: &mut SpinneyApp, kind: JobKind) {
+        for _ in 0..1000 {
+            if let Some(done) = app.jobs.try_recv() {
+                let k = done.kind;
+                app.job_done(done);
+                if k == kind {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("{kind:?} did not finish");
+    }
+
+    #[test]
+    fn tags_push_and_delete_on_origin_as_jobs() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let remote = tmp.path().join("remote.git");
+        let d = tmp.path().join("repo");
+        std::fs::create_dir(&d).unwrap();
+        crate::git::run(tmp.path(), &["init", "-q", "--bare", "remote.git"]).unwrap();
+        let g = |args: &[&str]| crate::git::run(&d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        g(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", remote.display()),
+        ]);
+        g(&["tag", "v1"]);
+        let on_remote =
+            || crate::git::run(&remote, &["rev-parse", "--verify", "-q", "refs/tags/v1"]).is_ok();
+        let space = app.space().unwrap();
+        app.open_tab(&d, &space);
+        assert_eq!(app.tabs[0].tags.len(), 1);
+
+        app.apply(Action::PushTag("v1".into()));
+        assert!(app.jobs.running(JobKind::PushTag, &d));
+        finish_job(&mut app, JobKind::PushTag);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert!(on_remote());
+
+        let tag = app.tabs[0].tags[0].clone();
+        app.apply(Action::AskDeleteTag(tag));
+        let mut del = app.dialogs.delete_tag.take().expect("asks first");
+        del.also_remote = true;
+        app.delete_tag(del);
+        assert!(app.tabs[0].tags.is_empty(), "deleted locally at once");
+        finish_job(&mut app, JobKind::DeleteRemote);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert!(!on_remote());
     }
 
     #[test]

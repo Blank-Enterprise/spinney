@@ -367,6 +367,15 @@ fn tag_row(ui: &mut egui::Ui, t: &Tag, actions: &mut Vec<Action>) {
             actions.push(Action::CopyText(t.name.clone()));
             ui.close();
         }
+        if ui.button("Push to origin").clicked() {
+            actions.push(Action::PushTag(t.name.clone()));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Delete…").clicked() {
+            actions.push(Action::AskDeleteTag(t.clone()));
+            ui.close();
+        }
     });
 }
 
