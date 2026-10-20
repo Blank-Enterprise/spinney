@@ -151,12 +151,16 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
     if !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(Action::CloseDiff);
     }
+    let origin = match center {
+        Center::Review(_, origin) => origin.clone(),
+        _ => "committed".to_string(),
+    };
     let (fd, work) = match center {
         Center::Diff(w) => {
             let w = &mut **w;
             (&w.fd, Some((w.staged, &w.change, w.dir(), &mut w.sel)))
         }
-        Center::CommitFile(fd) => (&**fd, None),
+        Center::CommitFile(fd) | Center::Review(fd, _) => (&**fd, None),
         Center::Graph | Center::Conflict(_) | Center::Merge(_) => return,
     };
     let blocked = work
@@ -178,7 +182,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
     });
     ui.horizontal(|ui| {
         let Some((staged, change, dir, sel)) = &work else {
-            ui.weak("committed");
+            ui.weak(&origin);
             return;
         };
         ui.weak(if *staged { "staged" } else { "unstaged" });

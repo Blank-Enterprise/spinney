@@ -167,6 +167,10 @@ pub fn show(
     merge_tool: MergeTool,
     actions: &mut Vec<Action>,
 ) {
+    // The Worktrees view lists the selected worktree's changes here, read-only.
+    if tab.view == super::worktrees_view::View::Worktrees {
+        return super::worktrees_view::files(ui, tab, actions);
+    }
     if let Some(i) = tab.selected_commit {
         commit_files(ui, tab, i, actions);
         return;

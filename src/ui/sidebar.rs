@@ -1,3 +1,4 @@
+use super::worktrees_view::{self, View};
 use super::{theme, toolbar::folder_name, Action, ProjectTab};
 use crate::project::Worktree;
 use crate::refs::{Branch, Tag};
@@ -497,12 +498,34 @@ impl Split {
 }
 
 pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) {
+    if let Some(view) = worktrees_view::toggle(ui, tab.view) {
+        actions.push(Action::SetView(view));
+    }
+    ui.add_space(6.0);
     ui.add(
         egui::TextEdit::singleline(&mut tab.filter)
             .hint_text("Filter")
             .desired_width(f32::INFINITY),
     );
     ui.add_space(4.0);
+    // The sections fade over to the worktree list, and back.
+    let worktrees = tab.view == View::Worktrees;
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(egui::Id::unique("sidebar_view_fade"), worktrees, 0.15);
+    ui.set_opacity(if worktrees { t } else { 1.0 - t });
+    if worktrees {
+        let q = tab.filter.as_str();
+        let listed: Vec<_> = tab
+            .worktrees
+            .iter()
+            .filter(|w| {
+                filter_matches(q, &folder_name(&w.path))
+                    || w.branch.as_deref().is_some_and(|b| filter_matches(q, b))
+            })
+            .collect();
+        return worktrees_view::list(ui, &listed, &tab.review, actions);
+    }
     let spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.y = 0.0;
     let fixed = SECTIONS as f32 * HEADER_H + (SECTIONS - 1) as f32 * HANDLE_H;

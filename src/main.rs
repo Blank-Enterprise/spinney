@@ -1,4 +1,5 @@
 mod actions;
+mod agents;
 mod config;
 mod conflict;
 mod creds;
@@ -9,6 +10,7 @@ mod graph;
 mod mergetool;
 mod project;
 mod refs;
+mod review;
 mod ssh;
 mod stage;
 mod stash;

@@ -155,19 +155,22 @@ fn empty(path: &str) -> FileDiff {
     }
 }
 
+/// `git diff` for one file, in the form `parse` reads.
+const FILE_DIFF: [&str; 10] = [
+    "--literal-pathspecs",
+    "-c",
+    "core.quotepath=off",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "-U3",
+];
+
 pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> {
-    let base = [
-        "--literal-pathspecs",
-        "-c",
-        "core.quotepath=off",
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "-U3",
-    ];
+    let base = FILE_DIFF;
     let untracked = !staged
         && !git::run(
             worktree,
@@ -195,8 +198,21 @@ pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> 
         args.extend(["--", path]);
         git::run_bytes(worktree, &args, &[0])?
     };
-    let lossy = std::str::from_utf8(&out).is_err();
-    let text = String::from_utf8_lossy(&out);
+    Ok(one_file(&out, path))
+}
+
+/// `path` from commit `rev` to the working tree (staged and unstaged together).
+pub fn file_diff_from(worktree: &Path, rev: &str, path: &str) -> Result<FileDiff> {
+    let mut args = FILE_DIFF.to_vec();
+    args.extend([rev, "--", path]);
+    let out = git::run_bytes(worktree, &args, &[0])?;
+    Ok(one_file(&out, path))
+}
+
+/// Raw `git diff` output for one path as a single `FileDiff`.
+fn one_file(out: &[u8], path: &str) -> FileDiff {
+    let lossy = std::str::from_utf8(out).is_err();
+    let text = String::from_utf8_lossy(out);
     // A type change (file ↔ symlink) comes as two sections, the old side deleted and the
     // new one added: show both, one after the other.
     let mut fd = parse(&text)
@@ -209,7 +225,7 @@ pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> 
         .unwrap_or_else(|| empty(path));
     fd.path = path.to_string();
     fd.lossy = lossy;
-    Ok(fd)
+    fd
 }
 
 pub fn commit_diff(worktree: &Path, sha: &str) -> Result<Vec<FileDiff>> {
