@@ -233,10 +233,14 @@ fn free_target(root: &Path, branch: &str) -> Result<(PathBuf, String)> {
     Ok((target, arg))
 }
 
-/// Create worktree + new branch `branch` from `base`.
+/// Create worktree + new branch `branch` from `base`. `--no-track`: a base like `origin/main`
+/// must not become the upstream, or pull merges main and push refuses the name mismatch.
 pub fn add_worktree(root: &Path, branch: &str, base: &str) -> Result<PathBuf> {
     let (target, rel) = free_target(root, branch)?;
-    git::run(root, &["worktree", "add", "-b", branch, &rel, base])?;
+    git::run(
+        root,
+        &["worktree", "add", "--no-track", "-b", branch, &rel, base],
+    )?;
     Ok(target)
 }
 
@@ -505,6 +509,16 @@ mod tests {
         let branch = git::run(&p, &["symbolic-ref", "--short", "HEAD"]).unwrap();
         assert_eq!(branch.trim(), "topic");
         assert!(p.join("b.txt").exists());
+    }
+
+    #[test]
+    fn add_worktree_from_remote_base_has_no_upstream() {
+        let (_tmp, root) = cloned();
+        let p = add_worktree(&root, "topic", "origin/main").unwrap();
+        assert!(git::run(&p, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err());
+        crate::actions::push(&p).unwrap();
+        let up = git::run(&p, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
+        assert_eq!(up.trim(), "origin/topic");
     }
 
     #[test]
