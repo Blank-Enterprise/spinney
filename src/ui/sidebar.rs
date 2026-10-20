@@ -374,6 +374,10 @@ fn branch_menu(
             }
         }
         ui.separator();
+        if !b.remote && ui.button("Rename…").clicked() {
+            actions.push(Action::AskRename(name.to_string()));
+            ui.close();
+        }
         let (label, action) = if b.remote {
             (
                 "Delete remote branch…",

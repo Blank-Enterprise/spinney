@@ -242,6 +242,61 @@ pub(super) struct DeleteBranchDialog {
     pub(super) not_merged: bool,
 }
 
+/// Rename local `branch` (asked in `worktree`) to `name`, and maybe on its remote too.
+pub(super) struct RenameBranchDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) branch: String,
+    pub(super) name: String,
+    /// Offered when the upstream has the same name on its remote.
+    pub(super) remote: Option<actions::RemoteRename>,
+    pub(super) also_remote: bool,
+    /// Last name checked with git, and whether it was valid (git runs once per edit).
+    checked: Option<(String, bool)>,
+}
+
+impl RenameBranchDialog {
+    pub(super) fn new(
+        root: PathBuf,
+        worktree: PathBuf,
+        branch: String,
+        remote: Option<actions::RemoteRename>,
+    ) -> Self {
+        RenameBranchDialog {
+            root,
+            worktree,
+            name: branch.clone(),
+            branch,
+            remote,
+            also_remote: false,
+            checked: None,
+        }
+    }
+
+    /// The trimmed new name, or why Rename is disabled.
+    fn target(&mut self) -> Result<String, String> {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err("Enter a branch name".into());
+        }
+        if name == self.branch {
+            return Err("Enter a new name".into());
+        }
+        let valid = match &self.checked {
+            Some((n, ok)) if *n == name => *ok,
+            _ => {
+                let ok = project::check_branch_name(&name).is_ok();
+                self.checked = Some((name.clone(), ok));
+                ok
+            }
+        };
+        if !valid {
+            return Err(format!("{name} is not a valid branch name"));
+        }
+        Ok(name)
+    }
+}
+
 /// Merge `branch` into `into` (checked out in `worktree`), in the chosen mode.
 pub(super) struct MergeDialog {
     pub(super) root: PathBuf,
@@ -272,6 +327,7 @@ pub(super) struct Dialogs {
     pub(super) delete_branch: Option<DeleteBranchDialog>,
     /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
     pub(super) delete_remote: Option<String>,
+    pub(super) rename_branch: Option<RenameBranchDialog>,
     pub(super) confirm_drop_stash: Option<DropStash>,
     pub(super) convert: Option<ConvertDialog>,
     pub(super) merge: Option<MergeDialog>,
@@ -304,6 +360,7 @@ impl Dialogs {
             || self.convert.is_some()
             || self.delete_branch.is_some()
             || self.delete_remote.is_some()
+            || self.rename_branch.is_some()
             || self.merge.is_some()
             || self.rebase.is_some()
     }
@@ -521,6 +578,39 @@ impl SpinneyApp {
                 Some(true) => self.delete_remote(name),
                 Some(false) => {}
                 None => self.dialogs.delete_remote = Some(name),
+            }
+        }
+        if let Some(mut d) = self.dialogs.rename_branch.take() {
+            let mut result = None;
+            let target = d.target();
+            egui::Modal::new(egui::Id::unique("rename_branch")).show(ctx, |ui| {
+                ui.label(format!("Rename {}", d.branch));
+                ui.text_edit_singleline(&mut d.name);
+                if let Some(r) = &d.remote {
+                    let new = target.as_deref().unwrap_or("the new name");
+                    ui.checkbox(&mut d.also_remote, format!("Also rename on {}", r.remote));
+                    ui.label(theme::caption(&format!(
+                        "Pushes {new} and deletes {} on {}.",
+                        d.branch, r.remote
+                    )));
+                }
+                if let Err(reason) = &target {
+                    ui.colored_label(ui.visuals().error_fg_color, reason);
+                }
+                ui.horizontal(|ui| {
+                    let rename = theme::primary("Rename");
+                    if ui.add_enabled(target.is_ok(), rename).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match (result, target) {
+                (Some(true), Ok(name)) => self.rename_branch(d, name),
+                (Some(false), _) => {}
+                _ => self.dialogs.rename_branch = Some(d),
             }
         }
         if let Some(mut d) = self.dialogs.merge.take() {
@@ -793,6 +883,52 @@ impl SpinneyApp {
             Ok(actions::DeleteOutcome::NotMerged) => {
                 d.not_merged = true;
                 self.dialogs.delete_branch = Some(d);
+            }
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        self.errors.extend(errors);
+    }
+
+    /// Open the rename dialog for local `branch`, refusing now rather than after the
+    /// dialog a branch another worktree has checked out.
+    pub(super) fn ask_rename(&mut self, branch: String, errors: &mut Vec<String>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if self.jobs.network_busy(&tab.root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let worktree = tab.active_worktree.clone();
+        if let Err(e) = actions::ensure_not_checked_out_elsewhere(&worktree, &branch) {
+            return errors.push(format!("{e:#}"));
+        }
+        match actions::remote_rename(&worktree, &branch) {
+            Ok(remote) => {
+                let d = RenameBranchDialog::new(tab.root.clone(), worktree, branch, remote);
+                self.dialogs.rename_branch = Some(d);
+            }
+            Err(e) => errors.push(format!("upstream: {e:#}")),
+        }
+    }
+
+    /// Rename locally now; the remote half runs as a job, like a push.
+    pub(super) fn rename_branch(&mut self, d: RenameBranchDialog, name: String) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.root == d.root) else {
+            return;
+        };
+        let res = actions::rename_branch(&d.worktree, &d.branch, &name);
+        tab.refresh(&ctx, &mut errors);
+        match res {
+            Ok(()) => {
+                if let Some(r) = d.remote.filter(|_| d.also_remote) {
+                    let (wt, old) = (d.worktree, d.branch);
+                    self.jobs
+                        .spawn(JobKind::RenameRemote, d.root, String::new(), move || {
+                            actions::rename_on_remote(&wt, &r, &old, &name)
+                        });
+                }
             }
             Err(e) => errors.push(format!("{e:#}")),
         }
@@ -1434,6 +1570,14 @@ mod tests {
         d.delete_remote = Some("origin/topic".into());
         assert!(d.any_open());
         d.delete_remote = None;
+        d.rename_branch = Some(RenameBranchDialog::new(
+            PathBuf::from("/tmp/r"),
+            PathBuf::from("/tmp/r"),
+            "topic".into(),
+            None,
+        ));
+        assert!(d.any_open());
+        d.rename_branch = None;
         d.merge = Some(MergeDialog {
             root: PathBuf::from("/tmp/r"),
             worktree: PathBuf::from("/tmp/r"),
@@ -1641,6 +1785,80 @@ mod tests {
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, None);
         assert!(app.tabs[0].status.changed_files() == 0);
+    }
+
+    #[test]
+    fn rename_dialog_validates_the_new_name() {
+        let mut d = RenameBranchDialog::new(
+            PathBuf::from("/tmp/r"),
+            PathBuf::from("/tmp/r"),
+            "topic".into(),
+            None,
+        );
+        assert_eq!(d.name, "topic", "prefilled");
+        assert_eq!(d.target().unwrap_err(), "Enter a new name");
+        d.name = "  ".into();
+        assert_eq!(d.target().unwrap_err(), "Enter a branch name");
+        d.name = "a..b".into();
+        assert_eq!(d.target().unwrap_err(), "a..b is not a valid branch name");
+        d.name = " feat/topic ".into();
+        assert_eq!(d.target().unwrap(), "feat/topic");
+    }
+
+    #[test]
+    fn rename_is_refused_up_front_for_a_branch_out_elsewhere() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path().join("repo");
+        std::fs::create_dir(&d).unwrap();
+        let g = |args: &[&str]| crate::git::run(&d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        g(&["branch", "topic"]);
+        g(&["branch", "other"]);
+        let elsewhere = proj.path().join("other");
+        g(&[
+            "worktree",
+            "add",
+            "-q",
+            elsewhere.to_str().unwrap(),
+            "other",
+        ]);
+        let space = app.space().unwrap();
+        app.open_tab(&d, &space);
+
+        app.apply(Action::AskRename("other".into()));
+        assert!(app.dialogs.rename_branch.is_none(), "refused before asking");
+        assert!(app
+            .errors
+            .iter()
+            .any(|e| e.contains("checked out in worktree other")));
+        app.errors.clear();
+
+        app.apply(Action::AskRename("topic".into()));
+        let mut r = app.dialogs.rename_branch.take().expect("dialog open");
+        assert!(r.remote.is_none(), "no upstream, no remote rename");
+        r.name = "feat/topic".into();
+        let name = r.target().unwrap();
+        app.rename_branch(r, name);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let names: Vec<_> = app.tabs[0]
+            .branches
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"feat/topic") && !names.contains(&"topic"),
+            "{names:?}"
+        );
+        assert!(!app.jobs.any(JobKind::RenameRemote));
     }
 
     #[test]
