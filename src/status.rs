@@ -181,6 +181,9 @@ pub fn status(worktree: &Path) -> Result<Status> {
                 let path = f.last().copied().unwrap_or_default();
                 st.conflicted.push(fs(path, Change::Conflicted(conflict)));
             }
+            // A trailing `/` is an embedded repo or worktree (an agent's `.claude/worktrees/…`):
+            // its own work, and staging it would only add a gitlink.
+            "?" if rest.ends_with('/') => {}
             "?" => st.unstaged.push(fs(rest.trim_start(), Change::Untracked)),
             _ => {}
         }
@@ -213,6 +216,45 @@ mod tests {
         st.unstaged.push(fs_("b", Change::Untracked));
         st.conflicted.push(fs_("c", Change::Conflicted(BOTH)));
         assert_eq!(st.changed_files(), 3);
+    }
+
+    #[test]
+    fn a_nested_worktree_is_not_an_untracked_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        g(d, &["init", "-q", "-b", "main"]);
+        g(
+            d,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        // Claude Code's agent worktree, inside the checkout and not ignored.
+        g(
+            d,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "a",
+                ".claude/worktrees/agent-1",
+            ],
+        );
+        fs::write(d.join(".claude/settings.json"), "{}").unwrap();
+        let s = status(d).unwrap();
+        assert_eq!(
+            s.unstaged,
+            [fs_(".claude/settings.json", Change::Untracked)]
+        );
     }
 
     #[test]
