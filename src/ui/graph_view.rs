@@ -22,6 +22,8 @@ const ON_PILL: Color32 = Color32::from_rgb(0x10, 0x14, 0x1c);
 
 pub struct GraphOutput {
     pub clicked: Option<usize>,
+    /// ⌘-clicked: added to or removed from the multi-selection.
+    pub toggled: Option<usize>,
     pub wip_clicked: bool,
     pub near_end: bool,
     /// A branch label dropped onto another label.
@@ -95,6 +97,8 @@ pub struct MenuContext<'a> {
     pub operation: Option<Operation>,
     /// Per row: the commit is HEAD or one of its ancestors.
     pub on_head: &'a [bool],
+    /// Rows ⌘-clicked into a multi-selection.
+    pub picked: &'a [usize],
 }
 
 /// Why checking out another commit must wait: uncommitted changes to tracked files, or an
@@ -128,6 +132,63 @@ pub enum MenuAction {
     Worktree,
     /// A sub-menu of Soft, Mixed and Hard.
     Reset,
+    /// The commit, or the ⌘-clicked selection it belongs to.
+    CherryPick,
+}
+
+/// What the menu needs to know about one commit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Facts {
+    /// HEAD or one of its ancestors.
+    pub on_head: bool,
+    /// Has more than one parent.
+    pub merge: bool,
+}
+
+impl Facts {
+    fn of(row: &Row, on_head: bool) -> Facts {
+        Facts {
+            on_head,
+            merge: row.commit.parents.len() > 1,
+        }
+    }
+}
+
+/// The rows a cherry-pick from row `i`'s menu applies, oldest first: the ⌘-clicked
+/// selection when `i` is in it, else just `i`. Rows run newest first, so higher is older.
+pub fn pick_rows(picked: &[usize], i: usize) -> Vec<usize> {
+    if picked.len() < 2 || !picked.contains(&i) {
+        return vec![i];
+    }
+    let mut rows = picked.to_vec();
+    rows.sort_unstable_by(|a, b| b.cmp(a));
+    rows.dedup();
+    rows
+}
+
+/// "Cherry-pick onto <branch>" (or "Cherry-pick N commits onto <branch>") for `picks`, and
+/// why it is disabled, if it is.
+fn cherry_pick_item(ctx: &MenuContext, picks: &[Facts]) -> (String, Option<String>) {
+    let onto = ctx.branch.as_deref().unwrap_or("HEAD");
+    let label = match picks.len() {
+        1 => format!("Cherry-pick onto {onto}"),
+        n => format!("Cherry-pick {n} commits onto {onto}"),
+    };
+    let blocked = if ctx.branch.is_none() {
+        Some("Check out a branch first".to_string())
+    } else if ctx.dirty.is_some() {
+        ctx.dirty.clone()
+    } else if picks.iter().any(|f| f.merge) {
+        Some("Cherry-picking a merge commit isn't supported".to_string())
+    } else if picks.iter().any(|f| f.on_head) {
+        Some(match picks.len() {
+            1 => format!("This commit is already on {onto}"),
+            _ => format!("Some of these commits are already on {onto}"),
+        })
+    } else {
+        None
+    };
+    (label, blocked)
 }
 
 impl MenuAction {
@@ -139,7 +200,9 @@ impl MenuAction {
             MenuAction::Checkout => Action::CheckoutCommit(sha),
             MenuAction::Branch => Action::BranchAt(sha),
             MenuAction::Worktree => Action::NewWorktreeFrom(sha),
-            MenuAction::Reset => unreachable!("a sub-menu, see reset_action"),
+            MenuAction::Reset | MenuAction::CherryPick => {
+                unreachable!("handled in commit_menu")
+            }
         }
     }
 }
@@ -171,15 +234,17 @@ fn reset_item(ctx: &MenuContext, on_head: bool) -> (String, Option<String>) {
     (label, blocked)
 }
 
-/// The commit menu's entries in groups (separated in the menu), with enabled states.
-/// `on_head`: the commit is HEAD or one of its ancestors.
-pub fn menu_items(ctx: &MenuContext, on_head: bool) -> Vec<Vec<MenuItem>> {
+/// The commit menu's entries in groups (separated in the menu), with enabled states, for a
+/// commit described by `this`; `picks` are the commits a cherry-pick would apply.
+pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<MenuItem>> {
+    let on_head = this.on_head;
     let item = |label: &str, action, blocked: Option<String>| MenuItem {
         label: label.to_string(),
         action,
         blocked,
     };
     let (reset_label, reset_blocked) = reset_item(ctx, on_head);
+    let (pick_label, pick_blocked) = cherry_pick_item(ctx, picks);
     let worktrees = ctx.layout == Layout::WorktreeRoot;
     // A normal clone's new branch is switched to, moving HEAD like a checkout.
     let branch_blocked = if worktrees { None } else { ctx.dirty.clone() };
@@ -202,19 +267,28 @@ pub fn menu_items(ctx: &MenuContext, on_head: bool) -> Vec<Vec<MenuItem>> {
             item("Create branch here…", MenuAction::Branch, branch_blocked),
             item("New worktree here…", MenuAction::Worktree, worktree_blocked),
         ],
+        vec![item(&pick_label, MenuAction::CherryPick, pick_blocked)],
         vec![item(&reset_label, MenuAction::Reset, reset_blocked)],
     ]
 }
 
 fn commit_menu(
     ui: &mut egui::Ui,
-    row: &Row,
-    on_head: bool,
+    rows: &[Row],
+    i: usize,
     ctx: &MenuContext,
     actions: &mut Vec<Action>,
 ) {
-    for (i, group) in menu_items(ctx, on_head).into_iter().enumerate() {
-        if i > 0 {
+    let row = &rows[i];
+    let on = |k: usize| ctx.on_head.get(k).copied().unwrap_or(false);
+    let picks: Vec<usize> = pick_rows(ctx.picked, i)
+        .into_iter()
+        .filter(|&k| k < rows.len())
+        .collect();
+    let facts: Vec<Facts> = picks.iter().map(|&k| Facts::of(&rows[k], on(k))).collect();
+    let items = menu_items(ctx, Facts::of(row, on(i)), &facts);
+    for (g, group) in items.into_iter().enumerate() {
+        if g > 0 {
             ui.separator();
         }
         for item in group {
@@ -241,7 +315,12 @@ fn commit_menu(
                 )
                 .on_disabled_hover_text(item.blocked.unwrap_or_default());
             if r.clicked() {
-                actions.push(item.action.action(&row.commit.sha));
+                actions.push(match item.action {
+                    MenuAction::CherryPick => Action::CherryPick(
+                        picks.iter().map(|&k| rows[k].commit.sha.clone()).collect(),
+                    ),
+                    a => a.action(&row.commit.sha),
+                });
                 ui.close();
             }
         }
@@ -265,6 +344,7 @@ pub fn show(
 ) -> GraphOutput {
     let mut out = GraphOutput {
         clicked: None,
+        toggled: None,
         wip_clicked: false,
         near_end: false,
         drops: vec![],
@@ -294,7 +374,7 @@ pub fn show(
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
                 let (is_sel, row) = match k.checked_sub(skip) {
                     None => (selected.is_none(), None),
-                    Some(i) => (selected == Some(i), Some(i)),
+                    Some(i) => (selected == Some(i) || menu.picked.contains(&i), Some(i)),
                 };
                 let bg = if is_sel {
                     theme::SEL_BG
@@ -311,7 +391,11 @@ pub fn show(
                     }
                     Some(i) => {
                         if resp.clicked() {
-                            out.clicked = Some(i);
+                            if ui.input(|inp| inp.modifiers.command) {
+                                out.toggled = Some(i);
+                            } else {
+                                out.clicked = Some(i);
+                            }
                         }
                         let pills = paint_row(ui, rect, &rows[i], text_x, now, names);
                         // Branch labels drag onto each other; a plain click still selects.
@@ -322,8 +406,7 @@ pub fn show(
                             }
                             branch_drop::drag_and_drop(ui, &label, name, &mut out.drops);
                         }
-                        let on = menu.on_head.get(i).copied().unwrap_or(false);
-                        resp.context_menu(|ui| commit_menu(ui, &rows[i], on, menu, actions));
+                        resp.context_menu(|ui| commit_menu(ui, rows, i, menu, actions));
                     }
                 }
             }
@@ -572,12 +655,21 @@ mod tests {
     }
 
     fn enabled(ctx: &MenuContext) -> Vec<(String, bool)> {
-        menu_items(ctx, true)
+        menu_items(ctx, ON, &[OFF])
             .into_iter()
             .flatten()
             .map(|i| (i.label, i.blocked.is_none()))
             .collect()
     }
+
+    const ON: Facts = Facts {
+        on_head: true,
+        merge: false,
+    };
+    const OFF: Facts = Facts {
+        on_head: false,
+        merge: false,
+    };
 
     fn ctx(layout: Layout, dirty: Option<&str>) -> MenuContext<'static> {
         MenuContext {
@@ -586,13 +678,85 @@ mod tests {
             branch: Some("main".into()),
             operation: None,
             on_head: &[],
+            picked: &[],
         }
+    }
+
+    #[test]
+    fn cherry_pick_applies_the_selection_oldest_first() {
+        assert_eq!(pick_rows(&[], 4), [4]);
+        assert_eq!(pick_rows(&[4], 4), [4]);
+        assert_eq!(
+            pick_rows(&[2, 7, 5], 5),
+            [7, 5, 2],
+            "oldest (lowest row) first"
+        );
+        assert_eq!(
+            pick_rows(&[2, 7], 3),
+            [3],
+            "right-clicked outside the selection"
+        );
+    }
+
+    #[test]
+    fn cherry_pick_is_refused_for_merges_and_commits_already_here() {
+        let pick = |c: &MenuContext, picks: &[Facts]| {
+            let items = menu_items(c, OFF, picks);
+            let it = items
+                .into_iter()
+                .flatten()
+                .find(|i| i.action == MenuAction::CherryPick);
+            let it = it.unwrap();
+            (it.label, it.blocked)
+        };
+        let c = ctx(Layout::WorktreeRoot, None);
+        assert_eq!(pick(&c, &[OFF]), ("Cherry-pick onto main".into(), None));
+        assert_eq!(
+            pick(&c, &[OFF, OFF, OFF]),
+            ("Cherry-pick 3 commits onto main".into(), None)
+        );
+        assert_eq!(
+            pick(&c, &[ON]).1.as_deref(),
+            Some("This commit is already on main")
+        );
+        assert_eq!(
+            pick(&c, &[OFF, ON]).1.as_deref(),
+            Some("Some of these commits are already on main")
+        );
+        let merge = Facts {
+            on_head: false,
+            merge: true,
+        };
+        assert_eq!(
+            pick(&c, &[OFF, merge]).1.as_deref(),
+            Some("Cherry-picking a merge commit isn't supported")
+        );
+        let dirty = ctx(
+            Layout::WorktreeRoot,
+            Some("Commit or stash your changes first"),
+        );
+        assert_eq!(
+            pick(&dirty, &[OFF]).1.as_deref(),
+            Some("Commit or stash your changes first")
+        );
+        let detached = MenuContext {
+            branch: None,
+            ..ctx(Layout::WorktreeRoot, None)
+        };
+        assert_eq!(
+            pick(&detached, &[OFF]).1.as_deref(),
+            Some("Check out a branch first")
+        );
     }
 
     #[test]
     fn reset_is_offered_only_on_the_current_branchs_history() {
         let reset = |c: &MenuContext, on_head| {
-            let items = menu_items(c, on_head);
+            let f = Facts {
+                on_head,
+                merge: false,
+            };
+            let items = menu_items(c, f, &[f]);
             let it = items.into_iter().flatten().last().unwrap();
             assert_eq!(it.action, MenuAction::Reset);
             (it.label, it.blocked)
@@ -635,6 +799,7 @@ mod tests {
             ("Checkout this commit", false),
             ("Create branch here…", true),
             ("New worktree here…", true),
+            ("Cherry-pick onto main", false),
             ("Reset main to this commit", true),
         ];
         let want: Vec<_> = want.iter().map(|(l, on)| (l.to_string(), *on)).collect();
@@ -646,7 +811,7 @@ mod tests {
         let got = enabled(&normal);
         assert_eq!(got[3], ("Create branch here…".into(), false), "it switches");
         assert_eq!(got[4], ("New worktree here…".into(), false));
-        let checkout = &menu_items(&normal, true)[1][0];
+        let checkout = &menu_items(&normal, ON, &[ON])[1][0];
         assert_eq!(
             checkout.blocked.as_deref(),
             Some("Commit or stash your changes first")

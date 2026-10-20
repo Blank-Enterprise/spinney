@@ -147,6 +147,8 @@ pub struct ProjectTab {
     head: Option<String>,
     ancestry: Ancestry,
     on_head: Vec<bool>,
+    /// Rows ⌘-clicked into a multi-selection (for cherry-picking several commits).
+    picked: Vec<usize>,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -214,6 +216,7 @@ impl ProjectTab {
             head: None,
             ancestry: Ancestry::default(),
             on_head: vec![],
+            picked: vec![],
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -249,6 +252,7 @@ impl ProjectTab {
         self.log = LogPager::start(self.active_worktree.clone(), ctx.clone());
         self.log.request(PAGE);
         self.rows.clear();
+        self.picked.clear();
         self.selected_commit = None;
         self.commit_files.clear();
         self.reload_changes(errors);
@@ -619,6 +623,10 @@ pub enum Action {
     CopyCommitMessage(String),
     /// Check out the commit with this SHA, detaching HEAD.
     CheckoutCommit(String),
+    /// ⌘-click on a row: add it to the multi-selection, or take it out.
+    TogglePick(usize),
+    /// Cherry-pick these commits (SHAs, oldest first) onto the checked-out branch.
+    CherryPick(Vec<String>),
     /// Ask before resetting the checked-out branch to the commit with this SHA.
     AskReset(String, actions::ResetMode),
     /// "Create branch here…" on the detached-HEAD banner: a new branch at HEAD, switched to.
@@ -1082,6 +1090,7 @@ impl SpinneyApp {
                 }
             }
             Action::SelectCommit(_)
+            | Action::TogglePick(_)
             | Action::DeselectCommit
             | Action::OpenDiff(..)
             | Action::OpenConflict(_)
@@ -1150,6 +1159,7 @@ impl SpinneyApp {
                     });
                 }
             }
+            Action::CherryPick(shas) => self.cherry_pick(&shas, &mut errors),
             Action::AskReset(sha, mode) => self.ask_reset(&sha, mode, &mut errors),
             Action::AttachBranch => {
                 let head = self
@@ -1665,9 +1675,14 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
         }
     }
     match action {
-        Action::SelectCommit(i) => tab.select_commit(i, errors),
+        Action::SelectCommit(i) => {
+            tab.picked.clear();
+            tab.select_commit(i, errors)
+        }
+        Action::TogglePick(i) => tab.picked = toggle_pick(&tab.picked, tab.selected_commit, i),
         Action::DeselectCommit => {
             tab.selected_commit = None;
+            tab.picked.clear();
             tab.commit_files.clear();
         }
         Action::OpenDiff(f, staged) => tab.open_diff(f, staged, errors),
@@ -1718,6 +1733,22 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
         Action::CloseDiff => tab.center = Center::Graph,
         _ => {}
     }
+}
+
+/// The multi-selection after ⌘-clicking row `i`: the selected commit joins it first, so
+/// ⌘-clicking a second row selects both.
+pub fn toggle_pick(picked: &[usize], selected: Option<usize>, i: usize) -> Vec<usize> {
+    let mut out = picked.to_vec();
+    if out.is_empty() {
+        out.extend(selected.filter(|&s| s != i));
+    }
+    match out.iter().position(|&k| k == i) {
+        Some(at) => {
+            out.remove(at);
+        }
+        None => out.push(i),
+    }
+    out
 }
 
 /// Where leaving a detached HEAD goes once confirmed.
@@ -2058,6 +2089,7 @@ impl eframe::App for SpinneyApp {
                     branch: branch.map(|b| b.name.clone()),
                     operation: tab.operation,
                     on_head: &tab.on_head,
+                    picked: &tab.picked,
                 };
                 let out = graph_view::show(
                     ui,
@@ -2069,6 +2101,9 @@ impl eframe::App for SpinneyApp {
                     &mut actions,
                 );
                 actions.extend(out.drops);
+                if let Some(i) = out.toggled {
+                    actions.push(Action::TogglePick(i));
+                }
                 if let Some(i) = out.clicked {
                     actions.push(Action::SelectCommit(i));
                 }
@@ -2529,6 +2564,15 @@ mod tests {
         }
         assert_eq!(done.expect("job finished").kind, JobKind::Pull);
         assert!(!jobs.network_busy(a) && jobs.active.is_empty());
+    }
+
+    #[test]
+    fn cmd_click_builds_a_selection_from_the_selected_commit() {
+        assert_eq!(toggle_pick(&[], Some(2), 5), [2, 5]);
+        assert_eq!(toggle_pick(&[], None, 5), [5]);
+        assert_eq!(toggle_pick(&[], Some(5), 5), [5]);
+        assert_eq!(toggle_pick(&[2, 5], Some(2), 5), [2], "toggled off");
+        assert_eq!(toggle_pick(&[2, 5], Some(2), 7), [2, 5, 7]);
     }
 
     #[test]

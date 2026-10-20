@@ -931,6 +931,27 @@ impl SpinneyApp {
         }
     }
 
+    /// Cherry-pick synchronously, like merge; conflicts go to the in-progress banner.
+    pub(super) fn cherry_pick(&mut self, shas: &[String], errors: &mut Vec<String>) {
+        let ctx = self.ctx.clone();
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        // A pull or push may be moving the same branch (the toolbar disables it too).
+        if self.jobs.network_busy(&tab.root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let res = actions::cherry_pick(&tab.active_worktree, shas);
+        tab.refresh(&ctx, errors);
+        match res {
+            Ok(MergeOutcome::Conflicts(files)) => {
+                self.notices.push(conflict_message("Cherry-pick", &files))
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
+
     /// Open the reset confirmation, refusing now what would fail anyway.
     pub(super) fn ask_reset(&mut self, sha: &str, mode: ResetMode, errors: &mut Vec<String>) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
@@ -2080,6 +2101,52 @@ mod tests {
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(g(&["rev-parse", "HEAD"]), init);
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "a\n");
+    }
+
+    #[test]
+    fn cherry_pick_from_the_graph_applies_or_stops_in_progress() {
+        use super::super::Action;
+        use crate::actions::Operation;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap().trim().to_string();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        g(&["switch", "-q", "-c", "topic"]);
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "b"]);
+        let b = g(&["rev-parse", "HEAD"]);
+        std::fs::write(d.join("a.txt"), "topic\n").unwrap();
+        g(&["commit", "-qam", "topic a"]);
+        let topic_a = g(&["rev-parse", "HEAD"]);
+        g(&["switch", "-q", "main"]);
+        std::fs::write(d.join("a.txt"), "main\n").unwrap();
+        g(&["commit", "-qam", "main a"]);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        app.apply(Action::CherryPick(vec![b]));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(g(&["log", "-1", "--format=%s"]), "b");
+
+        app.apply(Action::CherryPick(vec![topic_a]));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].operation, Some(Operation::CherryPick));
+        assert_eq!(app.tabs[0].status.conflicted.len(), 1);
+        assert!(app
+            .notices
+            .iter()
+            .any(|n| n.starts_with("Cherry-pick stopped")));
     }
 
     #[test]
