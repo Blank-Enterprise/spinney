@@ -513,6 +513,8 @@ pub enum Action {
     DismissConvert(PathBuf),
     ActivateWorktree(PathBuf),
     RemoveWorktree(PathBuf),
+    /// Ask before removing a worktree and deleting its branch in one step.
+    AskRemoveWithBranch(PathBuf),
     SelectCommit(usize),
     DeselectCommit,
     OpenDiff(FileStatus, bool),
@@ -1107,6 +1109,24 @@ impl SpinneyApp {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.active_worktree = path;
                     tab.refresh(&ctx, &mut errors);
+                }
+            }
+            Action::AskRemoveWithBranch(path) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let root = tab.root.clone();
+                    // Refuse now (busy, detached, out elsewhere) rather than after asking.
+                    let plan = if self.jobs.network_busy(&root) {
+                        Err(anyhow::anyhow!("Wait for the running fetch, pull or push"))
+                    } else {
+                        actions::plan_remove_with_branch(&root, &path)
+                    };
+                    match plan {
+                        Ok(plan) => {
+                            self.dialogs.remove_with_branch =
+                                Some(dialogs::RemoveWithBranchDialog { root, plan })
+                        }
+                        Err(e) => errors.push(format!("{e:#}")),
+                    }
                 }
             }
             Action::RemoveWorktree(path) => {

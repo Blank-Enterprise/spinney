@@ -786,6 +786,77 @@ pub fn fast_forward_to(worktree: &Path, branch: &str, target: &str) -> Result<Me
     Ok(MergeOutcome::Done)
 }
 
+/// What removing a worktree together with its branch loses, shown before it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoveWithBranch {
+    pub path: PathBuf,
+    pub branch: String,
+    /// Uncommitted or untracked files in the worktree.
+    pub dirty: bool,
+    /// What `git branch -d` checks against: the upstream, else the project's HEAD.
+    pub base: String,
+    /// Commits on the branch that are not on `base`.
+    pub unmerged: usize,
+}
+
+/// Check that the worktree at `path` can go with its branch: it has a branch, no other
+/// worktree has that branch out, and it is not the main working tree.
+pub fn plan_remove_with_branch(root: &Path, path: &Path) -> Result<RemoveWithBranch> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(path);
+    if target == canon(root) {
+        bail!("the main working tree can't be removed");
+    }
+    let worktrees = list_worktrees(root)?;
+    let Some(wt) = worktrees.iter().find(|w| canon(&w.path) == target) else {
+        bail!("{} is not a worktree of this project", path.display());
+    };
+    let Some(branch) = wt.branch.clone() else {
+        bail!("this worktree has no branch (detached HEAD)");
+    };
+    let elsewhere = worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some(&branch) && canon(&w.path) != target);
+    if let Some(w) = elsewhere {
+        let name = w.path.file_name().unwrap_or(w.path.as_os_str());
+        bail!(
+            "{branch} is also checked out in worktree {}",
+            name.to_string_lossy()
+        );
+    }
+    let dirty = !git::run(path, &["status", "--porcelain"])?
+        .trim()
+        .is_empty();
+    let local = format!("refs/heads/{branch}");
+    let up = git::run(
+        root,
+        &["for-each-ref", "--format=%(upstream:short)", &local],
+    )?;
+    let base = match up.trim() {
+        "" => refs::current_branch(root)?.unwrap_or_else(|| "HEAD".into()),
+        up => up.to_string(),
+    };
+    let range = format!("{base}..{local}");
+    let unmerged = git::run(root, &["rev-list", "--count", &range])?
+        .trim()
+        .parse()?;
+    Ok(RemoveWithBranch {
+        path: path.to_path_buf(),
+        branch,
+        dirty,
+        base,
+        unmerged,
+    })
+}
+
+/// Remove the worktree (forcing only when the confirmed plan said it was dirty), then
+/// delete its branch: `-D` only when the plan said it was unmerged. A branch that turns out
+/// unmerged anyway is kept and reported as `NotMerged`, for the usual prompt.
+pub fn remove_with_branch(root: &Path, plan: &RemoveWithBranch) -> Result<DeleteOutcome> {
+    crate::project::remove_worktree(root, &plan.path, plan.dirty)?;
+    delete_branch(root, &plan.branch, plan.unmerged > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,6 +1372,89 @@ mod tests {
         // The active worktree's own branch too: pull is the way there.
         let err = fast_forward_to(&main, "main", "origin/feature/x").unwrap_err();
         assert!(err.to_string().contains("worktree main"), "{err}");
+    }
+
+    fn remove_worktree_and_its_merged_branch() {
+        let (_tmp, root, _main) = cloned();
+        let wt = crate::project::add_worktree(&root, "topic", "main").unwrap();
+        let plan = plan_remove_with_branch(&root, &wt).unwrap();
+        assert_eq!(
+            (plan.branch.as_str(), plan.base.as_str()),
+            ("topic", "main")
+        );
+        assert_eq!((plan.dirty, plan.unmerged), (false, 0));
+        let out = remove_with_branch(&root, &plan).unwrap();
+        assert_eq!(out, DeleteOutcome::Deleted);
+        assert!(!wt.exists());
+        assert!(git::run(&root, &["rev-parse", "--verify", "-q", "topic"]).is_err());
+    }
+
+    #[test]
+    fn remove_worktree_and_unmerged_dirty_branch_once_confirmed() {
+        let (_tmp, root, _main) = cloned();
+        let wt = crate::project::add_worktree(&root, "topic", "main").unwrap();
+        g(&wt, &["config", "user.name", "Test User"]);
+        write_commit(&wt, "t.txt");
+        std::fs::write(
+            wt.join("scratch.txt"),
+            "s
+",
+        )
+        .unwrap();
+        let plan = plan_remove_with_branch(&root, &wt).unwrap();
+        assert_eq!((plan.dirty, plan.unmerged), (true, 1));
+        // Asked about as clean and merged, nothing is forced: the worktree stays.
+        let unconfirmed = RemoveWithBranch {
+            dirty: false,
+            unmerged: 0,
+            ..plan.clone()
+        };
+        assert!(remove_with_branch(&root, &unconfirmed).is_err());
+        assert!(wt.join("scratch.txt").exists());
+        assert_eq!(
+            remove_with_branch(&root, &plan).unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert!(!wt.exists());
+        assert!(git::run(&root, &["rev-parse", "--verify", "-q", "topic"]).is_err());
+    }
+
+    #[test]
+    fn remove_worktree_keeps_a_branch_found_unmerged_after_asking() {
+        let (_tmp, root, _main) = cloned();
+        let wt = crate::project::add_worktree(&root, "topic", "main").unwrap();
+        let plan = plan_remove_with_branch(&root, &wt).unwrap();
+        g(&wt, &["config", "user.name", "Test User"]);
+        write_commit(&wt, "t.txt");
+        let out = remove_with_branch(&root, &plan).unwrap();
+        assert_eq!(out, DeleteOutcome::NotMerged, "the usual prompt follows");
+        assert!(!wt.exists());
+        git::run(&root, &["rev-parse", "--verify", "topic"]).unwrap();
+    }
+
+    #[test]
+    fn remove_with_branch_refusals() {
+        let (tmp, root, main) = cloned();
+        let wt = add_worktree_existing(&root, "feature/x").unwrap();
+        assert_eq!(
+            plan_remove_with_branch(&root, &wt).unwrap().base,
+            "origin/feature/x",
+            "judged against its upstream"
+        );
+        let twin = tmp.path().join("twin");
+        let twin_s = twin.to_str().unwrap();
+        g(&root, &["worktree", "add", "-q", "-f", twin_s, "feature/x"]);
+        let err = plan_remove_with_branch(&root, &wt).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("also checked out in worktree twin"),
+            "{err}"
+        );
+        g(&twin, &["checkout", "-q", "--detach"]);
+        let err = plan_remove_with_branch(&root, &twin).unwrap_err();
+        assert!(err.to_string().contains("detached"), "{err}");
+        assert!(plan_remove_with_branch(&root, &root).is_err());
+        assert!(main.exists() && wt.exists() && twin.exists());
     }
 
     /// `main` and a local `other`, both from `init`, each changing `a.txt` differently.
