@@ -63,6 +63,46 @@ pub fn branches(dir: &Path) -> Result<Vec<Branch>> {
         .collect())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tag {
+    pub name: String,
+    /// The commit it names: an annotated tag is peeled to its commit.
+    pub target: String,
+    pub annotated: bool,
+}
+
+/// Parse `for-each-ref` lines of `refname NUL objectname NUL *objectname NUL objecttype`.
+fn parse_tags(out: &str) -> Vec<Tag> {
+    out.lines()
+        .filter_map(|line| {
+            let mut f = line.split('\0');
+            let (refname, object, peeled, kind) = (f.next()?, f.next()?, f.next()?, f.next()?);
+            // Not `refname:short`: it turns into `tags/x` when a branch is also called x.
+            let name = refname.strip_prefix("refs/tags/")?;
+            let target = if peeled.is_empty() { object } else { peeled };
+            Some(Tag {
+                name: name.to_string(),
+                target: target.to_string(),
+                annotated: kind == "tag",
+            })
+        })
+        .collect()
+}
+
+/// Tags, newest first: by tagger date, or the commit date for a lightweight tag.
+pub fn tags(dir: &Path) -> Result<Vec<Tag>> {
+    let out = git::run(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-creatordate",
+            "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(objecttype)",
+            "refs/tags",
+        ],
+    )?;
+    Ok(parse_tags(&out))
+}
+
 /// Short name of the checked-out branch, or `None` when HEAD is detached.
 pub fn current_branch(worktree: &Path) -> Result<Option<String>> {
     let out = git::run_ok_codes(
@@ -149,9 +189,74 @@ mod tests {
     }
 
     #[test]
+    fn tag_lines_parse() {
+        let out = "refs/tags/v2\0aaa\0ccc\0tag\nrefs/tags/release/v1\0bbb\0\0commit\n";
+        assert_eq!(
+            parse_tags(out),
+            [
+                Tag {
+                    name: "v2".into(),
+                    target: "ccc".into(),
+                    annotated: true
+                },
+                Tag {
+                    name: "release/v1".into(),
+                    target: "bbb".into(),
+                    annotated: false
+                },
+            ]
+        );
+        assert!(parse_tags("").is_empty());
+    }
+
+    #[test]
+    fn tags_newest_first_and_peeled() {
+        let (_tmp, root) = cloned();
+        let main = root.join("main");
+        let at = |date: &str, args: &[&str]| {
+            git::run_env(&main, args, &[("GIT_COMMITTER_DATE", date)]).unwrap();
+        };
+        let head = || {
+            git::run(&main, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        at(
+            "2020-01-01T00:00:00Z",
+            &["commit", "--allow-empty", "-q", "-m", "a"],
+        );
+        let a = head();
+        at("2020-01-01T00:00:00Z", &["tag", "old"]);
+        at(
+            "2023-01-01T00:00:00Z",
+            &["commit", "--allow-empty", "-q", "-m", "b"],
+        );
+        let b = head();
+        at("2023-01-01T00:00:00Z", &["tag", "new"]);
+        // Annotated: dated by the tagger (2021), not by its newer commit.
+        at(
+            "2021-01-01T00:00:00Z",
+            &["tag", "-a", "-m", "mid", "mid", &b],
+        );
+        let list = tags(&main).unwrap();
+        let names: Vec<_> = list.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["new", "mid", "old"]);
+        assert_eq!(
+            (list[1].target.as_str(), list[1].annotated),
+            (b.as_str(), true)
+        );
+        assert_eq!(
+            (list[2].target.as_str(), list[2].annotated),
+            (a.as_str(), false)
+        );
+    }
+
+    #[test]
     fn empty_repo_has_no_branches() {
         let tmp = tempfile::tempdir().unwrap();
         git::run(tmp.path(), &["init", "-q", "-b", "main"]).unwrap();
         assert!(branches(tmp.path()).unwrap().is_empty());
+        assert!(tags(tmp.path()).unwrap().is_empty());
     }
 }

@@ -1,6 +1,6 @@
 use super::{theme, toolbar::folder_name, Action, ProjectTab};
 use crate::project::{Layout, Worktree};
-use crate::refs::Branch;
+use crate::refs::{Branch, Tag};
 use eframe::egui::{self, RichText};
 use std::path::Path;
 
@@ -334,6 +334,39 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
+        // Last: a long tag list shouldn't push worktrees and stashes out of view.
+        let tags: Vec<_> = tab
+            .tags
+            .iter()
+            .filter(|t| filter_matches(q, &t.name))
+            .collect();
+        section(ui, "tags", "Tags", tags.len(), true, |ui| {
+            for t in tags {
+                tag_row(ui, t, actions);
+            }
+        });
+    });
+}
+
+/// "v1.0 · Annotated tag at 1a2b3c4", or "· Tag at …" for a lightweight one.
+pub fn tag_hover(t: &Tag) -> String {
+    let kind = if t.annotated { "Annotated tag" } else { "Tag" };
+    format!("{} · {kind} at {}", t.name, short_sha(&t.target))
+}
+
+/// One tag: its full name (`release/1.0` stays whole, not foldered), the commit on the right.
+fn tag_row(ui: &mut egui::Ui, t: &Tag, actions: &mut Vec<Action>) {
+    let r = row(ui, false, t.name.clone(), short_sha(&t.target).into()).on_hover_text(tag_hover(t));
+    r.context_menu(|ui| {
+        // The peeled commit, so it goes through the detached-HEAD checks like a commit does.
+        if ui.button("Checkout").clicked() {
+            actions.push(Action::CheckoutCommit(t.target.clone()));
+            ui.close();
+        }
+        if ui.button("Copy name").clicked() {
+            actions.push(Action::CopyText(t.name.clone()));
+            ui.close();
+        }
     });
 }
 
@@ -629,6 +662,18 @@ mod tests {
         let mut r = branch("origin/main");
         (r.remote, r.behind, r.upstream) = (true, 1, Some("x".into()));
         assert_eq!(fast_forward_item(&r, &[]), None, "remote branch");
+    }
+
+    #[test]
+    fn tag_hover_names_kind_and_commit() {
+        let mut t = Tag {
+            name: "v1.2.0".into(),
+            target: "83174b7246c76c9b6426a95147a715f0d26bf6c6".into(),
+            annotated: true,
+        };
+        assert_eq!(tag_hover(&t), "v1.2.0 · Annotated tag at 83174b7");
+        t.annotated = false;
+        assert_eq!(tag_hover(&t), "v1.2.0 · Tag at 83174b7");
     }
 
     #[test]

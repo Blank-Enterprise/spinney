@@ -18,7 +18,7 @@ use crate::config::{Config, PullStrategy, Space};
 use crate::diff::FileDiff;
 use crate::graph::{Ancestry, LogStream, Row};
 use crate::project::{self, Layout, Worktree};
-use crate::refs::{self, Branch};
+use crate::refs::{self, Branch, Tag};
 use crate::stage::Direction;
 use crate::stash::{self, Stash};
 use crate::status::{self, FileStatus, Status};
@@ -123,6 +123,8 @@ pub struct ProjectTab {
     worktrees: Vec<Worktree>,
     active_worktree: PathBuf,
     branches: Vec<Branch>,
+    /// Newest first.
+    tags: Vec<Tag>,
     stashes: Vec<Stash>,
     log: LogPager,
     rows: Vec<Row>,
@@ -202,6 +204,7 @@ impl ProjectTab {
             log: LogPager::start(active_worktree.clone(), ctx.clone()),
             active_worktree,
             branches: vec![],
+            tags: vec![],
             stashes: vec![],
             rows: vec![],
             selected_commit: None,
@@ -261,10 +264,15 @@ impl ProjectTab {
         self.reload_changes(errors);
     }
 
+    /// Branches, tags and HEAD: what a checkout, fetch or commit can change.
     fn load_branches(&mut self, errors: &mut Vec<String>) {
         match refs::branches(&self.active_worktree) {
             Ok(b) => self.branches = b,
             Err(e) => errors.push(format!("branches: {e:#}")),
+        }
+        match refs::tags(&self.active_worktree) {
+            Ok(t) => self.tags = t,
+            Err(e) => errors.push(format!("tags: {e:#}")),
         }
         let wt = &self.active_worktree;
         self.head = actions::head_commit(wt).unwrap_or_else(|e| {
