@@ -28,7 +28,7 @@ jobs:
       - name: Refuse anything that isn't a version tag
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.TAG }}
           fetch-depth: 0
