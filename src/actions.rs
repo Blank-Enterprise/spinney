@@ -626,6 +626,60 @@ pub fn create_branch(worktree: &Path, name: &str, base: &str) -> Result<()> {
     Ok(())
 }
 
+/// The commit HEAD is detached at, or None when a branch (even an unborn one) is out.
+pub fn detached_head(worktree: &Path) -> Result<Option<String>> {
+    if refs::current_branch(worktree)?.is_some() {
+        return Ok(None);
+    }
+    let out = git::run_ok_codes(worktree, &["rev-parse", "--verify", "-q", "HEAD"], &[0, 1])?;
+    let sha = out.trim();
+    Ok((!sha.is_empty()).then(|| sha.to_string()))
+}
+
+/// How far back the checkout history is searched for the last branch.
+const PREVIOUS_LOOKBACK: usize = 10;
+
+/// The most recently checked-out branch that still exists, other than the current one,
+/// from the worktree's checkout history (`@{-N}`).
+pub fn previous_branch(worktree: &Path) -> Result<Option<String>> {
+    let current = refs::current_branch(worktree)?;
+    for n in 1..=PREVIOUS_LOOKBACK {
+        let rev = format!("@{{-{n}}}");
+        // Fails for a deleted branch or once the history runs out; empty when that
+        // checkout was detached.
+        let Ok(out) = git::run(worktree, &["rev-parse", "--symbolic-full-name", &rev]) else {
+            continue;
+        };
+        let Some(name) = out.trim().strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let full = format!("refs/heads/{name}");
+        let exists = git::run(worktree, &["rev-parse", "--verify", "-q", &full]).is_ok();
+        if exists && current.as_deref() != Some(name) {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Commits reachable from a detached HEAD but from no branch, tag or remote-tracking ref:
+/// what leaving HEAD would make hard to find. Zero when a branch is checked out.
+pub fn detached_orphans(worktree: &Path) -> Result<usize> {
+    if detached_head(worktree)?.is_none() {
+        return Ok(0);
+    }
+    let args = [
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--not",
+        "--branches",
+        "--tags",
+        "--remotes",
+    ];
+    Ok(git::run(worktree, &args)?.trim().parse()?)
+}
+
 /// Create `name` at `base` and switch to it. Moving to another commit refuses over
 /// uncommitted changes, as `checkout_detached` does; from HEAD itself they come along.
 pub fn create_and_switch(worktree: &Path, name: &str, base: &str) -> Result<()> {
@@ -1253,6 +1307,34 @@ mod tests {
         g(&main, &["checkout", "--", "a.txt"]);
         create_and_switch(&main, "old", &init).unwrap();
         assert_eq!(head(&main, "HEAD"), init);
+    }
+
+    #[test]
+    fn detached_head_previous_branch_and_orphans() {
+        let (_tmp, _root, main) = cloned();
+        assert_eq!(detached_head(&main).unwrap(), None);
+        assert_eq!(detached_orphans(&main).unwrap(), 0);
+        let init = head(&main, "HEAD");
+        g(&main, &["switch", "-q", "-c", "topic"]);
+        assert_eq!(previous_branch(&main).unwrap().as_deref(), Some("main"));
+        checkout_detached(&main, &init).unwrap();
+        assert_eq!(detached_head(&main).unwrap(), Some(init.clone()));
+        assert_eq!(previous_branch(&main).unwrap().as_deref(), Some("topic"));
+        assert_eq!(detached_orphans(&main).unwrap(), 0, "init is on main");
+        // Detached to detached: the branch before that is still found.
+        write_commit(&main, "c.txt");
+        let c = head(&main, "HEAD");
+        checkout_detached(&main, &init).unwrap();
+        checkout_detached(&main, &c).unwrap();
+        assert_eq!(previous_branch(&main).unwrap().as_deref(), Some("topic"));
+        assert_eq!(detached_orphans(&main).unwrap(), 1, "c is on no branch");
+        write_commit(&main, "d.txt");
+        assert_eq!(detached_orphans(&main).unwrap(), 2);
+        create_branch(&main, "saved", "HEAD").unwrap();
+        assert_eq!(detached_orphans(&main).unwrap(), 0);
+        // A deleted branch is not offered.
+        g(&main, &["branch", "-q", "-D", "topic"]);
+        assert_eq!(previous_branch(&main).unwrap().as_deref(), Some("main"));
     }
 
     #[test]

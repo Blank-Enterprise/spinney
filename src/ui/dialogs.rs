@@ -2,7 +2,7 @@
 //! convert, merge and rebase.
 
 use super::{
-    actions, add_project, graph_view, paths, project, repo_name_from_url, spaces, theme,
+    actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
     toolbar::folder_name, visible_projects, JobKind, ProjectTab, SpinneyApp,
 };
 use crate::actions::{MergeMode, MergeOutcome};
@@ -392,6 +392,28 @@ pub(super) struct Dialogs {
     pub(super) rebase: Option<RebaseDialog>,
     /// The menu shown after dropping one branch onto another.
     pub(super) drop_menu: Option<super::branch_drop::DropMenu>,
+    pub(super) leave_detached: Option<LeaveDetached>,
+}
+
+/// Leaving a detached HEAD at `head` would strand `lost` commits that no ref has.
+pub(super) struct LeaveDetached {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) head: String,
+    pub(super) lost: usize,
+    pub(super) to: super::LeaveTo,
+}
+
+/// The leave-detached-HEAD question, naming what would be lost.
+pub(super) fn leave_question(lost: usize) -> String {
+    let commits = match lost {
+        1 => "1 commit made on this detached HEAD isn't".to_string(),
+        n => format!("{n} commits made on this detached HEAD aren't"),
+    };
+    format!(
+        "{commits} on any branch or tag. If you leave, only git's reflog can find them, \
+         and git eventually deletes them. Create a branch to keep them."
+    )
 }
 
 /// Convert-to-worktree-layout confirm screen; `plan` holds the refusal when it cannot run.
@@ -425,7 +447,15 @@ impl Dialogs {
             || self.merge.is_some()
             || self.rebase.is_some()
             || self.drop_menu.is_some()
+            || self.leave_detached.is_some()
     }
+}
+
+/// The buttons of the leave-detached-HEAD confirmation.
+enum LeaveChoice {
+    Branch,
+    Leave,
+    Cancel,
 }
 
 /// Red, bold button for a destructive confirmation.
@@ -747,6 +777,37 @@ impl SpinneyApp {
                 None => self.dialogs.merge = Some(d),
             }
         }
+        if let Some(d) = self.dialogs.leave_detached.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("leave_detached")).show(ctx, |ui| {
+                ui.label(super::detached_text(&d.head));
+                ui.label(leave_question(d.lost));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary("Create branch…")).clicked() {
+                        result = Some(LeaveChoice::Branch);
+                    }
+                    if ui.add(danger("Leave anyway")).clicked() {
+                        result = Some(LeaveChoice::Leave);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(LeaveChoice::Cancel);
+                    }
+                });
+            });
+            match result {
+                Some(LeaveChoice::Leave) => self.leave_detached(d),
+                Some(LeaveChoice::Branch) => {
+                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
+                        base: d.head,
+                        branch: String::new(),
+                        mode: BranchMode::Switch,
+                    })
+                }
+                Some(LeaveChoice::Cancel) => {}
+                None => self.dialogs.leave_detached = Some(d),
+            }
+        }
         if let Some(d) = self.dialogs.rebase.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("rebase")).show(ctx, |ui| {
@@ -780,6 +841,35 @@ impl SpinneyApp {
                 None => self.dialogs.rebase = Some(d),
             }
         }
+    }
+
+    /// Leave the detached HEAD as confirmed, unless HEAD moved since it was asked.
+    pub(super) fn leave_detached(&mut self, d: LeaveDetached) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.root == d.root && t.active_worktree == d.worktree);
+        let Some(tab) = tab else {
+            return self
+                .errors
+                .push("The project or worktree changed; try again".into());
+        };
+        match actions::detached_head(&d.worktree) {
+            Ok(Some(h)) if h == d.head => match &d.to {
+                super::LeaveTo::Branch(name) => checkout(tab, name, &mut errors),
+                super::LeaveTo::Commit(sha) => {
+                    if let Err(e) = actions::checkout_detached(&d.worktree, sha) {
+                        errors.push(format!("{e:#}"));
+                    }
+                }
+            },
+            Ok(_) => errors.push("HEAD moved since you were asked; try again".into()),
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        tab.refresh(&ctx, &mut errors);
+        self.errors.extend(errors);
     }
 
     /// Open the merge or (with `rebase`) rebase confirmation for `branch`, refusing now
@@ -1754,6 +1844,71 @@ mod tests {
         assert!(one.starts_with("1 commit of main already pushed"), "{one}");
         let two = rebase_warning(2, "main").unwrap();
         assert!(two.starts_with("2 commits of main"), "{two}");
+    }
+
+    #[test]
+    fn leave_question_names_the_commits() {
+        let one = leave_question(1);
+        assert!(
+            one.starts_with("1 commit made on this detached HEAD isn't"),
+            "{one}"
+        );
+        assert!(leave_question(3).starts_with("3 commits made on this detached HEAD aren't"));
+    }
+
+    #[test]
+    fn leaving_detached_head_with_unsaved_commits_asks_first() {
+        use super::super::{Action, LeaveTo};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap().trim().to_string();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let init = g(&["rev-parse", "HEAD"]);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+        assert_eq!(app.tabs[0].detached, None);
+
+        // Nothing stranded: no question.
+        app.apply(Action::CheckoutCommit(init.clone()));
+        assert!(app.dialogs.leave_detached.is_none(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].detached.as_deref(), Some(init.as_str()));
+        assert_eq!(app.tabs[0].previous_branch.as_deref(), Some("main"));
+
+        g(&["commit", "-q", "--allow-empty", "-m", "loose"]);
+        let loose = g(&["rev-parse", "HEAD"]);
+        app.apply(Action::Checkout("main".into()));
+        let ask = app.dialogs.leave_detached.take().expect("asked");
+        assert_eq!((ask.lost, ask.head.as_str()), (1, loose.as_str()));
+        assert_eq!(ask.to, LeaveTo::Branch("main".into()));
+        assert_eq!(g(&["rev-parse", "HEAD"]), loose, "still there");
+
+        app.apply(Action::CheckoutCommit(init.clone()));
+        assert!(app.dialogs.leave_detached.take().is_some(), "a commit too");
+
+        // HEAD moved meanwhile: refused.
+        app.apply(Action::Checkout("main".into()));
+        let stale = app.dialogs.leave_detached.take().unwrap();
+        g(&["commit", "-q", "--allow-empty", "-m", "more"]);
+        app.leave_detached(stale);
+        assert!(app.errors.iter().any(|e| e.contains("HEAD moved")));
+        assert!(crate::refs::current_branch(d).unwrap().is_none());
+        app.errors.clear();
+
+        app.apply(Action::Checkout("main".into()));
+        let ask = app.dialogs.leave_detached.take().unwrap();
+        assert_eq!(ask.lost, 2);
+        app.leave_detached(ask);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(g(&["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(app.tabs[0].detached, None);
     }
 
     #[test]
