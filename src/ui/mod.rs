@@ -299,7 +299,8 @@ impl ProjectTab {
             if let Center::Review(fd, _) = &self.center {
                 let path = fd.path.clone();
                 self.center = Center::Graph;
-                if let Some(i) = self.review.changes.iter().position(|c| c.path == path) {
+                let at = self.review.listed().position(|p| p == path);
+                if let Some(i) = at {
                     open_review_file(self, i, errors);
                 }
             }
@@ -670,12 +671,16 @@ pub enum Action {
     SetView(worktrees_view::View),
     /// List what a worktree changed since it branched.
     ReviewWorktree(PathBuf),
-    /// Show one of the listed changes (an index into `review.changes`).
+    /// Show one of the listed files: an index into `review.commit_files` when a commit is
+    /// picked, else into `review.changes`.
     ReviewFile(usize),
     /// "Open in Git view": make a worktree active and show its graph.
     OpenInGit(PathBuf),
     /// The Worktrees view's Refresh: reload worktrees, standings and agents.
     RefreshWorktrees,
+    /// Pick a commit in the Worktrees view's graph (an index into `review.commits`), or None
+    /// for all changes since the branch point.
+    ReviewCommit(Option<usize>),
     /// From the in-progress banner: `ContinueOp` goes on; `AskOpStep` asks before a Skip
     /// or Abort, which `ConfirmOpStep` runs and `CancelOpStep` drops.
     ContinueOp,
@@ -1202,7 +1207,8 @@ impl SpinneyApp {
             | Action::CloseDiff
             | Action::SetView(_)
             | Action::ReviewWorktree(_)
-            | Action::ReviewFile(_) => {
+            | Action::ReviewFile(_)
+            | Action::ReviewCommit(_) => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab_action(tab, action, &mut errors);
                 }
@@ -1771,11 +1777,9 @@ impl SpinneyApp {
 }
 
 /// Changes-panel and diff-view actions on the active tab.
-/// Show the selected worktree's `i`th change in the diff view.
+/// Show the selected worktree's `i`th listed file in the diff view: of the picked commit, or
+/// of all its changes.
 fn open_review_file(tab: &mut ProjectTab, i: usize, errors: &mut Vec<String>) {
-    let Some(change) = tab.review.changes.get(i).cloned() else {
-        return;
-    };
     let Some((wt, base)) = tab.review.base() else {
         return;
     };
@@ -1785,6 +1789,16 @@ fn open_review_file(tab: &mut ProjectTab, i: usize, errors: &mut Vec<String>) {
         .find(|w| w.path == wt)
         .map(|w| sidebar::worktree_label(w).0)
         .unwrap_or_default();
+    if let Some(c) = tab.review.commit.and_then(|k| tab.review.commits.get(k)) {
+        if let Some(fd) = tab.review.commit_files.get(i) {
+            let label = worktrees_view::review_label(&c.sha[..7.min(c.sha.len())], &name);
+            tab.center = Center::Review(Box::new(fd.clone()), label);
+        }
+        return;
+    }
+    let Some(change) = tab.review.changes.get(i).cloned() else {
+        return;
+    };
     match crate::review::file_since(wt, base, &change) {
         Ok(fd) => {
             let label = worktrees_view::review_label(change.origin.label(), &name);
@@ -1884,6 +1898,13 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
             }
         }
         Action::ReviewFile(i) => open_review_file(tab, i, errors),
+        Action::ReviewCommit(i) => {
+            tab.center = Center::Graph;
+            if let Err(e) = tab.review.pick_commit(i) {
+                errors.push(format!("{e:#}"));
+            }
+            open_review_file(tab, 0, errors);
+        }
         _ => {}
     }
 }
@@ -2592,6 +2613,26 @@ mod tests {
             (fd.path.as_str(), origin.as_str()),
             ("done.txt", "committed · in agent-1")
         );
+        // The graph: picking the commit lists only its files and opens the first.
+        let sha = app.tabs[0].review.commits[0].sha.clone();
+        assert_eq!(app.tabs[0].review.commits.len(), 1);
+        app.apply(Action::ReviewCommit(Some(0)));
+        let listed: Vec<_> = app.tabs[0].review.listed().map(str::to_string).collect();
+        assert_eq!(listed, ["done.txt"], "not the untracked wip.txt");
+        let Center::Review(fd, origin) = &app.tabs[0].center else {
+            panic!("a commit opens its first file")
+        };
+        let header = format!("{} · in agent-1", &sha[..7]);
+        assert_eq!((fd.path.as_str(), origin.as_str()), ("done.txt", &*header));
+        app.apply(Action::RefreshWorktrees);
+        assert_eq!(
+            app.tabs[0].review.commit,
+            Some(0),
+            "a refresh keeps the commit"
+        );
+        app.apply(Action::ReviewCommit(None));
+        assert_eq!(app.tabs[0].review.listed().count(), 2, "all changes again");
+
         app.apply(Action::CloseDiff);
         assert!(matches!(app.tabs[0].center, Center::Graph));
         assert_eq!(app.tabs[0].view, View::Worktrees, "back to the list");

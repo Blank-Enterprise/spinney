@@ -24,7 +24,8 @@ and work like its own. Moved ones are relinked when the project opens.
   Missing ones can be located or removed; locked ones are left alone. The **Worktrees** view
   (the toggle above the sidebar's filter) lists every worktree, the agents running in it
   (Claude Code, Codex…) and how far it is from the default branch. Select one to list what it
-  changed since it branched, committed or not, with the first file's diff open.
+  changed since it branched, committed or not, with the first file's diff open, or step
+  through its commits one at a time.
 - **Branches:** a sidebar grouped into folders, with checkout, create, rename (also on the remote),
   delete local and remote, and fast-forward without checking out. Merge or rebase from the branch
   menu, or drag one branch onto another.

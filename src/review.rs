@@ -180,6 +180,63 @@ pub fn changes_since(worktree: &Path, base: &str) -> Result<Vec<Change>> {
     Ok(changes)
 }
 
+/// A commit on a worktree's branch since it branched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Commit {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    /// "2 hours ago".
+    pub when: String,
+}
+
+/// The most commits listed for a worktree.
+pub const MAX_COMMITS: usize = 200;
+
+/// The commits HEAD made since it branched from `base`, newest first. First parent only, so a
+/// merge into the branch is one commit and the list stays a single line.
+pub fn commits_since(worktree: &Path, base: &str) -> Result<Vec<Commit>> {
+    let range = format!("{}..HEAD", merge_base(worktree, base)?);
+    let max = format!("--max-count={MAX_COMMITS}");
+    let out = git::run(
+        worktree,
+        &[
+            "log",
+            "--first-parent",
+            "--no-color",
+            &max,
+            "--format=%H%x1f%s%x1f%an%x1f%cr%x1e",
+            &range,
+        ],
+    )?;
+    Ok(parse_log(&out))
+}
+
+/// `%H %s %an %cr` fields split by 0x1f, records ended by 0x1e.
+fn parse_log(out: &str) -> Vec<Commit> {
+    out.split('\x1e')
+        .filter_map(|rec| {
+            let mut f = rec.trim_start_matches('\n').split('\x1f');
+            Some(Commit {
+                sha: f.next().filter(|s| !s.is_empty())?.to_string(),
+                subject: f.next()?.to_string(),
+                author: f.next()?.to_string(),
+                when: f.next()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Lines a file's diff adds and removes; None for a binary file.
+pub fn line_counts(fd: &FileDiff) -> Option<(u32, u32)> {
+    if fd.binary {
+        return None;
+    }
+    let lines = fd.hunks.iter().flat_map(|h| &h.lines);
+    let count = |k| lines.clone().filter(|l| l.kind == k).count() as u32;
+    Some((count(diff::LineKind::Add), count(diff::LineKind::Del)))
+}
+
 /// One file's change since `base`'s branch point, working tree included.
 pub fn file_since(worktree: &Path, base: &str, change: &Change) -> Result<FileDiff> {
     if change.origin == Origin::Untracked {
@@ -345,5 +402,33 @@ mod tests {
         let got = changes_since(&root, "HEAD").unwrap();
         assert_eq!(got[0].path, "bin");
         assert_eq!(got[0].lines, None);
+    }
+
+    #[test]
+    fn commits_since_lists_the_branch_newest_first() {
+        let (tmp, root) = clone();
+        let wt = tmp.path().join("proj.worktrees/topic");
+        worktree(&root, &wt, &["-b", "topic"]);
+        write(&wt, "a.txt", "one\nTWO\n");
+        g(&wt, &["commit", "-q", "-am", "first"]);
+        write(&wt, "c.txt", "c\nd\n");
+        g(&wt, &["add", "."]);
+        g(&wt, &["commit", "-q", "-m", "second: with a | and a\ttab"]);
+        let got = commits_since(&wt, "origin/main").unwrap();
+        let subjects: Vec<&str> = got.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["second: with a | and a\ttab", "first"]);
+        assert_eq!(got[0].sha.len(), 40);
+        assert!(!got[0].author.is_empty() && !got[0].when.is_empty());
+        assert_eq!(
+            commits_since(&root, "HEAD").unwrap(),
+            [],
+            "nothing since HEAD"
+        );
+
+        let files = diff::commit_diff(&wt, &got[0].sha).unwrap();
+        assert_eq!(files[0].path, "c.txt");
+        assert_eq!(line_counts(&files[0]), Some((2, 0)));
+        let files = diff::commit_diff(&wt, &got[1].sha).unwrap();
+        assert_eq!(line_counts(&files[0]), Some((1, 1)));
     }
 }

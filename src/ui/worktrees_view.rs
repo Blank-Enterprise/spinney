@@ -1,14 +1,16 @@
 //! The Worktrees view, toggled at the top of the sidebar: the sidebar lists every worktree of
 //! the project (Spinney's, agents', any tool's) with the agents running in each and how far it
-//! is from the default branch. The selected one's changes since it branched fill the right
-//! panel, and its first file opens in the centre, as the working copy's do in Git view.
+//! is from the default branch, and under it the selected one's commits since it branched. The
+//! right panel lists all its changes or a picked commit's files, and the first file opens in
+//! the centre, as in Git view.
 
 use super::sidebar::{remove_blocked, worktree_hover, worktree_label};
 use super::toolbar::folder_name;
 use super::{theme, Action, Center, ProjectTab};
 use crate::agents;
+use crate::diff::FileDiff;
 use crate::project::Worktree;
-use crate::review::{self, Change};
+use crate::review::{self, Change, Commit};
 use eframe::egui::{self, Align, RichText, Sense, TextWrapMode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +43,12 @@ pub struct Review {
     pub changes: Vec<Change>,
     /// Why `changes` couldn't be read, if it couldn't.
     pub error: Option<String>,
+    /// The selected worktree's commits since it branched, newest first.
+    pub commits: Vec<Commit>,
+    /// The commit picked in the graph (an index into `commits`); None shows all changes.
+    pub commit: Option<usize>,
+    /// The picked commit's files.
+    pub commit_files: Vec<FileDiff>,
 }
 
 impl Review {
@@ -82,6 +90,27 @@ impl Review {
         self.selected = None;
         self.changes.clear();
         self.error = None;
+        self.commits.clear();
+        self.clear_commit();
+    }
+
+    fn clear_commit(&mut self) {
+        self.commit = None;
+        self.commit_files.clear();
+    }
+
+    /// Show commit `i`'s files, or all changes since the branch point for None.
+    pub fn pick_commit(&mut self, i: Option<usize>) -> anyhow::Result<()> {
+        self.clear_commit();
+        let (Some(i), Some(wt)) = (i, self.selected.as_deref()) else {
+            return Ok(());
+        };
+        let Some(c) = self.commits.get(i) else {
+            return Ok(());
+        };
+        self.commit_files = crate::diff::commit_diff(wt, &c.sha)?;
+        self.commit = Some(i);
+        Ok(())
     }
 
     /// List what `path` changed since it branched.
@@ -89,8 +118,15 @@ impl Review {
         let Some(base) = self.standing(&path).map(|s| s.base.clone()) else {
             return self.clear_selection();
         };
+        // A refresh of the same worktree keeps the picked commit if it's still there.
+        let picked = (self.selected.as_ref() == Some(&path))
+            .then(|| self.commit.and_then(|i| self.commits.get(i)))
+            .flatten()
+            .map(|c| c.sha.clone());
         self.changes.clear();
         self.error = None;
+        self.commits.clear();
+        self.clear_commit();
         if !path.is_dir() {
             self.error =
                 Some("Its folder is missing. Right-click it to Locate… or Remove it.".into());
@@ -99,8 +135,21 @@ impl Review {
                 Ok(c) => self.changes = c,
                 Err(e) => self.error = Some(format!("{e:#}")),
             }
+            self.commits = review::commits_since(&path, &base).unwrap_or_default();
         }
         self.selected = Some(path);
+        let again = picked.and_then(|sha| self.commits.iter().position(|c| c.sha == sha));
+        if again.is_some() {
+            let _ = self.pick_commit(again);
+        }
+    }
+
+    /// The paths the right panel lists: the picked commit's files, or all changes.
+    pub fn listed(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self.commit {
+            Some(_) => Box::new(self.commit_files.iter().map(|f| f.path.as_str())),
+            None => Box::new(self.changes.iter().map(|c| c.path.as_str())),
+        }
     }
 
     /// The selected worktree's base, for a file's diff.
@@ -173,8 +222,21 @@ fn worktree_row(
     detail: &str,
     running: &str,
 ) -> egui::Response {
+    two_line_row(ui, on, 0.0, name, detail, running).0
+}
+
+/// The row behind `worktree_row` and the commit graph's rows, with `indent` left free (for
+/// the graph's line and dot). Returns the row's rect too.
+fn two_line_row(
+    ui: &mut egui::Ui,
+    on: bool,
+    indent: f32,
+    name: &str,
+    detail: &str,
+    running: &str,
+) -> (egui::Response, egui::Rect) {
     let width = ui.available_width();
-    let (rect, r) = ui.allocate_exact_size(egui::vec2(width, 40.0), Sense::click());
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(width, 38.0), Sense::click());
     let fill = if on {
         Some(theme::SEL_STRONG)
     } else if r.hovered() {
@@ -185,7 +247,8 @@ fn worktree_row(
     if let Some(fill) = fill {
         ui.painter().rect_filled(rect, theme::WIDGET_R, fill);
     }
-    let inner = rect.shrink2(egui::vec2(8.0, 4.0));
+    let mut inner = rect.shrink2(egui::vec2(8.0, 4.0));
+    inner.min.x += indent;
     let galley = |text: RichText, max: f32| {
         egui::WidgetText::from(text).into_galley(
             ui,
@@ -225,7 +288,96 @@ fn worktree_row(
         detail,
         theme::MUTED,
     );
-    r
+    (r, rect)
+}
+
+/// A commit's second line: "a1b2c3d · Ada · 2 hours ago".
+pub fn commit_detail(c: &Commit) -> String {
+    format!(
+        "{} · {} · {}",
+        &c.sha[..c.sha.len().min(7)],
+        c.author,
+        c.when
+    )
+}
+
+/// The Commits section: one line of dots, "All changes" on top, then each commit, newest
+/// first, then the commit it branched from.
+fn commit_graph(ui: &mut egui::Ui, review: &Review, base: &str, actions: &mut Vec<Action>) {
+    const LANE: f32 = 18.0;
+    let n = review.commits.len();
+    let more = if n >= review::MAX_COMMITS { "+" } else { "" };
+    ui.label(theme::section(&format!("Commits · {n}{more}")));
+    ui.add_space(2.0);
+    // Draw the line through a row's lane: from its centre up, down, or both.
+    let lane = |ui: &egui::Ui, rect: egui::Rect, up: bool, down: bool, hollow: bool| {
+        let c = egui::pos2(rect.left() + 8.0 + LANE / 2.0, rect.center().y);
+        let stroke = egui::Stroke::new(2.0, theme::ACCENT);
+        let p = ui.painter();
+        if up {
+            p.line_segment([egui::pos2(c.x, rect.top()), c], stroke);
+        }
+        if down {
+            p.line_segment([c, egui::pos2(c.x, rect.bottom())], stroke);
+        }
+        if hollow {
+            p.circle(c, 4.5, theme::BG, stroke);
+        } else {
+            p.circle_filled(c, 4.5, theme::ACCENT);
+        }
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("worktree_commits")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let what = match review.changes.len() {
+                1 => "1 file".to_string(),
+                k => format!("{k} files"),
+            };
+            let (r, rect) = two_line_row(
+                ui,
+                review.commit.is_none(),
+                LANE,
+                "All changes",
+                &format!("{what} since it branched, uncommitted too"),
+                "",
+            );
+            lane(ui, rect, false, true, true);
+            if r.clicked() {
+                actions.push(Action::ReviewCommit(None));
+            }
+            for (i, c) in review.commits.iter().enumerate() {
+                let on = review.commit == Some(i);
+                let (r, rect) = two_line_row(ui, on, LANE, &c.subject, &commit_detail(c), "");
+                lane(ui, rect, true, true, false);
+                let r = r.on_hover_text(format!("{}\n{}", c.subject, commit_detail(c)));
+                if r.clicked() {
+                    actions.push(Action::ReviewCommit(Some(i)));
+                }
+            }
+            // Where it branched: the base, muted and not selectable.
+            let base = match base {
+                "@{upstream}" => "its upstream",
+                b => b,
+            };
+            let width = ui.available_width();
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), Sense::hover());
+            let c = egui::pos2(rect.left() + 8.0 + LANE / 2.0, rect.center().y);
+            let p = ui.painter();
+            p.line_segment(
+                [egui::pos2(c.x, rect.top()), c],
+                egui::Stroke::new(2.0, theme::ACCENT),
+            );
+            p.circle_filled(c, 3.5, theme::MUTED);
+            p.text(
+                egui::pos2(rect.left() + 8.0 + LANE + 8.0, c.y),
+                egui::Align2::LEFT_CENTER,
+                format!("branched from {base}"),
+                egui::FontId::proportional(11.5),
+                theme::MUTED,
+            );
+        });
 }
 
 /// Git | Worktrees, across the top of the sidebar. Returns the view clicked, when it isn't
@@ -277,8 +429,21 @@ pub fn list(
         });
     });
     ui.add_space(4.0);
+    // With a worktree picked, the list gives up the lower part to its commits.
+    let base = review
+        .selected
+        .as_deref()
+        .filter(|_| review.error.is_none())
+        .and_then(|p| review.standing(p))
+        .map(|s| s.base.clone());
+    let height = match base {
+        Some(_) => (ui.available_height() * 0.4).max(80.0),
+        None => f32::INFINITY,
+    };
     egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
+        .id_salt("worktree_list")
+        .max_height(height)
+        .auto_shrink([false, base.is_some()])
         .show(ui, |ui| {
             for wt in worktrees {
                 let (name, _) = worktree_label(wt);
@@ -325,6 +490,11 @@ pub fn list(
                 });
             }
         });
+    if let Some(base) = base {
+        ui.add_space(8.0);
+        ui.separator();
+        commit_graph(ui, review, &base, actions);
+    }
 }
 
 /// The centre in Worktrees view when no file is open.
@@ -380,6 +550,9 @@ pub fn files(ui: &mut egui::Ui, tab: &ProjectTab, actions: &mut Vec<Action>) {
         ui.colored_label(ui.visuals().error_fg_color, e);
         return;
     }
+    if let Some(c) = review.commit.and_then(|i| review.commits.get(i)) {
+        return commit_files(ui, tab, c, actions);
+    }
     ui.label(theme::section(&format!("Files · {}", review.changes.len())));
     if review.changes.is_empty() {
         ui.weak("No changes.");
@@ -396,6 +569,48 @@ pub fn files(ui: &mut egui::Ui, tab: &ProjectTab, actions: &mut Vec<Action>) {
                     .truncate()
                     .min_size(egui::vec2(ui.available_width(), 0.0));
                 if ui.add(row).on_hover_text(&c.path).clicked() {
+                    actions.push(Action::ReviewFile(i));
+                }
+            }
+        });
+}
+
+/// The right panel with a commit picked: its message and files.
+fn commit_files(ui: &mut egui::Ui, tab: &ProjectTab, c: &Commit, actions: &mut Vec<Action>) {
+    let review = &tab.review;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Commit {}", &c.sha[..c.sha.len().min(8)])).strong());
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button("All changes").clicked() {
+                actions.push(Action::ReviewCommit(None));
+            }
+        });
+    });
+    ui.label(RichText::new(&c.subject).color(theme::TEXT));
+    ui.weak(format!("{} · {}", c.author, c.when));
+    ui.add_space(6.0);
+    ui.label(theme::section(&format!(
+        "Files · {}",
+        review.commit_files.len()
+    )));
+    if review.commit_files.is_empty() {
+        ui.weak("No file changes.");
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (i, f) in review.commit_files.iter().enumerate() {
+                let open = matches!(&tab.center, Center::Review(fd, _) if fd.path == f.path);
+                let right = match review::line_counts(f) {
+                    Some((a, r)) => format!("+{a} −{r}"),
+                    None => "binary".into(),
+                };
+                let row = egui::Button::selectable(open, RichText::new(&f.path).size(12.5))
+                    .right_text(RichText::new(right).size(11.5).color(theme::MUTED))
+                    .truncate()
+                    .min_size(egui::vec2(ui.available_width(), 0.0));
+                if ui.add(row).on_hover_text(&f.path).clicked() {
                     actions.push(Action::ReviewFile(i));
                 }
             }
@@ -465,6 +680,17 @@ mod tests {
         );
         let main = wt("/p/proj", Some("main"));
         assert_eq!(row_detail(&main, None), "proj");
+    }
+
+    #[test]
+    fn commit_detail_has_short_sha_author_and_age() {
+        let c = Commit {
+            sha: "83174b7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            subject: "s".into(),
+            author: "Ada".into(),
+            when: "2 hours ago".into(),
+        };
+        assert_eq!(commit_detail(&c), "83174b7 · Ada · 2 hours ago");
     }
 
     #[test]
