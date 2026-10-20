@@ -147,7 +147,12 @@ pub fn changes_since(worktree: &Path, base: &str) -> Result<Vec<Change>> {
         worktree,
         &["ls-files", "--others", "--exclude-standard", "-z"],
     )?;
-    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+    // A trailing `/` is an embedded repo or worktree (an agent's `.claude/worktrees/…`):
+    // its own work, not this one's.
+    let files = untracked
+        .split('\0')
+        .filter(|p| !p.is_empty() && !p.ends_with('/'));
+    for path in files {
         // --no-index exits 1 when the files differ.
         let out = git::run_ok_codes(
             worktree,
@@ -318,6 +323,18 @@ mod tests {
         let got = changes_since(&wt, &base).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].origin, Origin::Uncommitted);
+    }
+
+    #[test]
+    fn a_nested_agent_worktree_is_not_a_change_of_the_main_one() {
+        let (_tmp, root) = clone();
+        let agent = root.join(".claude/worktrees/agent-1");
+        worktree(&root, &agent, &["-b", "agent-1"]);
+        write(&agent, "x.txt", "x\n");
+        write(&root, "real.txt", "r\n");
+        let got = changes_since(&root, "HEAD").unwrap();
+        let paths: Vec<&str> = got.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["real.txt"]);
     }
 
     #[test]
