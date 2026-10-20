@@ -197,15 +197,19 @@ pub fn file_diff(worktree: &Path, path: &str, staged: bool) -> Result<FileDiff> 
     };
     let lossy = std::str::from_utf8(&out).is_err();
     let text = String::from_utf8_lossy(&out);
-    Ok(parse(&text)
+    // A type change (file ↔ symlink) comes as two sections, the old side deleted and the
+    // new one added: show both, one after the other.
+    let mut fd = parse(&text)
         .into_iter()
-        .next()
-        .map(|mut f| {
-            f.path = path.to_string();
-            f.lossy = lossy;
-            f
+        .reduce(|mut a, b| {
+            a.binary |= b.binary;
+            a.hunks.extend(b.hunks);
+            a
         })
-        .unwrap_or_else(|| empty(path)))
+        .unwrap_or_else(|| empty(path));
+    fd.path = path.to_string();
+    fd.lossy = lossy;
+    Ok(fd)
 }
 
 pub fn commit_diff(worktree: &Path, sha: &str) -> Result<Vec<FileDiff>> {

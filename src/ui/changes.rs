@@ -144,6 +144,7 @@ fn badge(c: &Change) -> (&'static str, Color32) {
         Change::Added => ("A", theme::ADDED),
         Change::Deleted => ("D", theme::DELETED),
         Change::Renamed { .. } => ("R", theme::RENAMED),
+        Change::TypeChanged { .. } => ("T", theme::WARN),
         Change::Untracked => ("?", theme::UNTRACKED),
         Change::Conflicted(_) => ("!", theme::DELETED),
     }
@@ -362,7 +363,10 @@ fn file_list(
                         Some(hint) => r.on_hover_text(hint),
                         None => r,
                     },
-                    _ => r,
+                    c => match c.type_label() {
+                        Some(t) => r.on_hover_text(t),
+                        None => r,
+                    },
                 };
                 if r.clicked() {
                     actions.push(match list {

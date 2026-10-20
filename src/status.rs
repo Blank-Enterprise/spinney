@@ -9,9 +9,54 @@ pub enum Change {
     Modified,
     Added,
     Deleted,
-    Renamed { from: String },
+    Renamed {
+        from: String,
+    },
+    /// The path changed kind, e.g. a file replaced by a symlink. Git diffs it as a deletion
+    /// plus an addition, so only the whole file can be staged or discarded.
+    TypeChanged {
+        from: Kind,
+        to: Kind,
+    },
     Untracked,
     Conflicted(Conflict),
+}
+
+/// What a path is, from its git mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    File,
+    Symlink,
+    Submodule,
+}
+
+impl Kind {
+    /// From a mode in porcelain v2 (`100644`, `100755`, `120000`, `160000`).
+    pub fn from_mode(mode: &str) -> Kind {
+        match mode {
+            "120000" => Kind::Symlink,
+            "160000" => Kind::Submodule,
+            _ => Kind::File,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::File => "file",
+            Kind::Symlink => "symlink",
+            Kind::Submodule => "submodule",
+        }
+    }
+}
+
+impl Change {
+    /// A type change as "file → symlink"; None for any other change.
+    pub fn type_label(&self) -> Option<String> {
+        match self {
+            Change::TypeChanged { from, to } => Some(format!("{} → {}", from.name(), to.name())),
+            _ => None,
+        }
+    }
 }
 
 /// How each side left a conflicted file, in git's terms: `ours` is HEAD (index stage 2)
@@ -73,14 +118,20 @@ impl Status {
     }
 }
 
-fn change_of(code: char, from: Option<&str>) -> Change {
+/// One side's change from its status letter, the original path of a rename, and the
+/// modes before and after (`mH`→`mI` for the staged side, `mI`→`mW` for the unstaged one).
+fn change_of(code: char, from: Option<&str>, modes: (&str, &str)) -> Change {
     match code {
         'A' => Change::Added,
         'D' => Change::Deleted,
         'R' => Change::Renamed {
             from: from.unwrap_or_default().to_string(),
         },
-        _ => Change::Modified, // M, T, C
+        'T' => Change::TypeChanged {
+            from: Kind::from_mode(modes.0),
+            to: Kind::from_mode(modes.1),
+        },
+        _ => Change::Modified, // M, C
     }
 }
 
@@ -112,11 +163,12 @@ pub fn status(worktree: &Path) -> Result<Status> {
                 let from = if kind == "2" { entries.next() } else { None };
                 let xy: Vec<char> = f[0].chars().collect();
                 let path = f[n - 1];
+                let (mh, mi, mw) = (f[2], f[3], f[4]);
                 if xy[0] != '.' {
-                    st.staged.push(fs(path, change_of(xy[0], from)));
+                    st.staged.push(fs(path, change_of(xy[0], from, (mh, mi))));
                 }
                 if xy[1] != '.' {
-                    st.unstaged.push(fs(path, change_of(xy[1], from)));
+                    st.unstaged.push(fs(path, change_of(xy[1], from, (mi, mw))));
                 }
             }
             "u" => {
@@ -272,6 +324,65 @@ mod tests {
             theirs: Side::Deleted,
         };
         assert_eq!(s.conflicted, vec![fs_("f", Change::Conflicted(ud))]);
+    }
+
+    #[test]
+    fn status_reports_type_changes_per_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        g(d, &["init", "-q"]);
+        fs::write(d.join("f"), "hi\n").unwrap();
+        fs::write(d.join("target"), "t\n").unwrap();
+        std::os::unix::fs::symlink("target", d.join("link")).unwrap();
+        g(d, &["add", "."]);
+        g(
+            d,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        // A file replaced by a symlink, and a symlink replaced by a file.
+        fs::remove_file(d.join("f")).unwrap();
+        std::os::unix::fs::symlink("target", d.join("f")).unwrap();
+        fs::remove_file(d.join("link")).unwrap();
+        fs::write(d.join("link"), "now a file\n").unwrap();
+        let to_link = Change::TypeChanged {
+            from: Kind::File,
+            to: Kind::Symlink,
+        };
+        let to_file = Change::TypeChanged {
+            from: Kind::Symlink,
+            to: Kind::File,
+        };
+        let s = status(d).unwrap();
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.unstaged,
+            vec![fs_("f", to_link.clone()), fs_("link", to_file.clone())]
+        );
+        assert_eq!(to_link.type_label().as_deref(), Some("file → symlink"));
+        assert_eq!(to_file.type_label().as_deref(), Some("symlink → file"));
+        assert_eq!(Change::Modified.type_label(), None);
+
+        g(d, &["add", "f"]);
+        let s = status(d).unwrap();
+        assert_eq!(s.staged, vec![fs_("f", to_link)]);
+        assert_eq!(s.unstaged, vec![fs_("link", to_file)]);
+    }
+
+    #[test]
+    fn kinds_come_from_modes() {
+        assert_eq!(Kind::from_mode("100644"), Kind::File);
+        assert_eq!(Kind::from_mode("100755"), Kind::File);
+        assert_eq!(Kind::from_mode("120000"), Kind::Symlink);
+        assert_eq!(Kind::from_mode("160000"), Kind::Submodule);
     }
 
     const BOTH: Conflict = Conflict {
