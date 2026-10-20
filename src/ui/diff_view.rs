@@ -131,7 +131,7 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
             (&w.fd, Some((w.staged, &w.change, w.dir(), &mut w.sel)))
         }
         Center::CommitFile(fd) => (&**fd, None),
-        Center::Graph | Center::Conflict(_) => return,
+        Center::Graph | Center::Conflict(_) | Center::Merge(_) => return,
     };
     let lines_ok = work
         .as_ref()

@@ -31,11 +31,11 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 | `src/convert.rs` | Converts a normal clone to the worktree layout, with an undo journal and rollback. |
 | `src/project.rs` | Layout detection, worktrees, clone and create. |
 | `src/refs.rs`, `src/status.rs`, `src/diff.rs`, `src/graph.rs` | Parse `for-each-ref`, `status`, `diff` and `log` output. |
-| `src/conflict.rs` | Parses a conflicted file's `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` blocks. |
+| `src/conflict.rs` | Parses a conflicted file's `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` blocks, and writes them back with a side picked for each (the built-in merge tool). |
 | `src/creds.rs`, `src/ssh.rs`, `src/github.rs` | Keychain tokens and the credential helper; per-space SSH keys; the GitHub API and device-flow sign-in. |
 | `src/config.rs` | `config.toml`: spaces and settings. New fields need `#[serde(default)]`, so older configs still load. |
 | `src/ui/mod.rs` | `SpinneyApp`, the `Action` enum and `apply()`, background `Jobs`, and the top confirmation bars. |
-| `src/ui/*.rs` | Panels: `toolbar`, `sidebar`, `graph_view`, `changes`, `diff_view`, `conflict_view`, `dialogs` (modals), `in_progress` (merge/rebase banner), `spaces` (account editor), `new_tab`, `theme`. |
+| `src/ui/*.rs` | Panels: `toolbar`, `sidebar`, `graph_view`, `changes`, `diff_view`, `conflict_view`, `merge_view` (built-in merge tool), `dialogs` (modals), `in_progress` (merge/rebase banner), `spaces` (account editor), `new_tab`, `theme`. |
 
 ## Patterns to follow
 

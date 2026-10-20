@@ -405,6 +405,23 @@ pub fn mark_resolved(worktree: &Path, path: &str, anyway: bool) -> Result<bool> 
     Ok(true)
 }
 
+/// Save the built-in merge tool's `result` over conflicted `path`, then mark it resolved.
+/// `original` is the text the merge started from: if the file changed since (another
+/// tool, an editor), nothing is written. Like `mark_resolved`, false means conflict
+/// markers are left, the file is saved but not marked, and the caller asks first.
+pub fn save_resolution(worktree: &Path, path: &str, original: &str, result: &str) -> Result<bool> {
+    let full = worktree.join(path);
+    // Only ever overwrite a regular file inside the worktree, never through a symlink.
+    if !std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_file()) {
+        bail!("{path} is not a regular file");
+    }
+    if std::fs::read(&full)? != original.as_bytes() {
+        bail!("{path} changed on disk since the merge started; close it and open it again");
+    }
+    std::fs::write(&full, result)?;
+    mark_resolved(worktree, path, false)
+}
+
 /// Open `path` in its default macOS app, as a double-click in Finder would.
 pub fn open_file(path: &Path) -> Result<()> {
     let out = std::process::Command::new("open").arg(path).output()?;
@@ -1764,6 +1781,52 @@ mod tests {
             let tree = g(&main, &["ls-tree", "--name-only", "HEAD"]);
             assert_eq!(!tree.lines().any(|l| l == "a.txt"), gone, "{version:?}");
         }
+    }
+
+    #[test]
+    fn save_resolution_writes_and_marks_resolved() {
+        let (_tmp, _root, main) = conflicting();
+        assert!(matches!(
+            merge(&main, "other", MergeMode::NoFf).unwrap(),
+            MergeOutcome::Conflicts(_)
+        ));
+        let original = std::fs::read_to_string(main.join("a.txt")).unwrap();
+        assert!(save_resolution(&main, "a.txt", &original, "main\nother\n").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(main.join("a.txt")).unwrap(),
+            "main\nother\n"
+        );
+        assert!(unmerged(&main).unwrap().is_empty());
+        assert_eq!(g(&main, &["diff", "--cached", "--name-only"]), "a.txt");
+    }
+
+    #[test]
+    fn save_resolution_with_markers_saves_but_asks() {
+        let (_tmp, _root, main) = conflicting();
+        merge(&main, "other", MergeMode::NoFf).unwrap();
+        let original = std::fs::read_to_string(main.join("a.txt")).unwrap();
+        let kept = format!("top\n{original}");
+        assert!(!save_resolution(&main, "a.txt", &original, &kept).unwrap());
+        assert_eq!(std::fs::read_to_string(main.join("a.txt")).unwrap(), kept);
+        assert_eq!(unmerged(&main).unwrap(), ["a.txt"], "still conflicted");
+    }
+
+    #[test]
+    fn save_resolution_refuses_a_file_changed_since() {
+        let (_tmp, _root, main) = conflicting();
+        merge(&main, "other", MergeMode::NoFf).unwrap();
+        let original = std::fs::read_to_string(main.join("a.txt")).unwrap();
+        std::fs::write(main.join("a.txt"), "edited elsewhere\n").unwrap();
+        let err = save_resolution(&main, "a.txt", &original, "x\n").unwrap_err();
+        assert!(err.to_string().contains("changed on disk"), "{err}");
+        let now = std::fs::read_to_string(main.join("a.txt")).unwrap();
+        assert_eq!(now, "edited elsewhere\n", "not overwritten");
+        assert_eq!(unmerged(&main).unwrap(), ["a.txt"]);
+        // A symlink is never written through.
+        std::fs::remove_file(main.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("/tmp/x", main.join("a.txt")).unwrap();
+        let err = save_resolution(&main, "a.txt", "", "x\n").unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]

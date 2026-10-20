@@ -100,6 +100,82 @@ pub fn count(chunks: &[Chunk]) -> usize {
         .count()
 }
 
+/// What the built-in merge tool keeps of one conflict: a side, or both in either order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick {
+    Ours,
+    Theirs,
+    OursThenTheirs,
+    TheirsThenOurs,
+}
+
+/// How a file ends its lines, so a merged result is written back the same way. `parse`
+/// drops each `\r` before a `\n`, so mixed endings come back as the first one seen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Endings {
+    pub crlf: bool,
+    /// The last line ends with a newline too.
+    pub trailing: bool,
+}
+
+impl Endings {
+    pub fn of(text: &str) -> Endings {
+        Endings {
+            crlf: text.find('\n').is_some_and(|i| text[..i].ends_with('\r')),
+            trailing: text.ends_with('\n'),
+        }
+    }
+}
+
+fn with_label(m: &str, label: &str) -> String {
+    if label.is_empty() {
+        m.to_string()
+    } else {
+        format!("{m} {label}")
+    }
+}
+
+/// The file with each conflict replaced by its pick. A conflict without one (`None`, or
+/// past the end of `picks`) keeps its markers, so nothing is lost by not choosing.
+pub fn merge(chunks: &[Chunk], picks: &[Option<Pick>], endings: Endings) -> String {
+    let mut lines: Vec<String> = vec![];
+    let mut k = 0;
+    for chunk in chunks {
+        let b = match chunk {
+            Chunk::Same(same) => {
+                lines.extend(same.iter().cloned());
+                continue;
+            }
+            Chunk::Conflict(b) => b,
+        };
+        let pick = picks.get(k).copied().flatten();
+        k += 1;
+        match pick {
+            Some(Pick::Ours) => lines.extend(b.ours.iter().cloned()),
+            Some(Pick::Theirs) => lines.extend(b.theirs.iter().cloned()),
+            Some(Pick::OursThenTheirs) => lines.extend(b.ours.iter().chain(&b.theirs).cloned()),
+            Some(Pick::TheirsThenOurs) => lines.extend(b.theirs.iter().chain(&b.ours).cloned()),
+            None => {
+                lines.push(with_label("<<<<<<<", &b.ours_label));
+                lines.extend(b.ours.iter().cloned());
+                if let Some((label, base)) = &b.base {
+                    lines.push(with_label("|||||||", label));
+                    lines.extend(base.iter().cloned());
+                }
+                lines.push("=======".into());
+                lines.extend(b.theirs.iter().cloned());
+                lines.push(with_label(">>>>>>>", &b.theirs_label));
+            }
+        }
+    }
+    let eol = if endings.crlf { "\r\n" } else { "\n" };
+    let mut text = lines.join(eol);
+    if endings.trailing && !lines.is_empty() {
+        text.push_str(eol);
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +274,56 @@ mod tests {
         assert_eq!(
             (b.theirs_label.as_str(), &b.theirs),
             ("topic", &v(&["topic"]))
+        );
+    }
+
+    #[test]
+    fn merge_with_no_picks_gives_the_file_back() {
+        for text in [
+            "a\n<<<<<<< HEAD\nm\n||||||| base\nb\n=======\nt\n>>>>>>> topic\nz\n",
+            "a\r\n<<<<<<< HEAD\r\nm\r\n=======\r\nt\r\n>>>>>>>\r\nz",
+            "<<<<<<< HEAD\n=======\n>>>>>>> x\n",
+            "",
+        ] {
+            let chunks = parse(text);
+            assert_eq!(merge(&chunks, &[], Endings::of(text)), text);
+            assert_eq!(merge(&chunks, &[None, None], Endings::of(text)), text);
+        }
+    }
+
+    #[test]
+    fn merge_keeps_each_pick() {
+        let text = "a\n<<<<<<< HEAD\nm\n=======\nt\n>>>>>>> topic\nb\n\
+                    <<<<<<< HEAD\nm2\n||||||| base\nb2\n=======\nt2\n>>>>>>> topic\nc\n";
+        let chunks = parse(text);
+        let e = Endings::of(text);
+        let m = |picks: &[Option<Pick>]| merge(&chunks, picks, e);
+        assert_eq!(
+            m(&[Some(Pick::Ours), Some(Pick::Theirs)]),
+            "a\nm\nb\nt2\nc\n"
+        );
+        assert_eq!(
+            m(&[Some(Pick::OursThenTheirs), Some(Pick::TheirsThenOurs)]),
+            "a\nm\nt\nb\nt2\nm2\nc\n"
+        );
+        // Only the first picked: the second keeps its markers, base included.
+        assert_eq!(
+            m(&[Some(Pick::Theirs)]),
+            "a\nt\nb\n<<<<<<< HEAD\nm2\n||||||| base\nb2\n=======\nt2\n>>>>>>> topic\nc\n"
+        );
+    }
+
+    #[test]
+    fn endings_follow_the_file() {
+        let e = Endings::of("x\r\ny");
+        assert_eq!((e.crlf, e.trailing), (true, false));
+        let e = Endings::of("x\ny\r\n");
+        assert_eq!((e.crlf, e.trailing), (false, true));
+        let chunks = parse("<<<<<<< HEAD\r\nm\r\n=======\r\nt\r\n>>>>>>> x\r\n");
+        let e = Endings::of("\r\n");
+        assert_eq!(
+            merge(&chunks, &[Some(Pick::OursThenTheirs)], e),
+            "m\r\nt\r\n"
         );
     }
 }
