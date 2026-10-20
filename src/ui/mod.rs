@@ -14,7 +14,7 @@ mod theme;
 mod toolbar;
 
 use crate::actions::{self, CheckoutOutcome, MergeOutcome, Operation};
-use crate::config::{Config, Space};
+use crate::config::{Config, PullStrategy, Space};
 use crate::diff::FileDiff;
 use crate::graph::{Ancestry, LogStream, Row};
 use crate::project::{self, Layout, Worktree};
@@ -149,6 +149,8 @@ pub struct ProjectTab {
     on_head: Vec<bool>,
     /// Rows ⌘-clicked into a multi-selection (for cherry-picking several commits).
     picked: Vec<usize>,
+    /// The pull strategy `active_worktree`'s git config asks for (`pull.rebase`, `pull.ff`).
+    git_pull: PullStrategy,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -217,6 +219,7 @@ impl ProjectTab {
             ancestry: Ancestry::default(),
             on_head: vec![],
             picked: vec![],
+            git_pull: PullStrategy::default(),
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -276,6 +279,16 @@ impl ProjectTab {
             None => None,
             Some(_) => actions::previous_branch(wt).unwrap_or_default(),
         };
+        // Per branch (`branch.<name>.rebase`), so it is read again with the branches.
+        self.git_pull = actions::git_pull_strategy(wt).unwrap_or_else(|e| {
+            errors.push(format!("pull config: {e:#}"));
+            PullStrategy::default()
+        });
+    }
+
+    /// What Pull does without choosing: config.toml's `pull_strategy`, else git's config.
+    fn pull_default(&self, config: &Config) -> PullStrategy {
+        config.pull_strategy.unwrap_or(self.git_pull)
     }
 
     fn load_stashes(&mut self, errors: &mut Vec<String>) {
@@ -521,7 +534,8 @@ pub enum Action {
     /// Drop a project from the space (closing its tab if open).
     RemoveRecent(PathBuf),
     Fetch,
-    Pull,
+    /// Pull the active worktree's upstream with this strategy.
+    Pull(PullStrategy),
     Push,
     /// Stash all changes (untracked included).
     Stash,
@@ -781,6 +795,17 @@ impl SpinneyApp {
             return self.convert_done(root, result);
         }
         if let Err(e) = result {
+            // Left in progress: refresh so the banner and the Conflicted list show it.
+            let e = match e.downcast::<actions::PullConflicts>() {
+                Ok(c) => {
+                    self.refresh_tab(&root);
+                    let what = format!("Pull ({})", c.strategy.label().to_lowercase());
+                    return self
+                        .notices
+                        .push(dialogs::conflict_message(&what, &c.files));
+                }
+                Err(e) => e,
+            };
             if kind == JobKind::MergeTool {
                 // The tool may have resolved some of it; show what's left.
                 self.refresh_tab(&root);
@@ -875,10 +900,28 @@ impl SpinneyApp {
                 Ok(common) => Box::new(move || actions::fetch(&common)),
                 Err(e) => return self.errors.push(format!("{e:#}")),
             },
-            JobKind::Pull => Box::new(move || actions::pull(&wt)),
             _ => Box::new(move || actions::push(&wt)),
         };
         self.jobs.spawn(kind, root, String::new(), work);
+    }
+
+    /// Pull the active tab's worktree as a job. Conflicts come back as `PullConflicts`.
+    fn pull(&mut self, strategy: PullStrategy) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+        self.jobs.spawn(
+            JobKind::Pull,
+            root,
+            String::new(),
+            move || match actions::pull(&wt, strategy)? {
+                MergeOutcome::Conflicts(files) => {
+                    Err(actions::PullConflicts { strategy, files }.into())
+                }
+                _ => Ok(()),
+            },
+        );
     }
 
     fn apply(&mut self, action: Action) {
@@ -935,9 +978,9 @@ impl SpinneyApp {
                 self.dialogs.create = self.space().as_ref().map(CreateDialog::new)
             }
             Action::Fetch => self.network(JobKind::Fetch),
-            Action::Pull => {
+            Action::Pull(strategy) => {
                 self.rejected_push = None;
-                self.network(JobKind::Pull)
+                self.pull(strategy)
             }
             Action::Push => {
                 self.rejected_push = None;
@@ -1580,7 +1623,13 @@ impl SpinneyApp {
     }
 
     /// "Push rejected" with Pull / Force push…, then the force push confirmation.
-    fn push_bar(ui: &mut egui::Ui, r: &RejectedPush, busy: bool, actions: &mut Vec<Action>) {
+    fn push_bar(
+        ui: &mut egui::Ui,
+        r: &RejectedPush,
+        busy: bool,
+        pull: PullStrategy,
+        actions: &mut Vec<Action>,
+    ) {
         ui.horizontal(|ui| {
             let branch = &r.rejected.branch;
             let text = match &r.lease {
@@ -1623,8 +1672,16 @@ impl SpinneyApp {
                         if ui.small_button("Force push…").clicked() {
                             actions.push(Action::AskForcePush);
                         }
-                        if ui.small_button("Pull").clicked() {
-                            actions.push(Action::Pull);
+                        // The branches have diverged, so offer merge and rebase right here.
+                        ui.menu_button("▾", |ui| toolbar::pull_menu(ui, pull, actions))
+                            .response
+                            .on_hover_text("Pull with…");
+                        if ui
+                            .small_button("Pull")
+                            .on_hover_text(pull.label())
+                            .clicked()
+                        {
+                            actions.push(Action::Pull(pull));
                         }
                     }
                 })
@@ -1945,7 +2002,8 @@ impl eframe::App for SpinneyApp {
                 egui::Panel::top("toolbar").frame(bar).show(ui, |ui| {
                     let busy = jobs.network_busy(&tab.root);
                     let running = |k| jobs.running(k, &tab.root);
-                    toolbar::toolbar(ui, tab, projects, busy, running, &mut actions)
+                    let pull = tab.pull_default(&self.config);
+                    toolbar::toolbar(ui, tab, projects, busy, running, pull, &mut actions)
                 });
                 // A rebase detaches HEAD too; the in-progress banner covers it.
                 if let (Some(head), None) = (&tab.detached, tab.operation) {
@@ -2027,6 +2085,7 @@ impl eframe::App for SpinneyApp {
         self.op_banner(ui, &mut actions);
         if let Some(r) = self.push_tab() {
             let busy = self.jobs.network_busy(&r.root);
+            let pull = self.tabs[self.active_tab].pull_default(&self.config);
             let fill = if r.lease.is_some() {
                 theme::DIFF_DEL
             } else {
@@ -2037,7 +2096,7 @@ impl eframe::App for SpinneyApp {
                 .inner_margin(Margin::symmetric(14, 6));
             egui::Panel::top("push_rejected")
                 .frame(bar)
-                .show(ui, |ui| Self::push_bar(ui, r, busy, &mut actions));
+                .show(ui, |ui| Self::push_bar(ui, r, busy, pull, &mut actions));
         }
         if !self.errors.is_empty() || !self.notices.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));

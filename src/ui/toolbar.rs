@@ -1,6 +1,7 @@
 //! Top of the window: the project tab strip and the repository toolbar.
 
 use super::{active_space, spaces, theme, Action, JobKind, ProjectTab, SpinneyApp};
+use crate::config::PullStrategy;
 use crate::project::{Layout, Worktree};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Vec2,
@@ -147,6 +148,7 @@ pub(super) fn toolbar(
     projects: &[std::path::PathBuf],
     busy: bool,
     running: impl Fn(JobKind) -> bool,
+    pull: PullStrategy,
     actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
@@ -218,22 +220,75 @@ pub(super) fn toolbar(
             if tool_button(ui, "⤒", "Stash", !busy, false, stash) {
                 actions.push(Action::Stash);
             }
-            for (icon, label, kind, action) in [
-                ("↑", "Push", JobKind::Push, Action::Push),
-                ("↓", "Pull", JobKind::Pull, Action::Pull),
-                ("↻", "Fetch", JobKind::Fetch, Action::Fetch),
-            ] {
-                let hint = if busy {
-                    "Waiting for the running job"
+            let hint = |label: &str| {
+                if busy {
+                    waiting.to_string()
                 } else {
-                    label
-                };
-                if tool_button(ui, icon, label, !busy, running(kind), hint) {
-                    actions.push(action);
+                    label.to_string()
                 }
+            };
+            if tool_button(
+                ui,
+                "↑",
+                "Push",
+                !busy,
+                running(JobKind::Push),
+                &hint("Push"),
+            ) {
+                actions.push(Action::Push);
+            }
+            // Pull's ▾ sits between it and Push (right to left).
+            ui.add_enabled_ui(!busy, |ui| {
+                let more = egui::Button::new(RichText::new("▾").color(theme::MUTED))
+                    .frame(false)
+                    .min_size(Vec2::new(14.0, 40.0));
+                egui::containers::menu::MenuButton::from_button(more)
+                    .ui(ui, |ui| pull_menu(ui, pull, actions))
+                    .0
+                    .on_hover_text("Pull with…")
+                    .on_disabled_hover_text(waiting);
+            });
+            let pull_hint = hint(&format!("Pull: {}", pull.label().to_lowercase()));
+            if tool_button(ui, "↓", "Pull", !busy, running(JobKind::Pull), &pull_hint) {
+                actions.push(Action::Pull(pull));
+            }
+            if tool_button(
+                ui,
+                "↻",
+                "Fetch",
+                !busy,
+                running(JobKind::Fetch),
+                &hint("Fetch"),
+            ) {
+                actions.push(Action::Fetch);
             }
         });
     });
+}
+
+/// Pull's ▾ menu, in the toolbar and the rejected-push bar: one pull with the chosen
+/// strategy. `default` is what plain Pull does.
+pub(super) fn pull_menu(ui: &mut egui::Ui, default: PullStrategy, actions: &mut Vec<Action>) {
+    for s in PullStrategy::ALL {
+        if ui.button(pull_item(s, default)).clicked() {
+            actions.push(Action::Pull(s));
+            ui.close();
+        }
+    }
+    ui.separator();
+    // Until the Preferences window (#84) has a place for it.
+    ui.label(theme::caption(
+        "Default: pull_strategy in config.toml, else git's pull.rebase / pull.ff",
+    ));
+}
+
+/// A pull menu item, marking the one plain Pull uses.
+fn pull_item(s: PullStrategy, default: PullStrategy) -> String {
+    if s == default {
+        format!("{} · default", s.label())
+    } else {
+        s.label().to_string()
+    }
 }
 
 /// Muted caption over a frameless "value ▾" menu button.
@@ -297,4 +352,18 @@ fn tool_button(
         resp.clicked()
     })
     .inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_menu_marks_the_default() {
+        let items: Vec<String> = PullStrategy::ALL
+            .into_iter()
+            .map(|s| pull_item(s, PullStrategy::Rebase))
+            .collect();
+        assert_eq!(items, ["Fast-forward only", "Merge", "Rebase · default"]);
+    }
 }

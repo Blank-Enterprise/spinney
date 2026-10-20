@@ -1542,7 +1542,7 @@ mod tests {
         g(&wt, &["rev-parse", "--verify", "origin/main"]);
         g(&second, &["branch", "-q", "--set-upstream-to=origin/main"]);
         g(&second, &["reset", "-q", "--hard", "main~1"]);
-        actions::pull(&second).unwrap();
+        actions::pull(&second, crate::config::PullStrategy::FastForwardOnly).unwrap();
         assert!(second.join("remote.txt").exists());
 
         let spec = g(&wt, &["config", "--get-all", "remote.origin.fetch"]);
