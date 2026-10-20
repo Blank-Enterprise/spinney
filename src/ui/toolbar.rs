@@ -189,17 +189,11 @@ pub(super) fn toolbar(
         });
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let worktrees = tab.layout == Layout::WorktreeRoot;
             // Right to left: the last button comes first.
             if tool_button(ui, "›_", "Terminal", true, false, "Open Terminal here") {
                 actions.push(Action::OpenTerminal);
             }
-            let hint = if worktrees {
-                "New worktree"
-            } else {
-                "Convert this clone to the worktree layout first (right-click its tab)"
-            };
-            if tool_button(ui, "⊞", "Worktree", worktrees, false, hint) {
+            if tool_button(ui, "⊞", "Worktree", true, false, "New worktree") {
                 actions.push(Action::NewWorktreeFrom(base.clone()));
             }
             if tool_button(ui, "⎇", "Branch", true, false, "New branch") {

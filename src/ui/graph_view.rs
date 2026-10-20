@@ -269,11 +269,6 @@ pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<Me
     let worktrees = ctx.layout == Layout::WorktreeRoot;
     // A normal clone's new branch is switched to, moving HEAD like a checkout.
     let branch_blocked = if worktrees { None } else { ctx.dirty.clone() };
-    let worktree_blocked = (!worktrees).then(|| {
-        "This project is a normal clone: right-click its tab and choose Convert to worktree \
-         layout"
-            .to_string()
-    });
     vec![
         vec![
             item("Copy SHA", MenuAction::CopySha, None),
@@ -286,7 +281,7 @@ pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<Me
         )],
         vec![
             item("Create branch here…", MenuAction::Branch, branch_blocked),
-            item("New worktree here…", MenuAction::Worktree, worktree_blocked),
+            item("New worktree here…", MenuAction::Worktree, None),
             item("Create tag here…", MenuAction::Tag, None),
         ],
         vec![
@@ -878,7 +873,7 @@ mod tests {
         };
         let got = enabled(&normal);
         assert_eq!(got[3], ("Create branch here…".into(), false), "it switches");
-        assert_eq!(got[4], ("New worktree here…".into(), false));
+        assert_eq!(got[4], ("New worktree here…".into(), true), "any repo");
         let checkout = &menu_items(&normal, ON, &[ON])[1][0];
         assert_eq!(
             checkout.blocked.as_deref(),

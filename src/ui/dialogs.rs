@@ -54,7 +54,8 @@ pub(super) struct CloneDialog {
     focus_search: bool,
     /// "Edit space" was clicked: close and open the space editor.
     edit_space: bool,
-    /// "Use the worktree layout": `.bare` plus a folder per branch, or a normal clone.
+    /// "Use the old worktree layout": `.bare` plus a folder per branch. Off: a normal clone,
+    /// with worktrees beside it. #160 removes the option.
     worktrees: bool,
 }
 
@@ -78,7 +79,7 @@ impl CloneDialog {
             query: String::new(),
             focus_search: false,
             edit_space: false,
-            worktrees: true,
+            worktrees: false,
         }
     }
 
@@ -2035,18 +2036,37 @@ impl SpinneyApp {
         self.errors.extend(errors);
     }
 
-    /// Open `root` as a tab (or focus its tab) and add it to the active space.
-    pub(super) fn open_folder(&mut self, root: PathBuf) {
+    /// Open `picked` as a tab (or focus its tab) and add it to the active space. A worktree
+    /// folder (Spinney's, an agent's, an IDE's) opens its project with that worktree active.
+    pub(super) fn open_folder(&mut self, picked: PathBuf) {
         let Some(space) = self.space() else { return };
-        if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
-            self.active_tab = i;
-            self.new_tab = false;
-            return;
-        }
-        let before = self.tabs.len();
-        self.open_tab(&root, &space);
-        if self.tabs.len() > before && add_project(&mut self.config, &space.id, &root) {
-            self.save_config();
+        // Keep the path as picked when it is the project itself (git returns `/private/…`).
+        let root = match project::project_root(&picked) {
+            Ok(r) if !project::same_dir(&r, &picked) => r,
+            _ => picked.clone(),
+        };
+        let i = match self.tabs.iter().position(|t| t.root == root) {
+            Some(i) => i,
+            None => {
+                let before = self.tabs.len();
+                self.open_tab(&root, &space);
+                if self.tabs.len() == before {
+                    return;
+                }
+                if add_project(&mut self.config, &space.id, &root) {
+                    self.save_config();
+                }
+                self.tabs.len() - 1
+            }
+        };
+        self.active_tab = i;
+        self.new_tab = false;
+        let picked = picked.canonicalize().unwrap_or(picked);
+        let ctx = self.ctx.clone();
+        let tab = &mut self.tabs[i];
+        if picked != tab.active_worktree && tab.worktrees.iter().any(|w| w.path == picked) {
+            tab.active_worktree = picked;
+            tab.refresh(&ctx, &mut self.errors);
         }
     }
 
@@ -2326,7 +2346,7 @@ fn name_and_clone(
     let home = paths::home();
     let full = paths::expand_tilde(&d.where_dir, home.as_deref()).join(d.name.trim());
     ui.monospace(format!("{}/", full.display()));
-    ui.checkbox(&mut d.worktrees, "Use the worktree layout");
+    ui.checkbox(&mut d.worktrees, "Use the old .bare layout");
     ui.weak(if d.worktrees {
         "worktrees go in folders inside this one"
     } else {
@@ -3637,11 +3657,11 @@ mod tests {
     }
 
     #[test]
-    fn clone_defaults_to_worktree_layout() {
+    fn clone_defaults_to_a_normal_clone() {
         let mut d = CloneDialog::new(&Space::default());
-        assert_eq!(d.layout(), project::Layout::WorktreeRoot);
-        d.worktrees = false;
         assert_eq!(d.layout(), project::Layout::NormalClone);
+        d.worktrees = true;
+        assert_eq!(d.layout(), project::Layout::WorktreeRoot);
     }
 
     fn repo(name: &str) -> github::Repo {

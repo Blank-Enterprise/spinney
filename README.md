@@ -3,10 +3,11 @@
 A lightweight Git desktop client for macOS on Apple Silicon, written in Rust with
 [egui](https://github.com/emilk/egui).
 
-Spinney is built around **worktrees**. Each project is a `.bare` repository plus one folder per
-branch, so switching branches never means stashing, and two branches can be open, built and run
-side by side. Spinney creates projects in that layout, converts an existing clone to it (with an
-undo journal if anything goes wrong), and manages the worktrees for you. A normal clone works too.
+Spinney is built around **worktrees**. Each project is a normal clone, so your editor, terminal
+and coding agents see an ordinary repository. Its worktrees live beside it in
+`<project>.worktrees/`, so two branches can be open, built and run side by side without
+stashing. Worktrees made outside Spinney, by `git worktree add`, an IDE or an agent, show up
+and work like its own. Moved ones are relinked when the project opens.
 
 <!-- Screenshot of the main window goes here once docs/screenshot.png is added:
 ![Spinney's main window: branch sidebar, commit graph and staged changes](docs/screenshot.png)
@@ -17,9 +18,10 @@ undo journal if anything goes wrong), and manages the worktrees for you. A norma
 - **Spaces:** keep work and personal accounts apart. Each space has its own GitHub or GitHub
   Enterprise account (device-flow sign-in or a token), SSH key, author identity and clone folder.
   Tokens live in the macOS Keychain, and Spinney gives them only to the space's own host.
-- **Projects:** clone from a URL or by searching your repositories, in the worktree layout or as a
-  plain clone; create, open recent, and one tab per project.
+- **Projects:** clone from a URL or by searching your repositories; create, open recent, and one
+  tab per project. Opening any worktree folder opens its project.
 - **Worktrees:** add and remove them, or remove a worktree and delete its branch in one step.
+  Missing ones can be located or removed; locked ones are left alone.
 - **Branches:** a sidebar grouped into folders, with checkout, create, rename (also on the remote),
   delete local and remote, and fast-forward without checking out. Merge or rebase from the branch
   menu, or drag one branch onto another.
