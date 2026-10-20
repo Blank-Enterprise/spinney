@@ -1019,6 +1019,73 @@ pub fn delete_remote_branch(worktree: &Path, remote_branch: &str) -> Result<()> 
     Ok(())
 }
 
+/// Why `name` can't be a new tag's name, checked with `git check-ref-format`. A leading
+/// `-` passes that check but `git tag` would read it as an option.
+pub fn check_tag_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Enter a tag name");
+    }
+    if name.starts_with('-') {
+        bail!("{name} is not a valid tag name: it can't start with -");
+    }
+    // Outside any repo, like `check_branch_name`.
+    let full = format!("refs/tags/{name}");
+    if git::run(&std::env::temp_dir(), &["check-ref-format", &full]).is_err() {
+        bail!("{name} is not a valid tag name");
+    }
+    Ok(())
+}
+
+/// Whether `refs/tags/<name>` exists (the full ref, so a same-named branch doesn't count).
+pub fn tag_exists(worktree: &Path, name: &str) -> Result<bool> {
+    let full = format!("refs/tags/{name}");
+    let out = git::run_ok_codes(worktree, &["rev-parse", "--verify", "-q", &full], &[0, 1])?;
+    Ok(!out.trim().is_empty())
+}
+
+/// `git tag` arguments for tagging `target`: annotated (`-a`, its message on stdin, so no
+/// editor) when there is a message, lightweight otherwise. Never `-f`.
+pub fn tag_args<'a>(name: &'a str, target: &'a str, annotated: bool) -> Vec<&'a str> {
+    if annotated {
+        vec!["tag", "-a", "-F", "-", name, target]
+    } else {
+        vec!["tag", name, target]
+    }
+}
+
+/// Tag `target` as `name`, annotated when `message` has any text. An existing tag is
+/// refused, never moved.
+pub fn create_tag(worktree: &Path, name: &str, target: &str, message: Option<&str>) -> Result<()> {
+    check_tag_name(name)?;
+    if tag_exists(worktree, name)? {
+        bail!("A tag named {name} already exists");
+    }
+    let message = message.map(str::trim).filter(|m| !m.is_empty());
+    let args = tag_args(name, target, message.is_some());
+    match message {
+        Some(m) => git::run_stdin(worktree, &args, format!("{m}\n").as_bytes())?,
+        None => git::run(worktree, &args)?,
+    };
+    Ok(())
+}
+
+/// The commit `rev` (a SHA or a full ref) names, so a tag pins what the user was shown.
+pub fn resolve_commit(worktree: &Path, rev: &str) -> Result<String> {
+    let spec = format!("{rev}^{{commit}}");
+    let args = ["rev-parse", "--verify", "-q", "--end-of-options", &spec];
+    let out = git::run_ok_codes(worktree, &args, &[0, 1])?;
+    match out.trim() {
+        "" => bail!("{rev} is not a commit"),
+        sha => Ok(sha.to_string()),
+    }
+}
+
+/// Whether the repository has a remote called `name`.
+pub fn has_remote(worktree: &Path, name: &str) -> Result<bool> {
+    let out = git::run(worktree, &["remote"])?;
+    Ok(out.lines().any(|l| l == name))
+}
+
 /// `git push <remote> refs/tags/<tag>`: the full ref, so a branch with the same name is
 /// never the one pushed. A tag already on the remote at another commit is rejected.
 pub fn push_tag(worktree: &Path, remote: &str, tag: &str) -> Result<()> {
@@ -1442,6 +1509,116 @@ mod tests {
         let up = git::run(&main, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
         assert_eq!(up.trim(), "origin/topic");
         git::run(&remote_dir(&tmp), &["rev-parse", "--verify", "topic"]).unwrap();
+    }
+
+    #[test]
+    fn create_lightweight_tag() {
+        let (_tmp, _root, main) = cloned();
+        let head = head_commit(&main).unwrap().unwrap();
+        create_tag(&main, "v1.0", &head, None).unwrap();
+        let t = git::run(&main, &["cat-file", "-t", "refs/tags/v1.0"]).unwrap();
+        assert_eq!(t.trim(), "commit");
+        let at = git::run(&main, &["rev-parse", "refs/tags/v1.0"]).unwrap();
+        assert_eq!(at.trim(), head);
+        // A blank message is no message.
+        create_tag(&main, "v1.1", &head, Some("  \n")).unwrap();
+        let t = git::run(&main, &["cat-file", "-t", "refs/tags/v1.1"]).unwrap();
+        assert_eq!(t.trim(), "commit");
+    }
+
+    #[test]
+    fn create_annotated_tag() {
+        let (_tmp, _root, main) = cloned();
+        let first = git::run(&main, &["rev-parse", "HEAD"]).unwrap();
+        write_commit(&main, "n.txt");
+        let msg = "Release 2\n\nWith notes.";
+        create_tag(&main, "v2", first.trim(), Some(msg)).unwrap();
+        let t = git::run(&main, &["cat-file", "-t", "refs/tags/v2"]).unwrap();
+        assert_eq!(t.trim(), "tag");
+        let body = git::run(&main, &["cat-file", "tag", "refs/tags/v2"]).unwrap();
+        assert!(body.contains("Release 2"), "{body}");
+        let at = git::run(&main, &["rev-parse", "refs/tags/v2^{commit}"]).unwrap();
+        assert_eq!(at, first, "tags the commit asked for, not HEAD");
+    }
+
+    #[test]
+    fn invalid_tag_names_are_refused() {
+        let (_tmp, _root, main) = cloned();
+        for bad in [
+            "",
+            "a..b",
+            "has space",
+            "end.",
+            "x.lock",
+            "-x",
+            "a~1",
+            "a:b",
+        ] {
+            assert!(check_tag_name(bad).is_err(), "{bad:?} accepted");
+            assert!(create_tag(&main, bad, "HEAD", None).is_err(), "{bad:?}");
+        }
+        for good in ["v1.2.3", "release/2026-10", "beta-1"] {
+            check_tag_name(good).unwrap();
+        }
+        let tags = git::run(&main, &["tag", "-l"]).unwrap();
+        assert_eq!(tags, "", "nothing created");
+    }
+
+    #[test]
+    fn existing_tag_is_never_overwritten() {
+        let (_tmp, _root, main) = cloned();
+        let first = git::run(&main, &["rev-parse", "HEAD"]).unwrap();
+        create_tag(&main, "v1", "HEAD", None).unwrap();
+        write_commit(&main, "n.txt");
+        let err = create_tag(&main, "v1", "HEAD", Some("again")).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let at = git::run(&main, &["rev-parse", "refs/tags/v1"]).unwrap();
+        assert_eq!(at, first);
+        // A branch of the same name doesn't count as a tag.
+        git::run(&main, &["branch", "same"]).unwrap();
+        assert!(!tag_exists(&main, "same").unwrap());
+    }
+
+    #[test]
+    fn resolve_commit_peels_refs() {
+        let (_tmp, _root, main) = cloned();
+        let head = head_commit(&main).unwrap().unwrap();
+        assert_eq!(resolve_commit(&main, "refs/heads/main").unwrap(), head);
+        let x = resolve_commit(&main, "refs/remotes/origin/feature/x").unwrap();
+        assert_ne!(x, head);
+        assert!(resolve_commit(&main, "refs/heads/nope").is_err());
+        assert!(has_remote(&main, "origin").unwrap());
+        assert!(!has_remote(&main, "upstream").unwrap());
+    }
+
+    #[test]
+    fn tag_args_never_force() {
+        assert_eq!(tag_args("v1", "abc", false), ["tag", "v1", "abc"]);
+        assert_eq!(
+            tag_args("v1", "abc", true),
+            ["tag", "-a", "-F", "-", "v1", "abc"]
+        );
+    }
+
+    #[test]
+    fn push_tag_pushes_only_the_tag() {
+        let (tmp, _root, main) = cloned();
+        git::run(&main, &["switch", "-q", "-c", "unpushed"]).unwrap();
+        write_commit(&main, "t.txt");
+        create_tag(&main, "v3", "HEAD", Some("three")).unwrap();
+        create_tag(&main, "other", "HEAD", None).unwrap();
+        push_tag(&main, "origin", "v3").unwrap();
+        let remote = remote_dir(&tmp);
+        let t = git::run(&remote, &["cat-file", "-t", "refs/tags/v3"]).unwrap();
+        assert_eq!(t.trim(), "tag");
+        assert!(!tag_exists(&remote, "other").unwrap(), "only the one tag");
+        let branch = git::run_ok_codes(
+            &remote,
+            &["rev-parse", "--verify", "-q", "refs/heads/unpushed"],
+            &[0, 1],
+        )
+        .unwrap();
+        assert_eq!(branch, "", "the branch isn't pushed");
     }
 
     #[test]

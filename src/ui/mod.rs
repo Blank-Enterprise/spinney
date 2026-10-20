@@ -668,6 +668,8 @@ pub enum Action {
     /// "Create branch here…" on a commit: the new-branch dialog with the commit as base,
     /// which creates the branch (worktree layout) or creates and switches (normal clone).
     BranchAt(String),
+    /// "Create tag here…" on a commit (its SHA) or a branch (its full ref): the tag dialog.
+    TagAt(String),
 }
 
 pub struct SpinneyApp {
@@ -1274,6 +1276,7 @@ impl SpinneyApp {
                     });
                 }
             }
+            Action::TagAt(target) => self.ask_tag(target, &mut errors),
             Action::CopyText(text) => ctx.copy_text(text),
             Action::CopyCommitMessage(sha) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {

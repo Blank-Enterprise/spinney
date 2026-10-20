@@ -318,6 +318,76 @@ impl RenameBranchDialog {
     }
 }
 
+/// Tag commit `sha` (asked from `label`'s menu) in `worktree`, maybe pushing it to origin.
+pub(super) struct TagDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) sha: String,
+    pub(super) label: String,
+    pub(super) name: String,
+    /// Empty for a lightweight tag.
+    pub(super) message: String,
+    pub(super) push: bool,
+    /// The repository has an `origin` to push to.
+    pub(super) can_push: bool,
+    /// Last name checked with git, and why it was refused (git runs once per edit).
+    checked: Option<(String, Option<String>)>,
+}
+
+impl TagDialog {
+    pub(super) fn new(
+        root: PathBuf,
+        worktree: PathBuf,
+        sha: String,
+        label: String,
+        can_push: bool,
+    ) -> Self {
+        TagDialog {
+            root,
+            worktree,
+            sha,
+            label,
+            name: String::new(),
+            message: String::new(),
+            push: false,
+            can_push,
+            checked: None,
+        }
+    }
+
+    /// The trimmed name, or why Create is disabled: invalid, or already a tag.
+    pub(super) fn target(&mut self) -> Result<String, String> {
+        let name = self.name.trim().to_string();
+        let refused = match &self.checked {
+            Some((n, why)) if *n == name => why.clone(),
+            _ => {
+                let why = match actions::check_tag_name(&name) {
+                    Err(e) => Some(e.to_string()),
+                    Ok(()) => match actions::tag_exists(&self.worktree, &name) {
+                        Ok(true) => Some(format!("A tag named {name} already exists")),
+                        Ok(false) => None,
+                        Err(e) => Some(format!("{e:#}")),
+                    },
+                };
+                self.checked = Some((name.clone(), why.clone()));
+                why
+            }
+        };
+        match refused {
+            Some(why) => Err(why),
+            None => Ok(name),
+        }
+    }
+}
+
+/// The tag dialog's name for what is tagged: a branch's short name, or a short SHA.
+pub(super) fn tag_target_label(target: &str) -> &str {
+    ["refs/heads/", "refs/remotes/"]
+        .iter()
+        .find_map(|p| target.strip_prefix(p))
+        .unwrap_or_else(|| base_label(target))
+}
+
 /// Remove a worktree and delete its branch, as planned (and checked) when asked.
 pub(super) struct RemoveWithBranchDialog {
     pub(super) root: PathBuf,
@@ -398,6 +468,7 @@ pub(super) struct Dialogs {
     pub(super) reset: Option<ResetDialog>,
     pub(super) revert: Option<RevertDialog>,
     pub(super) interactive: Option<InteractiveDialog>,
+    pub(super) tag: Option<TagDialog>,
 }
 
 /// The interactive rebase editor: `plan` as listed, `items` as the user is editing them.
@@ -592,6 +663,7 @@ impl Dialogs {
             || self.reset.is_some()
             || self.revert.is_some()
             || self.interactive.is_some()
+            || self.tag.is_some()
     }
 }
 
@@ -1043,6 +1115,43 @@ impl SpinneyApp {
                 None => self.dialogs.interactive = Some(d),
             }
         }
+        if let Some(mut d) = self.dialogs.tag.take() {
+            let mut result = None;
+            let target = d.target();
+            egui::Modal::new(egui::Id::unique("create_tag")).show(ctx, |ui| {
+                ui.label(format!("Create tag at {}", d.label));
+                ui.text_edit_singleline(&mut d.name);
+                ui.label(theme::caption(
+                    "Message (optional): with one it's an annotated tag, without one a \
+                     lightweight tag.",
+                ));
+                ui.add(egui::TextEdit::multiline(&mut d.message).desired_rows(3));
+                ui.add_enabled(
+                    d.can_push,
+                    egui::Checkbox::new(&mut d.push, "Push to origin"),
+                )
+                .on_disabled_hover_text("This repository has no origin remote");
+                if let Err(reason) = &target {
+                    if !d.name.trim().is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, reason);
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let create = theme::primary("Create");
+                    if ui.add_enabled(target.is_ok(), create).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match (result, target) {
+                (Some(true), Ok(name)) => self.create_tag(d, name),
+                (Some(false), _) => {}
+                _ => self.dialogs.tag = Some(d),
+            }
+        }
         if let Some(mut d) = self.dialogs.revert.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("revert")).show(ctx, |ui| {
@@ -1230,6 +1339,45 @@ impl SpinneyApp {
             Err(e) => {
                 errors.push(format!("{e:#}"));
             }
+        }
+        self.errors.extend(errors);
+    }
+
+    /// Open the tag dialog for `target` (a SHA or a branch's full ref), pinned to the
+    /// commit it names now.
+    pub(super) fn ask_tag(&mut self, target: String, errors: &mut Vec<String>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+        let sha = match actions::resolve_commit(&wt, &target) {
+            Ok(sha) => sha,
+            Err(e) => return errors.push(format!("{e:#}")),
+        };
+        let can_push = actions::has_remote(&wt, "origin").unwrap_or(false);
+        let label = tag_target_label(&target).to_string();
+        self.dialogs.tag = Some(TagDialog::new(root, wt, sha, label, can_push));
+    }
+
+    /// Create the tag now; pushing it runs as a job, like other pushes.
+    pub(super) fn create_tag(&mut self, d: TagDialog, name: String) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.root == d.root) else {
+            return;
+        };
+        let res = actions::create_tag(&d.worktree, &name, &d.sha, Some(&d.message));
+        tab.refresh(&ctx, &mut errors);
+        match res {
+            Ok(()) if d.push && d.can_push => {
+                let wt = d.worktree;
+                self.jobs
+                    .spawn(JobKind::PushTag, d.root, String::new(), move || {
+                        actions::push_tag(&wt, "origin", &name)
+                    });
+            }
+            Ok(()) => {}
+            Err(e) => errors.push(format!("{e:#}")),
         }
         self.errors.extend(errors);
     }
@@ -3124,6 +3272,74 @@ mod tests {
         finish_job(&mut app, JobKind::DeleteRemote);
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert!(!on_remote());
+    }
+
+    #[test]
+    fn tag_target_labels() {
+        assert_eq!(tag_target_label("refs/heads/feat/x"), "feat/x");
+        assert_eq!(tag_target_label("refs/remotes/origin/main"), "origin/main");
+        let sha = "83174b7246c76c9b6426a95147a715f0d26bf6c6";
+        assert_eq!(tag_target_label(sha), "83174b72");
+    }
+
+    #[test]
+    fn tag_dialog_creates_and_pushes_the_tag() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let remote = proj.path().join("remote.git");
+        let d = proj.path().join("repo");
+        std::fs::create_dir(&d).unwrap();
+        let g = |args: &[&str]| crate::git::run(&d, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        g(&["tag", "taken"]);
+        let r = proj.path();
+        crate::git::run(r, &["init", "-q", "--bare", "remote.git"]).unwrap();
+        let url = format!("file://{}", remote.display());
+        g(&["remote", "add", "origin", &url]);
+        let space = app.space().unwrap();
+        app.open_tab(&d, &space);
+
+        app.apply(Action::TagAt("refs/heads/main".into()));
+        let mut t = app.dialogs.tag.take().expect("dialog open");
+        assert_eq!(t.label, "main");
+        assert!(t.can_push);
+        assert_eq!(t.target().unwrap_err(), "Enter a tag name");
+        t.name = "a..b".into();
+        assert_eq!(t.target().unwrap_err(), "a..b is not a valid tag name");
+        t.name = "taken".into();
+        assert_eq!(t.target().unwrap_err(), "A tag named taken already exists");
+        t.name = " v1.0 ".into();
+        t.message = "First release".into();
+        t.push = true;
+        let name = t.target().unwrap();
+        app.create_tag(t, name);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let kind = g(&["cat-file", "-t", "refs/tags/v1.0"]);
+        assert_eq!(kind.trim(), "tag");
+        // Opening the tab also starts a commit-graph job.
+        let mut done = None;
+        for _ in 0..500 {
+            done = app.jobs.try_recv().filter(|d| d.kind == JobKind::PushTag);
+            if done.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let done = done.expect("push job finished");
+        assert!(done.result.is_ok(), "{:?}", done.result);
+        let pushed = crate::git::run(&remote, &["cat-file", "-t", "refs/tags/v1.0"]).unwrap();
+        assert_eq!(pushed.trim(), "tag");
+        let main =
+            crate::git::run_ok_codes(&remote, &["rev-parse", "-q", "--verify", "main"], &[0, 1]);
+        assert_eq!(main.unwrap(), "", "only the tag is pushed");
     }
 
     #[test]
