@@ -749,7 +749,12 @@ pub struct Lease {
     pub expect: String,
     /// Commits at `expect` that are not on the branch: what the force push drops.
     pub lost: usize,
+    /// The newest `LOST_SHOWN` of them as "<short sha> <subject>", for the confirmation.
+    pub lost_commits: Vec<String>,
 }
+
+/// Lost commits a force push confirmation names; the rest are counted.
+pub const LOST_SHOWN: usize = 5;
 
 /// A non-fast-forward rejection fails with `PushRejected`.
 pub fn push(worktree: &Path) -> Result<()> {
@@ -799,6 +804,8 @@ pub fn lease(worktree: &Path) -> Result<Lease> {
     let expect = expect.trim().to_string();
     let range = format!("HEAD..{expect}");
     let lost = git::run(worktree, &["rev-list", "--count", &range])?;
+    let shown = format!("-{LOST_SHOWN}");
+    let log = git::run(worktree, &["log", &shown, "--format=%h %s", &range])?;
     Ok(Lease {
         worktree: worktree.to_path_buf(),
         branch,
@@ -807,6 +814,7 @@ pub fn lease(worktree: &Path) -> Result<Lease> {
         tracking,
         expect,
         lost: lost.trim().parse()?,
+        lost_commits: log.lines().map(str::to_string).collect(),
     })
 }
 
@@ -1896,11 +1904,32 @@ mod tests {
     }
 
     #[test]
+    fn lease_names_the_commits_a_force_push_drops() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        for i in 0..7 {
+            std::fs::write(theirs.join(format!("t{i}.txt")), "x\n").unwrap();
+            git::run(&theirs, &["add", "."]).unwrap();
+            commit(&theirs, &format!("theirs {i}")).unwrap();
+        }
+        push(&theirs).unwrap();
+        fetch(&ours).unwrap();
+        write_commit(&ours, "o.txt");
+
+        let lease = lease(&ours).unwrap();
+        assert_eq!(lease.lost, 7);
+        let short = git::run(&theirs, &["rev-parse", "--short", "HEAD"]).unwrap();
+        assert_eq!(lease.lost_commits.len(), LOST_SHOWN);
+        assert_eq!(lease.lost_commits[0], format!("{} theirs 6", short.trim()));
+        assert!(lease.lost_commits[4].ends_with(" theirs 2"));
+    }
+
+    #[test]
     fn force_push_with_lease_refuses_when_remote_moved_after_fetch() {
         let (_tmp, remote, ours, theirs) = two_clones();
         write_commit(&ours, "o.txt");
         let lease = lease(&ours).unwrap();
         assert_eq!(lease.lost, 0);
+        assert!(lease.lost_commits.is_empty());
         write_commit(&theirs, "t.txt");
         push(&theirs).unwrap();
         // A fetch after the lease was taken must not let us drop their commit unseen.

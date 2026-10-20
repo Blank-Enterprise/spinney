@@ -1693,18 +1693,7 @@ impl SpinneyApp {
                 None => format!(
                     "Push of {branch} was rejected: the remote has commits this branch doesn't."
                 ),
-                Some(l) => {
-                    let lost = match l.lost {
-                        0 => "Commits on the remote that aren't on this branch".to_string(),
-                        1 => format!("1 commit on {} that isn't on this branch", l.tracking),
-                        n => format!("{n} commits on {} that aren't on this branch", l.tracking),
-                    };
-                    format!(
-                        "Force push {}? {lost} will be lost. If someone pushed since your \
-                         last fetch, the push is refused.",
-                        l.branch
-                    )
-                }
+                Some(l) => force_push_question(l),
             };
             let icon = if r.lease.is_some() { "⚠" } else { "↑" };
             ui.label(egui::RichText::new(icon).color(theme::WARN));
@@ -1930,6 +1919,28 @@ pub fn toggle_pick(picked: &[usize], selected: Option<usize>, i: usize) -> Vec<u
 pub enum LeaveTo {
     Branch(String),
     Commit(String),
+}
+
+/// The force push confirmation, naming the commits it drops (newest first, the rest
+/// counted). Subjects can hold commas, so they're separated by semicolons.
+pub fn force_push_question(l: &actions::Lease) -> String {
+    let lost = match l.lost {
+        0 => "Commits on the remote that aren't on this branch".to_string(),
+        1 => format!("1 commit on {} that isn't on this branch", l.tracking),
+        n => format!("{n} commits on {} that aren't on this branch", l.tracking),
+    };
+    let mut named = l.lost_commits.join("; ");
+    if !named.is_empty() {
+        named = format!(": {named}");
+        if l.lost > l.lost_commits.len() {
+            named += &format!(" and {} more", l.lost - l.lost_commits.len());
+        }
+    }
+    format!(
+        "Force push {}? {lost} will be lost{named}. If someone pushed since your last fetch, \
+         the push is refused.",
+        l.branch
+    )
 }
 
 /// "Detached at 1a2b3c4".
@@ -2769,6 +2780,39 @@ mod tests {
         );
         app.apply(Action::DismissPush);
         assert!(app.rejected_push.is_none());
+    }
+
+    #[test]
+    fn force_push_question_names_the_lost_commits() {
+        let mut l = actions::Lease {
+            worktree: "/tmp/x".into(),
+            branch: "feature/x".into(),
+            remote: "origin".into(),
+            remote_ref: "refs/heads/feature/x".into(),
+            tracking: "origin/feature/x".into(),
+            expect: "1a2b3c4d".into(),
+            lost: 1,
+            lost_commits: vec!["1a2b3c4 Fix the parser, again".into()],
+        };
+        assert_eq!(
+            force_push_question(&l),
+            "Force push feature/x? 1 commit on origin/feature/x that isn't on this branch \
+             will be lost: 1a2b3c4 Fix the parser, again. If someone pushed since your last \
+             fetch, the push is refused."
+        );
+        l.lost = 7;
+        l.lost_commits = (0..5).map(|i| format!("abc000{i} c{i}")).collect();
+        assert!(
+            force_push_question(&l).contains(
+                "7 commits on origin/feature/x that aren't on this branch will be lost: \
+                 abc0000 c0; abc0001 c1; abc0002 c2; abc0003 c3; abc0004 c4 and 2 more. If"
+            ),
+            "{}",
+            force_push_question(&l)
+        );
+        l.lost = 0;
+        l.lost_commits.clear();
+        assert!(force_push_question(&l).contains("branch will be lost. If"));
     }
 
     #[test]
