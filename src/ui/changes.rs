@@ -1,6 +1,7 @@
 //! Right panel: working-copy status, staging and commit; or a selected commit's files.
 //! Also the ProjectTab handlers behind those controls.
 
+use super::conflict_view::ConflictView;
 use super::diff_view::{Selection, WorkDiff};
 use super::{theme, Action, Center, Discard, ProjectTab, Resolve};
 use crate::actions::{self, Operation, Version};
@@ -162,7 +163,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &
         return;
     }
     let open = match &tab.center {
-        Center::Diff(w) => Some((w.fd.path.clone(), w.staged)),
+        Center::Diff(w) if w.staged => Some((w.fd.path.clone(), List::Staged)),
+        Center::Diff(w) => Some((w.fd.path.clone(), List::Unstaged)),
+        Center::Conflict(v) => Some((v.path.clone(), List::Conflicted)),
         _ => None,
     };
     let enabled = commit_enabled(&tab.commit_summary, &tab.status, tab.amend);
@@ -257,7 +260,7 @@ fn file_list(
     files: &[FileStatus],
     status: &Status,
     op: Option<Operation>,
-    open: &Option<(String, bool)>,
+    open: &Option<(String, List)>,
     conflicts: bool,
     actions: &mut Vec<Action>,
 ) {
@@ -314,8 +317,7 @@ fn file_list(
                         _ => Action::StageFile(f.clone(), staged),
                     });
                 }
-                let is_open =
-                    list != List::Conflicted && open.as_ref() == Some(&(f.path.clone(), staged));
+                let is_open = open.as_ref() == Some(&(f.path.clone(), list));
                 let (letter, color) = badge(&f.change);
                 let row = egui::Button::selectable(
                     is_open,
@@ -340,9 +342,11 @@ fn file_list(
                     },
                     _ => r,
                 };
-                // Conflicted files have a combined diff the parser does not read.
-                if r.clicked() && list != List::Conflicted {
-                    actions.push(Action::OpenDiff(f.clone(), staged));
+                if r.clicked() {
+                    actions.push(match list {
+                        List::Conflicted => Action::OpenConflict(f.path.clone()),
+                        _ => Action::OpenDiff(f.clone(), staged),
+                    });
                 }
                 if list == List::Conflicted {
                     r.context_menu(|ui| conflict_menu(ui, f, actions));
@@ -426,7 +430,8 @@ fn commit_files(ui: &mut egui::Ui, tab: &ProjectTab, i: usize, actions: &mut Vec
 
 impl ProjectTab {
     /// Reload status and the open working-copy diff. The diff closes when its file left
-    /// that side's list; the selection survives only if the diff is unchanged.
+    /// that side's list; the selection survives only if the diff is unchanged. An open
+    /// conflict view is re-read, and closes once its file is no longer conflicted.
     pub(super) fn reload_changes(&mut self, errors: &mut Vec<String>) {
         match status::status(&self.active_worktree) {
             Ok(s) => self.status = s,
@@ -435,6 +440,15 @@ impl ProjectTab {
         match actions::in_progress(&self.active_worktree) {
             Ok(op) => self.operation = op,
             Err(e) => errors.push(format!("in progress: {e:#}")),
+        }
+        if let Center::Conflict(v) = &self.center {
+            let path = v.path.clone();
+            self.center = if self.status.conflicted.iter().any(|f| f.path == path) {
+                Center::Conflict(Box::new(ConflictView::load(&self.active_worktree, &path)))
+            } else {
+                Center::Graph // resolved
+            };
+            return;
         }
         let Center::Diff(w) = &mut self.center else {
             return;
