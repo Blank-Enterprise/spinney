@@ -119,6 +119,11 @@ pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
         git_dir,
         &["config", "--local", "--add", "credential.helper", &helper],
     )?;
+    // A plain `git push` (terminal, agent) on a new branch then sets its upstream itself.
+    git::run(
+        git_dir,
+        &["config", "--local", "push.autoSetupRemote", "true"],
+    )?;
     configure_ssh(git_dir, space)
 }
 
@@ -252,6 +257,8 @@ mod tests {
         assert!(lines[1].starts_with("!'") && lines[1].ends_with("' credential test-space"));
         let email = git::run(dir, &["config", "--local", "user.email"]).unwrap();
         assert_eq!(email.trim(), "test@example.com");
+        let auto = git::run(dir, &["config", "--local", "push.autoSetupRemote"]).unwrap();
+        assert_eq!(auto.trim(), "true");
     }
 
     #[test]
