@@ -600,6 +600,111 @@ pub fn fetch(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A fetch, pull or push that failed for a common reason: `message` says it in one line,
+/// and `raw` keeps git's own text for Details.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncError {
+    pub message: String,
+    pub raw: String,
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SyncError {}
+
+/// One line for git's `raw` error from a fetch, pull or push, or `None` to show it as is.
+/// `branch` is the branch checked out and `remote` the one it syncs with, when known.
+pub fn sync_message(raw: &str, branch: Option<&str>, remote: Option<&str>) -> Option<String> {
+    if raw.contains("There is no tracking information for the current branch") {
+        let branch = branch.unwrap_or("This branch");
+        return Some(format!(
+            "{branch} has no upstream yet: Push it first, or pull from a branch"
+        ));
+    }
+    // `fetch --all` follows each failed remote's output with its name: explain the first.
+    const FAILED: &str = "error: could not fetch ";
+    let (raw, remote) = match raw.find(FAILED) {
+        Some(i) => {
+            let name = &raw[i + FAILED.len()..];
+            let name = name.lines().next().unwrap_or_default().trim();
+            (&raw[..i], Some(name))
+        }
+        None => (raw, remote),
+    };
+    let remote = remote.unwrap_or("the remote");
+    // The text between `before` and the next `'` on the first line that has it.
+    let quoted = |before: &str| {
+        raw.lines().find_map(|l| {
+            let rest = &l[l.find(before)? + before.len()..];
+            Some(rest.split('\'').next()?.trim_end_matches('/').to_string())
+        })
+    };
+    let reach = |place: Option<String>| match place {
+        Some(place) => format!("Couldn't reach {remote}: {place}"),
+        None => format!("Couldn't reach {remote}"),
+    };
+    let signin = |place: Option<String>| {
+        let place = place.map(|p| format!(" ({p})")).unwrap_or_default();
+        format!("Couldn't sign in to {remote}{place}: check the space's account")
+    };
+    let has = |s: &str| raw.contains(s);
+    if has("' does not appear to be a git repository") {
+        return Some(reach(quoted("fatal: '")));
+    }
+    if has("Authentication failed for '") {
+        return Some(signin(quoted("Authentication failed for '")));
+    }
+    if has("terminal prompts disabled") {
+        return Some(signin(quoted("could not read Username for '")));
+    }
+    if has("Permission denied (publickey") {
+        return Some(format!(
+            "{remote} refused the SSH key: check the space's SSH key"
+        ));
+    }
+    if has("unable to access '") {
+        let url = quoted("unable to access '");
+        if has("returned error: 401") || has("returned error: 403") {
+            return Some(signin(url));
+        }
+        return Some(reach(url));
+    }
+    if has("repository '") && has("' not found") {
+        return Some(reach(quoted("repository '")));
+    }
+    if has("Could not read from remote repository") {
+        return Some(reach(None));
+    }
+    None
+}
+
+/// `e` from a fetch, pull or push in `dir`, as a `SyncError` when `sync_message` knows it.
+/// Rejected pushes and pull conflicts keep their own types for their bars.
+pub fn explain_sync(dir: &Path, e: anyhow::Error) -> anyhow::Error {
+    if e.is::<PushRejected>() || e.is::<PullConflicts>() {
+        return e;
+    }
+    let raw = format!("{e:#}");
+    let branch = refs::current_branch(dir).ok().flatten();
+    let config = |key: &str| {
+        let v = git::run_ok_codes(dir, &["config", "--get", key], &[0, 1]).ok()?;
+        Some(v.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    // The branch's remote, or origin, where a push without an upstream goes.
+    let remote = branch
+        .as_deref()
+        .and_then(|b| config(&format!("branch.{b}.remote")))
+        .or_else(|| config("remote.origin.url").map(|_| "origin".to_string()));
+    match sync_message(&raw, branch.as_deref(), remote.as_deref()) {
+        Some(message) => SyncError { message, raw }.into(),
+        None => e,
+    }
+}
+
 /// `git pull` arguments for `strategy`, all explicit so the user's `pull.rebase`,
 /// `pull.ff` or `branch.<name>.rebase` cannot turn it into a different kind of pull.
 /// `--prune` drops remote branches deleted on the remote, as Fetch does; tags stay.
@@ -1397,6 +1502,150 @@ mod tests {
     use super::*;
     use crate::config::Space;
     use crate::project::{add_worktree_existing, clone_into};
+
+    /// `explain_sync` for `e` in `dir`, as the one-line message and git's text.
+    fn explained(dir: &Path, e: anyhow::Error) -> SyncError {
+        let e = explain_sync(dir, e);
+        e.downcast::<SyncError>().expect("a known sync error")
+    }
+
+    #[test]
+    fn pull_without_upstream_says_push_first() {
+        let (_tmp, _remote, ours, _theirs) = two_clones();
+        git::run(&ours, &["switch", "-q", "-c", "feature/fresh"]).unwrap();
+        let e = explained(
+            &ours,
+            pull(&ours, PullStrategy::FastForwardOnly).unwrap_err(),
+        );
+        assert_eq!(
+            e.message,
+            "feature/fresh has no upstream yet: Push it first, or pull from a branch"
+        );
+        assert!(e.raw.contains("no tracking information"), "{}", e.raw);
+        assert_eq!(e.to_string(), e.message, "one line, git's text only in raw");
+    }
+
+    #[test]
+    fn unreachable_remote_is_one_line_for_fetch_pull_and_push() {
+        let (_tmp, _remote, ours, _theirs) = two_clones();
+        git::run(&ours, &["remote", "set-url", "origin", "/nonexistent/repo"]).unwrap();
+        write_commit(&ours, "o.txt");
+        let common = ours.join(".git");
+        let errors = [
+            explained(&common, fetch(&common).unwrap_err()),
+            explained(
+                &ours,
+                pull(&ours, PullStrategy::FastForwardOnly).unwrap_err(),
+            ),
+            explained(&ours, push(&ours).unwrap_err()),
+        ];
+        for e in errors {
+            assert_eq!(e.message, "Couldn't reach origin: /nonexistent/repo");
+            assert!(e.raw.contains("Could not read from remote"), "{}", e.raw);
+        }
+    }
+
+    #[test]
+    fn fetch_all_names_the_first_remote_that_failed() {
+        let (_tmp, _remote, ours, _theirs) = two_clones();
+        let g = |args: &[&str]| git::run(&ours, args).unwrap();
+        // Port 9 (discard) refuses at once, without the network.
+        g(&["remote", "set-url", "origin", "https://127.0.0.1:9/x.git"]);
+        g(&["remote", "add", "second", "/nonexistent/two"]);
+        let common = ours.join(".git");
+        let e = explained(&common, fetch(&common).unwrap_err());
+        assert_eq!(
+            e.message,
+            "Couldn't reach origin: https://127.0.0.1:9/x.git"
+        );
+        assert!(e.raw.contains("could not fetch second"), "{}", e.raw);
+    }
+
+    #[test]
+    fn rejected_push_keeps_its_type() {
+        let (_tmp, _remote, ours, theirs) = two_clones();
+        write_commit(&theirs, "t.txt");
+        push(&theirs).unwrap();
+        write_commit(&ours, "o.txt");
+        rejected(explain_sync(&ours, push(&ours).unwrap_err()));
+    }
+
+    #[test]
+    fn sync_message_for_git_errors() {
+        let m = |raw: &str| sync_message(raw, Some("main"), Some("origin"));
+        assert_eq!(
+            m(
+                "git fetch failed: fatal: unable to access 'https://nonexistent.invalid/x.git/': \
+               Could not resolve host: nonexistent.invalid"
+            )
+            .as_deref(),
+            Some("Couldn't reach origin: https://nonexistent.invalid/x.git")
+        );
+        assert_eq!(
+            m("git push failed: remote: Invalid username or token.\n\
+               fatal: Authentication failed for 'https://github.com/o/r.git/'")
+            .as_deref(),
+            Some("Couldn't sign in to origin (https://github.com/o/r.git): check the space's account")
+        );
+        assert_eq!(
+            m(
+                "git fetch failed: fatal: could not read Username for 'https://github.com': \
+               terminal prompts disabled"
+            )
+            .as_deref(),
+            Some("Couldn't sign in to origin (https://github.com): check the space's account")
+        );
+        assert_eq!(
+            m(
+                "git fetch failed: fatal: unable to access 'https://h/o/r.git/': \
+               The requested URL returned error: 403"
+            )
+            .as_deref(),
+            Some("Couldn't sign in to origin (https://h/o/r.git): check the space's account")
+        );
+        assert_eq!(
+            m(
+                "git push failed: git@github.com: Permission denied (publickey).\n\
+               fatal: Could not read from remote repository.\n\n\
+               Please make sure you have the correct access rights\n\
+               and the repository exists."
+            )
+            .as_deref(),
+            Some("origin refused the SSH key: check the space's SSH key")
+        );
+        assert_eq!(
+            m("git fetch failed: remote: Repository not found.\n\
+               fatal: repository 'https://github.com/o/gone.git/' not found")
+            .as_deref(),
+            Some("Couldn't reach origin: https://github.com/o/gone.git")
+        );
+        assert_eq!(
+            m(
+                "git push failed: ssh: connect to host 127.0.0.1 port 9: Connection refused\n\
+               fatal: Could not read from remote repository."
+            )
+            .as_deref(),
+            Some("Couldn't reach origin")
+        );
+        assert_eq!(
+            sync_message("fatal: Could not read from remote repository.", None, None).as_deref(),
+            Some("Couldn't reach the remote")
+        );
+        assert_eq!(
+            sync_message(
+                "There is no tracking information for the current branch.",
+                None,
+                None
+            )
+            .as_deref(),
+            Some("This branch has no upstream yet: Push it first, or pull from a branch")
+        );
+        // Anything else is shown as git said it.
+        assert_eq!(
+            m("git pull failed: fatal: Not possible to fast-forward"),
+            None
+        );
+    }
 
     fn space() -> Space {
         Space {
