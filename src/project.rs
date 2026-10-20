@@ -54,14 +54,35 @@ fn claim_root(parent: &Path, name: &str) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Clone `url` as `<parent>/<name>/.bare` plus a worktree for the default branch.
-pub fn clone_into(url: &str, parent: &Path, name: &str, space: &Space) -> Result<PathBuf> {
+/// Clone `url` to `<parent>/<name>`: as `.bare` plus a worktree for the default branch, or
+/// as a normal clone.
+pub fn clone_into(
+    url: &str,
+    parent: &Path,
+    name: &str,
+    space: &Space,
+    layout: Layout,
+) -> Result<PathBuf> {
     let root = claim_root(parent, name)?;
-    let result = clone_steps(url, parent, &root, space);
+    let result = match layout {
+        Layout::WorktreeRoot => clone_steps(url, parent, &root, space),
+        Layout::NormalClone => clone_normal(url, parent, &root, space),
+    };
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&root); // we created it, so clean it up
     }
     result.map(|()| root)
+}
+
+/// Plain `git clone` into the empty `root`, with the same credentials and identity as the
+/// worktree layout.
+fn clone_normal(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<()> {
+    let root_str = root.to_str().context("non-UTF-8 path")?;
+    let mut args = creds::git_env_args(space)?;
+    args.extend(["clone", url, root_str].map(String::from));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    git::run(parent, &refs)?;
+    creds::configure_repo(&root.join(".git"), space)
 }
 
 fn clone_steps(url: &str, parent: &Path, root: &Path, space: &Space) -> Result<()> {
@@ -261,7 +282,7 @@ mod tests {
 
     fn cloned() -> (tempfile::TempDir, PathBuf) {
         let (tmp, url, parent) = fixture();
-        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
+        let root = clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).unwrap();
         (tmp, root)
     }
 
@@ -292,17 +313,46 @@ mod tests {
     }
 
     #[test]
+    fn normal_clone_has_upstream_identity_and_helper() {
+        let (_tmp, url, parent) = fixture();
+        let root = clone_into(&url, &parent, "proj", &space(), Layout::NormalClone).unwrap();
+        assert_eq!(detect(&root).unwrap(), Layout::NormalClone);
+        assert!(!root.join(".bare").exists());
+        let up = git::run(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).unwrap();
+        assert_eq!(up.trim(), "origin/main");
+        let email = git::run(&root, &["config", "--local", "user.email"]).unwrap();
+        assert_eq!(email.trim(), space().author_email);
+        let helpers = git::run(
+            &root,
+            &["config", "--local", "--get-all", "credential.helper"],
+        );
+        assert_eq!(
+            helpers.unwrap().lines().next(),
+            Some(""),
+            "resets inherited helpers"
+        );
+    }
+
+    #[test]
+    fn normal_clone_failure_cleans_up() {
+        let (tmp, _url, parent) = fixture();
+        let bad = format!("file://{}", tmp.path().join("missing").display());
+        assert!(clone_into(&bad, &parent, "proj", &space(), Layout::NormalClone).is_err());
+        assert!(!parent.join("proj").exists());
+    }
+
+    #[test]
     fn clone_refuses_existing_dir() {
         let (_tmp, url, parent) = fixture();
         std::fs::create_dir(parent.join("proj")).unwrap();
-        assert!(clone_into(&url, &parent, "proj", &space()).is_err());
+        assert!(clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).is_err());
     }
 
     #[test]
     fn clone_failure_cleans_up() {
         let (tmp, _url, parent) = fixture();
         let bad = format!("file://{}", tmp.path().join("missing").display());
-        assert!(clone_into(&bad, &parent, "proj", &space()).is_err());
+        assert!(clone_into(&bad, &parent, "proj", &space(), Layout::WorktreeRoot).is_err());
         assert!(!parent.join("proj").exists());
     }
 
@@ -466,10 +516,13 @@ mod tests {
         let abs = tmp.path().join("abs").display().to_string();
         for bad in ["a/..", "..", abs.as_str()] {
             assert!(
-                clone_into(&bad_url, &parent, bad, &space()).is_err(),
+                clone_into(&bad_url, &parent, bad, &space(), Layout::WorktreeRoot).is_err(),
                 "{bad:?}"
             );
-            assert!(clone_into(&url, &parent, bad, &space()).is_err(), "{bad:?}");
+            assert!(
+                clone_into(&url, &parent, bad, &space(), Layout::WorktreeRoot).is_err(),
+                "{bad:?}"
+            );
             assert_intact(&parent);
         }
         assert!(!tmp.path().join("abs").exists());
@@ -481,7 +534,7 @@ mod tests {
         let link = parent.join("proj");
         std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
         assert!(create_new(&parent, "proj", "main", &space()).is_err());
-        assert!(clone_into(&url, &parent, "proj", &space()).is_err());
+        assert!(clone_into(&url, &parent, "proj", &space(), Layout::WorktreeRoot).is_err());
         let meta = std::fs::symlink_metadata(&link).unwrap();
         assert!(meta.file_type().is_symlink(), "symlink untouched");
         assert!(!tmp.path().join("nowhere").exists());

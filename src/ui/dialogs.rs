@@ -53,6 +53,8 @@ pub(super) struct CloneDialog {
     focus_search: bool,
     /// "Edit space" was clicked: close and open the space editor.
     edit_space: bool,
+    /// "Use the worktree layout": `.bare` plus a folder per branch, or a normal clone.
+    worktrees: bool,
 }
 
 impl CloneDialog {
@@ -75,6 +77,15 @@ impl CloneDialog {
             query: String::new(),
             focus_search: false,
             edit_space: false,
+            worktrees: true,
+        }
+    }
+
+    fn layout(&self) -> project::Layout {
+        if self.worktrees {
+            project::Layout::WorktreeRoot
+        } else {
+            project::Layout::NormalClone
         }
     }
 
@@ -812,10 +823,10 @@ impl SpinneyApp {
             }
         };
         let url = d.url.trim().to_string();
-        let id = space.id.clone();
+        let (id, layout) = (space.id.clone(), d.layout());
         self.jobs
             .spawn(JobKind::Clone, parent.join(&name), id, move || {
-                project::clone_into(&url, &parent, &name, &space).map(|_| ())
+                project::clone_into(&url, &parent, &name, &space, layout).map(|_| ())
             });
     }
 
@@ -1070,7 +1081,12 @@ fn name_and_clone(
     let home = paths::home();
     let full = paths::expand_tilde(&d.where_dir, home.as_deref()).join(d.name.trim());
     ui.monospace(format!("{}/", full.display()));
-    ui.weak("worktrees go in folders inside this one");
+    ui.checkbox(&mut d.worktrees, "Use the worktree layout");
+    ui.weak(if d.worktrees {
+        "worktrees go in folders inside this one"
+    } else {
+        "a normal clone; you can convert it later"
+    });
     ui.add_space(6.0);
     if let Err(reason) = target {
         ui.colored_label(ui.visuals().error_fg_color, reason);
@@ -1521,6 +1537,14 @@ mod tests {
         assert_eq!(d.where_dir, "/tmp/code");
         assert_eq!(d.github, "GitHub Enterprise (ghe.example.com)");
         assert_eq!(github_label("github.com"), "GitHub.com");
+    }
+
+    #[test]
+    fn clone_defaults_to_worktree_layout() {
+        let mut d = CloneDialog::new(&Space::default());
+        assert_eq!(d.layout(), project::Layout::WorktreeRoot);
+        d.worktrees = false;
+        assert_eq!(d.layout(), project::Layout::NormalClone);
     }
 
     fn repo(name: &str) -> github::Repo {

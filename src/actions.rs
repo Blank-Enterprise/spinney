@@ -537,7 +537,14 @@ mod tests {
     /// Worktree-layout project; returns (tmp, root, main worktree).
     fn cloned() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let (tmp, url, parent) = fixture();
-        let root = clone_into(&url, &parent, "proj", &space()).unwrap();
+        let root = clone_into(
+            &url,
+            &parent,
+            "proj",
+            &space(),
+            crate::project::Layout::WorktreeRoot,
+        )
+        .unwrap();
         let main = root.join("main");
         git::run(&main, &["config", "user.name", "Test User"]).unwrap();
         git::run(&main, &["config", "user.email", "test@example.com"]).unwrap();
