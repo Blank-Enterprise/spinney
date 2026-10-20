@@ -629,6 +629,8 @@ pub enum Action {
     CherryPick(Vec<String>),
     /// Revert the commit with this SHA; a merge commit first asks which parent to keep.
     Revert(String),
+    /// Open the interactive rebase editor for the commits after the one with this SHA.
+    AskInteractiveRebase(String),
     /// Ask before resetting the checked-out branch to the commit with this SHA.
     AskReset(String, actions::ResetMode),
     /// "Create branch here…" on the detached-HEAD banner: a new branch at HEAD, switched to.
@@ -1163,6 +1165,7 @@ impl SpinneyApp {
             }
             Action::CherryPick(shas) => self.cherry_pick(&shas, &mut errors),
             Action::Revert(sha) => self.ask_revert(sha, &mut errors),
+            Action::AskInteractiveRebase(sha) => self.ask_interactive(&sha, &mut errors),
             Action::AskReset(sha, mode) => self.ask_reset(&sha, mode, &mut errors),
             Action::AttachBranch => {
                 let head = self

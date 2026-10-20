@@ -282,7 +282,7 @@ fn current_for(worktree: &Path, branch: &str) -> Result<String> {
     Ok(current)
 }
 
-fn rev_parse(worktree: &Path, rev: &str) -> Result<String> {
+pub(crate) fn rev_parse(worktree: &Path, rev: &str) -> Result<String> {
     Ok(git::run(worktree, &["rev-parse", rev])?.trim().to_string())
 }
 
@@ -424,7 +424,7 @@ pub fn unmerged(worktree: &Path) -> Result<Vec<String>> {
 /// except a squash's, which is undone and checked to be back at `before`. Without
 /// conflicts (e.g. an untracked file in the way, which can stop a rebase partway), abort
 /// whatever was started and return git's own error.
-fn stopped(
+pub(crate) fn stopped(
     worktree: &Path,
     err: anyhow::Error,
     squash: bool,
@@ -1002,7 +1002,7 @@ pub fn rename_on_remote(worktree: &Path, r: &RemoteRename, old: &str, new: &str)
 }
 
 /// `git merge-base --is-ancestor a b`: `a` is reachable from `b`.
-fn is_ancestor(worktree: &Path, a: &str, b: &str) -> Result<bool> {
+pub(crate) fn is_ancestor(worktree: &Path, a: &str, b: &str) -> Result<bool> {
     let out = git::output(worktree, &["merge-base", "--is-ancestor", a, b])?;
     match out.status.code() {
         Some(0) => Ok(true),
