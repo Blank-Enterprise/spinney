@@ -297,6 +297,43 @@ impl RenameBranchDialog {
     }
 }
 
+/// Remove a worktree and delete its branch, as planned (and checked) when asked.
+pub(super) struct RemoveWithBranchDialog {
+    pub(super) root: PathBuf,
+    pub(super) plan: actions::RemoveWithBranch,
+}
+
+/// The question, what it loses, and the button label for removing a worktree with its
+/// branch.
+fn remove_with_branch_text(p: &actions::RemoveWithBranch) -> (String, Vec<String>, &'static str) {
+    let question = format!(
+        "Remove worktree {} and delete branch {}?",
+        folder_name(&p.path),
+        p.branch
+    );
+    let mut lost = vec![];
+    if p.dirty {
+        lost.push("Its uncommitted and untracked files will be lost.".to_string());
+    }
+    let commits = match p.unmerged {
+        0 => None,
+        1 => Some("1 commit".to_string()),
+        n => Some(format!("{n} commits")),
+    };
+    if let Some(c) = commits {
+        lost.push(format!(
+            "{} is not fully merged: {c} not on {} will be deleted with it.",
+            p.branch, p.base
+        ));
+    }
+    let button = if p.unmerged > 0 {
+        "Remove and delete anyway"
+    } else {
+        "Remove and delete"
+    };
+    (question, lost, button)
+}
+
 /// Merge `branch` into `into` (checked out in `worktree`), in the chosen mode.
 pub(super) struct MergeDialog {
     pub(super) root: PathBuf,
@@ -324,6 +361,7 @@ pub(super) struct Dialogs {
     pub(super) new_worktree: Option<NewWorktreeDialog>,
     /// Dirty worktree awaiting a forced-removal confirmation.
     pub(super) confirm_remove: Option<PathBuf>,
+    pub(super) remove_with_branch: Option<RemoveWithBranchDialog>,
     pub(super) delete_branch: Option<DeleteBranchDialog>,
     /// Remote branch (`origin/feature/x`) awaiting a delete confirmation.
     pub(super) delete_remote: Option<String>,
@@ -356,6 +394,7 @@ impl Dialogs {
             || self.create.is_some()
             || self.new_worktree.is_some()
             || self.confirm_remove.is_some()
+            || self.remove_with_branch.is_some()
             || self.confirm_drop_stash.is_some()
             || self.convert.is_some()
             || self.delete_branch.is_some()
@@ -487,6 +526,29 @@ impl SpinneyApp {
                 }
                 Some(false) => {}
                 None => self.dialogs.confirm_remove = Some(path),
+            }
+        }
+        if let Some(d) = self.dialogs.remove_with_branch.take() {
+            let mut result = None;
+            let (question, lost, button) = remove_with_branch_text(&d.plan);
+            egui::Modal::new(egui::Id::unique("remove_with_branch")).show(ctx, |ui| {
+                ui.label(question);
+                for line in lost {
+                    ui.colored_label(theme::WARN, format!("⚠ {line}"));
+                }
+                ui.horizontal(|ui| {
+                    if ui.add(danger(button)).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => self.remove_with_branch(d),
+                Some(false) => {}
+                None => self.dialogs.remove_with_branch = Some(d),
             }
         }
         if let Some(drop) = self.dialogs.confirm_drop_stash.take() {
@@ -929,6 +991,31 @@ impl SpinneyApp {
                             actions::rename_on_remote(&wt, &r, &old, &name)
                         });
                 }
+            }
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        self.errors.extend(errors);
+    }
+
+    /// Remove the worktree, then delete its branch; a branch that turns out unmerged
+    /// gets the usual "not fully merged" prompt.
+    pub(super) fn remove_with_branch(&mut self, d: RemoveWithBranchDialog) {
+        let ctx = self.ctx.clone();
+        let mut errors = vec![];
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.root == d.root) else {
+            return;
+        };
+        let res = actions::remove_with_branch(&d.root, &d.plan);
+        tab.refresh(&ctx, &mut errors);
+        match res {
+            Ok(actions::DeleteOutcome::Deleted) => {}
+            Ok(actions::DeleteOutcome::NotMerged) => {
+                self.dialogs.delete_branch = Some(DeleteBranchDialog {
+                    branch: d.plan.branch,
+                    remote: None,
+                    also_remote: false,
+                    not_merged: true,
+                })
             }
             Err(e) => errors.push(format!("{e:#}")),
         }
@@ -1545,6 +1632,12 @@ mod tests {
         d.confirm_remove = Some(PathBuf::from("/tmp/wt"));
         assert!(d.any_open());
         d.confirm_remove = None;
+        d.remove_with_branch = Some(RemoveWithBranchDialog {
+            root: PathBuf::from("/tmp/r"),
+            plan: plan(false, 0),
+        });
+        assert!(d.any_open());
+        d.remove_with_branch = None;
         d.confirm_drop_stash = Some(DropStash {
             root: PathBuf::from("/tmp/r"),
             worktree: PathBuf::from("/tmp/r"),
@@ -1785,6 +1878,36 @@ mod tests {
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(app.tabs[0].operation, None);
         assert!(app.tabs[0].status.changed_files() == 0);
+    }
+
+    fn plan(dirty: bool, unmerged: usize) -> actions::RemoveWithBranch {
+        actions::RemoveWithBranch {
+            path: PathBuf::from("/p/proj/feat-x"),
+            branch: "feat/x".into(),
+            dirty,
+            base: "origin/feat/x".into(),
+            unmerged,
+        }
+    }
+
+    #[test]
+    fn remove_with_branch_names_what_is_lost() {
+        let (q, lost, button) = remove_with_branch_text(&plan(false, 0));
+        assert_eq!(q, "Remove worktree feat-x and delete branch feat/x?");
+        assert!(lost.is_empty());
+        assert_eq!(button, "Remove and delete");
+        let (_, lost, button) = remove_with_branch_text(&plan(true, 2));
+        assert_eq!(
+            lost,
+            [
+                "Its uncommitted and untracked files will be lost.",
+                "feat/x is not fully merged: 2 commits not on origin/feat/x will be deleted \
+                 with it."
+            ]
+        );
+        assert_eq!(button, "Remove and delete anyway");
+        let (_, lost, _) = remove_with_branch_text(&plan(false, 1));
+        assert!(lost[0].contains(": 1 commit not on"), "{lost:?}");
     }
 
     #[test]

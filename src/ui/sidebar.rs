@@ -292,6 +292,14 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                         actions.push(Action::RemoveWorktree(wt.path.clone()));
                         ui.close();
                     }
+                    let both = ui.add_enabled(
+                        wt.branch.is_some(),
+                        egui::Button::new("Remove worktree and delete branch…"),
+                    );
+                    if both.on_disabled_hover_text("Detached: no branch").clicked() {
+                        actions.push(Action::AskRemoveWithBranch(wt.path.clone()));
+                        ui.close();
+                    }
                 });
             }
         });
