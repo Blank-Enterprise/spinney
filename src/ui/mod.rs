@@ -139,6 +139,10 @@ pub struct ProjectTab {
     filter: String,
     /// The merge, rebase, cherry-pick or revert stopped in `active_worktree`, if any.
     operation: Option<Operation>,
+    /// The commit HEAD is detached at in `active_worktree`, if it is.
+    detached: Option<String>,
+    /// The branch to go back to from a detached HEAD.
+    previous_branch: Option<String>,
 }
 
 /// `<git common dir>` of a project (the `.bare` dir or a normal clone's `.git`).
@@ -201,6 +205,8 @@ impl ProjectTab {
             amend: false,
             filter: String::new(),
             operation: None,
+            detached: None,
+            previous_branch: None,
         };
         tab.log.request(PAGE);
         tab.load_branches(errors);
@@ -246,6 +252,15 @@ impl ProjectTab {
             Ok(b) => self.branches = b,
             Err(e) => errors.push(format!("branches: {e:#}")),
         }
+        let wt = &self.active_worktree;
+        self.detached = actions::detached_head(wt).unwrap_or_else(|e| {
+            errors.push(format!("HEAD: {e:#}"));
+            None
+        });
+        self.previous_branch = match &self.detached {
+            None => None,
+            Some(_) => actions::previous_branch(wt).unwrap_or_default(),
+        };
     }
 
     fn load_stashes(&mut self, errors: &mut Vec<String>) {
@@ -586,6 +601,8 @@ pub enum Action {
     CopyCommitMessage(String),
     /// Check out the commit with this SHA, detaching HEAD.
     CheckoutCommit(String),
+    /// "Create branch here…" on the detached-HEAD banner: a new branch at HEAD, switched to.
+    AttachBranch,
     /// "Create branch here…" on a commit: the new-branch dialog with the commit as base,
     /// which creates the branch (worktree layout) or creates and switches (normal clone).
     BranchAt(String),
@@ -1113,6 +1130,19 @@ impl SpinneyApp {
                     });
                 }
             }
+            Action::AttachBranch => {
+                let head = self
+                    .tabs
+                    .get(self.active_tab)
+                    .and_then(|t| t.detached.clone());
+                if let Some(head) = head {
+                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
+                        base: head,
+                        branch: String::new(),
+                        mode: BranchMode::Switch,
+                    });
+                }
+            }
             Action::BranchAt(sha) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     let mode = match tab.layout {
@@ -1136,7 +1166,9 @@ impl SpinneyApp {
                 }
             }
             Action::CheckoutCommit(sha) => {
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if self.ask_leave(LeaveTo::Commit(sha.clone()), &mut errors) {
+                    // Asked first: commits only this detached HEAD has would be left behind.
+                } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     // A pull or push may be rewriting the same files (the toolbar disables it).
                     if self.jobs.network_busy(&tab.root) {
                         errors.push("Wait for the running fetch, pull or push".into());
@@ -1166,9 +1198,11 @@ impl SpinneyApp {
                 }
             }
             Action::Checkout(name) => {
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    checkout(tab, &name, &mut errors);
-                    tab.refresh(&ctx, &mut errors);
+                if !self.ask_leave(LeaveTo::Branch(name.clone()), &mut errors) {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        checkout(tab, &name, &mut errors);
+                        tab.refresh(&ctx, &mut errors);
+                    }
                 }
             }
             Action::ActivateWorktree(path) => {
@@ -1665,6 +1699,48 @@ fn tab_action(tab: &mut ProjectTab, action: Action, errors: &mut Vec<String>) {
     }
 }
 
+/// Where leaving a detached HEAD goes once confirmed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeaveTo {
+    Branch(String),
+    Commit(String),
+}
+
+/// Whether going to `to` moves the active worktree's HEAD. In the worktree layout a branch
+/// checkout jumps to (or creates) that branch's own worktree, leaving this one alone.
+pub fn leaves_head(layout: Layout, to: &LeaveTo) -> bool {
+    match to {
+        LeaveTo::Commit(_) => true,
+        LeaveTo::Branch(_) => layout == Layout::NormalClone,
+    }
+}
+
+/// "Detached at 1a2b3c4".
+pub fn detached_text(head: &str) -> String {
+    format!("Detached at {}", &head[..head.len().min(7)])
+}
+
+/// "Detached at …" with Create branch here… and Checkout <previous branch>.
+fn detached_bar(ui: &mut egui::Ui, head: &str, previous: Option<&str>, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("⚠").color(theme::WARN));
+        ui.label(egui::RichText::new(detached_text(head)).color(theme::TEXT));
+        ui.label(theme::caption(
+            "Commits made here belong to no branch until you create one.",
+        ));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(b) = previous {
+                if ui.small_button(format!("Checkout {b}")).clicked() {
+                    actions.push(Action::Checkout(b.to_string()));
+                }
+            }
+            if ui.small_button("Create branch here…").clicked() {
+                actions.push(Action::AttachBranch);
+            }
+        });
+    });
+}
+
 /// Check out `name` (local, or `remote/branch`) in the tab, jumping to or creating its worktree.
 fn checkout(tab: &mut ProjectTab, name: &str, errors: &mut Vec<String>) {
     let remote = tab.branches.iter().any(|b| b.remote && b.name == name);
@@ -1687,6 +1763,45 @@ fn checkout(tab: &mut ProjectTab, name: &str, errors: &mut Vec<String>) {
 }
 
 impl SpinneyApp {
+    /// Before `to` moves a detached HEAD away from commits no branch, tag or remote has,
+    /// open the confirmation and return true. A failed check also stops it (true).
+    fn ask_leave(&mut self, to: LeaveTo, errors: &mut Vec<String>) -> bool {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
+        if !leaves_head(tab.layout, &to) {
+            return false;
+        }
+        // From git, not `tab.detached`: commits made outside Spinney since the last refresh
+        // count too, and the confirmation is pinned to the HEAD they were counted at.
+        let wt = &tab.active_worktree;
+        let head = match actions::detached_head(wt) {
+            Ok(Some(h)) => h,
+            Ok(None) => return false,
+            Err(e) => {
+                errors.push(format!("detached HEAD: {e:#}"));
+                return true;
+            }
+        };
+        match actions::detached_orphans(wt) {
+            Ok(0) => false,
+            Ok(lost) => {
+                self.dialogs.leave_detached = Some(dialogs::LeaveDetached {
+                    root: tab.root.clone(),
+                    worktree: tab.active_worktree.clone(),
+                    head,
+                    lost,
+                    to,
+                });
+                true
+            }
+            Err(e) => {
+                errors.push(format!("detached HEAD: {e:#}"));
+                true
+            }
+        }
+    }
+
     /// The in-progress banner for the active tab, or its Skip/Abort confirmation. A
     /// confirmation for that tab whose operation finished or changed meanwhile is dropped.
     fn op_banner(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1774,6 +1889,16 @@ impl eframe::App for SpinneyApp {
                     let running = |k| jobs.running(k, &tab.root);
                     toolbar::toolbar(ui, tab, projects, busy, running, &mut actions)
                 });
+                // A rebase detaches HEAD too; the in-progress banner covers it.
+                if let (Some(head), None) = (&tab.detached, tab.operation) {
+                    let warn = egui::Frame::new()
+                        .fill(theme::WARN.gamma_multiply(0.12))
+                        .inner_margin(Margin::symmetric(14, 6));
+                    let previous = tab.previous_branch.as_deref();
+                    egui::Panel::top("detached")
+                        .frame(warn)
+                        .show(ui, |ui| detached_bar(ui, head, previous, &mut actions));
+                }
                 if self.offer_convert(tab) {
                     let root = tab.root.clone();
                     egui::Panel::top("convert_offer").frame(bar).show(ui, |ui| {
@@ -2379,6 +2504,21 @@ mod tests {
         }
         assert_eq!(done.expect("job finished").kind, JobKind::Pull);
         assert!(!jobs.network_busy(a) && jobs.active.is_empty());
+    }
+
+    #[test]
+    fn only_moving_this_worktrees_head_leaves_it() {
+        let commit = LeaveTo::Commit("abc".into());
+        let branch = LeaveTo::Branch("main".into());
+        assert!(leaves_head(Layout::NormalClone, &commit));
+        assert!(leaves_head(Layout::WorktreeRoot, &commit));
+        assert!(leaves_head(Layout::NormalClone, &branch));
+        assert!(
+            !leaves_head(Layout::WorktreeRoot, &branch),
+            "jumps to its worktree"
+        );
+        let sha = "83174b7246c76c9b6426a95147a715f0d26bf6c6";
+        assert_eq!(detached_text(sha), "Detached at 83174b7");
     }
 
     #[test]

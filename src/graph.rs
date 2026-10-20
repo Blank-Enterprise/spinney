@@ -283,6 +283,22 @@ mod tests {
     }
 
     #[test]
+    fn log_stream_shows_commits_only_a_detached_head_has() {
+        let tmp = repo();
+        let g = |args: &[&str]| git::run(tmp.path(), args).unwrap();
+        g(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        g(&["switch", "-q", "--detach"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "loose"]);
+        let mut s = LogStream::open(tmp.path()).unwrap();
+        let rows = s.next_page(10).unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.commit.subject.as_str(), r.commit.refs.as_str()))
+            .collect();
+        assert_eq!(got, [("loose", "HEAD"), ("init", "main")]);
+    }
+
+    #[test]
     fn log_stream_empty_repo() {
         let tmp = repo();
         let mut s = LogStream::open(tmp.path()).unwrap();
