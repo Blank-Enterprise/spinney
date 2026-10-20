@@ -139,6 +139,8 @@ pub struct ProjectTab {
     amend: bool,
     /// Sidebar filter text.
     filter: String,
+    /// Which sidebar sections are open and how tall each is.
+    sections: sidebar::Sections,
     /// The merge, rebase, cherry-pick or revert stopped in `active_worktree`, if any.
     operation: Option<Operation>,
     /// The commit HEAD is detached at in `active_worktree`, if it is.
@@ -215,6 +217,7 @@ impl ProjectTab {
             commit_desc: String::new(),
             amend: false,
             filter: String::new(),
+            sections: sidebar::Sections::default(),
             operation: None,
             detached: None,
             previous_branch: None,

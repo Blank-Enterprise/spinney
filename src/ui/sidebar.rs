@@ -202,18 +202,243 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
-fn section(
-    ui: &mut egui::Ui,
-    id: &str,
-    title: &str,
-    n: usize,
-    open: bool,
-    add: impl FnOnce(&mut egui::Ui),
-) {
-    egui::CollapsingHeader::new(theme::section(&format!("{title} · {n}")))
-        .id_salt(id)
-        .default_open(open)
-        .show(ui, add);
+/// The sidebar's sections, top to bottom.
+pub const SECTIONS: usize = 5;
+const HEADER_H: f32 = 22.0;
+/// The divider between two sections, dragged to resize them.
+const HANDLE_H: f32 = 6.0;
+/// The shortest an open section's body gets, however its neighbours are resized.
+const MIN_BODY: f32 = 150.0;
+/// The first split between open sections: Local gets the most.
+const FIRST_SHARES: [f32; SECTIONS] = [3.0, 2.0, 1.0, 1.0, 1.0];
+
+/// Which sidebar sections are open, and how tall each one's body is. A closed section
+/// keeps its height, to come back at that size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sections {
+    pub open: [bool; SECTIONS],
+    /// 0 until first laid out.
+    pub heights: [f32; SECTIONS],
+}
+
+impl Default for Sections {
+    /// Branches open; worktrees, stashes and tags closed until asked for.
+    fn default() -> Self {
+        Sections {
+            open: [true, true, false, false, false],
+            heights: [0.0; SECTIONS],
+        }
+    }
+}
+
+impl Sections {
+    fn open_list(&self) -> Vec<usize> {
+        (0..SECTIONS).filter(|&k| self.open[k]).collect()
+    }
+
+    /// Fit the open bodies to `space`. The first time, split it between them; after that
+    /// only the bottom open section takes up a change, and when the sidebar gets shorter
+    /// the ones above it give way in turn down to `min`, so the top ones stay put. With
+    /// no room for every minimum, they share it equally.
+    pub fn fit(&mut self, space: f32, min: f32) {
+        let open = self.open_list();
+        let Some(&last) = open.last() else {
+            return;
+        };
+        let h = &mut self.heights;
+        let sum: f32 = open.iter().map(|&k| h[k]).sum();
+        if sum <= 0.0 {
+            let total: f32 = open.iter().map(|&k| FIRST_SHARES[k]).sum();
+            for &k in &open {
+                h[k] = space * FIRST_SHARES[k] / total;
+            }
+            return;
+        }
+        if space >= sum {
+            h[last] += space - sum;
+            return;
+        }
+        let mut want = sum - space;
+        for &k in open.iter().rev() {
+            let take = (h[k] - min).max(0.0).min(want);
+            h[k] -= take;
+            want -= take;
+        }
+        if want > 0.0 {
+            for &k in &open {
+                h[k] = space / open.len() as f32;
+            }
+        }
+    }
+
+    /// Whether section `k` sits nearer the top of the sidebar than the bottom, so it
+    /// folds up (and opens down) rather than the other way.
+    fn nearer_top(&self, k: usize) -> bool {
+        let chrome = HEADER_H + HANDLE_H;
+        let body = |r: std::ops::Range<usize>| -> f32 {
+            r.filter(|&o| self.open[o]).map(|o| self.heights[o]).sum()
+        };
+        let above = k as f32 * chrome + body(0..k);
+        let below = (SECTIONS - 1 - k) as f32 * chrome + body(k + 1..SECTIONS);
+        above <= below
+    }
+
+    /// Open or close section `k`; the sidebar's top and bottom edges stay put. A section
+    /// nearer the top folds up, its space going to the nearest open section below; one
+    /// nearer the bottom folds down, its space going to the one above. Opening mirrors
+    /// that: it takes its old height back from that side first, nearest first, none
+    /// going under `min`.
+    pub fn toggle(&mut self, k: usize, space: f32, min: f32) {
+        let below: Vec<usize> = (k + 1..SECTIONS).filter(|&o| self.open[o]).collect();
+        let above: Vec<usize> = (0..k).rev().filter(|&o| self.open[o]).collect();
+        let others: Vec<usize> = if self.nearer_top(k) {
+            below.into_iter().chain(above).collect()
+        } else {
+            above.into_iter().chain(below).collect()
+        };
+        let h = &mut self.heights;
+        if self.open[k] {
+            self.open[k] = false;
+            if let Some(&to) = others.first() {
+                h[to] += h[k];
+            }
+        } else {
+            self.open[k] = true;
+            let want = if h[k] > 0.0 {
+                h[k]
+            } else {
+                space / (others.len() + 1) as f32
+            }
+            .max(min);
+            let mut got = 0.0;
+            for &o in &others {
+                let take = (h[o] - min).max(0.0).min(want - got);
+                h[o] -= take;
+                got += take;
+            }
+            h[k] = if others.is_empty() {
+                space
+            } else {
+                got.max(min)
+            };
+        }
+        self.fit(space, min);
+    }
+}
+
+/// Move the divider below section `i` by `delta` (down when positive). The nearest open
+/// section on the side it moves away from grows; open sections on the side it moves into
+/// shrink in turn, nearest first, none below `min`. It stops when they are all at `min`.
+pub fn drag(h: &mut [f32], open: &[bool], i: usize, delta: f32, min: f32) {
+    let above: Vec<usize> = (0..=i).rev().filter(|&k| open[k]).collect();
+    let below: Vec<usize> = (i + 1..h.len()).filter(|&k| open[k]).collect();
+    let (grow, shrink) = if delta > 0.0 {
+        (above.first(), &below)
+    } else {
+        (below.first(), &above)
+    };
+    let Some(&grow) = grow else {
+        return;
+    };
+    let mut want = delta.abs();
+    let mut moved = 0.0;
+    for &k in shrink {
+        let take = (h[k] - min).max(0.0).min(want);
+        h[k] -= take;
+        want -= take;
+        moved += take;
+    }
+    h[grow] += moved;
+}
+
+/// Draws the sections one after another, each body in its own scroll area, with a
+/// divider between each pair.
+struct Split {
+    s: Sections,
+    /// A header clicked this frame; it opens or closes after the frame is drawn.
+    toggled: Option<usize>,
+    /// Spacing for the bodies' contents (the split itself packs with none).
+    spacing: egui::Vec2,
+    min: f32,
+}
+
+impl Split {
+    fn section(
+        &mut self,
+        ui: &mut egui::Ui,
+        k: usize,
+        title: &str,
+        n: usize,
+        add: impl FnOnce(&mut egui::Ui),
+    ) {
+        let w = ui.available_width();
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(w, HEADER_H), egui::Sense::click());
+        if r.clicked() {
+            self.toggled = Some(k);
+        }
+        if r.hovered() {
+            ui.painter()
+                .rect_filled(rect, theme::WIDGET_R, theme::HOVER);
+        }
+        let icon = egui::Rect::from_center_size(
+            rect.left_center() + egui::vec2(9.0, 0.0),
+            egui::vec2(8.0, 8.0),
+        );
+        let rotation = if self.s.open[k] {
+            0.0
+        } else {
+            -std::f32::consts::FRAC_PI_2
+        };
+        ui.painter()
+            .add(egui::Shape::rotated_triangle(icon, rotation, theme::MUTED));
+        let text = egui::WidgetText::from(theme::section(&format!("{title} · {n}"))).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            w - 20.0,
+            egui::TextStyle::Body,
+        );
+        let pos = egui::pos2(rect.left() + 20.0, rect.center().y - text.size().y / 2.0);
+        ui.painter().galley(pos, text, theme::MUTED);
+
+        if self.s.open[k] {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(w, self.s.heights[k]), egui::Sense::hover());
+            let mut body = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("sidebar_section", k))
+                    .max_rect(rect),
+            );
+            body.spacing_mut().item_spacing = self.spacing;
+            egui::ScrollArea::vertical()
+                .id_salt(("sidebar_section", title))
+                .auto_shrink([false, false])
+                .show(&mut body, add);
+        }
+        if k + 1 < SECTIONS {
+            self.divider(ui, k);
+        }
+    }
+
+    /// The divider below section `k`; it drags only with an open section on each side.
+    fn divider(&mut self, ui: &mut egui::Ui, k: usize) {
+        let w = ui.available_width();
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(w, HANDLE_H), egui::Sense::drag());
+        let open = self.s.open;
+        let live = open[..=k].contains(&true) && open[k + 1..].contains(&true);
+        let hot = live && (r.hovered() || r.dragged());
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if live && r.dragged() {
+            drag(&mut self.s.heights, &open, k, r.drag_delta().y, self.min);
+        }
+        let color = if hot { theme::ACCENT } else { theme::BORDER };
+        ui.painter().hline(
+            rect.x_range(),
+            rect.center().y,
+            egui::Stroke::new(1.0, color),
+        );
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) {
@@ -223,9 +448,22 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .desired_width(f32::INFINITY),
     );
     ui.add_space(4.0);
-    let tab = &*tab;
-    let q = tab.filter.as_str();
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    let spacing = ui.spacing().item_spacing;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let fixed = SECTIONS as f32 * HEADER_H + (SECTIONS - 1) as f32 * HANDLE_H;
+    let space = (ui.available_height() - fixed).max(0.0);
+    let min = MIN_BODY;
+    let mut s = tab.sections;
+    s.fit(space, min);
+    let mut split = Split {
+        s,
+        toggled: None,
+        spacing,
+        min,
+    };
+    {
+        let tab = &*tab;
+        let q = tab.filter.as_str();
         let local: Vec<_> = tab
             .branches
             .iter()
@@ -248,7 +486,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             current,
             checked_out: &checked_out,
         };
-        section(ui, "local", "Local", local.len(), true, |ui| {
+        split.section(ui, 0, "Local", local.len(), |ui| {
             let nodes = branch_tree(&local);
             tree(ui, "local", &nodes, filtering, cx, actions);
         });
@@ -257,7 +495,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
             .iter()
             .filter(|b| b.remote && filter_matches(q, &b.name))
             .collect();
-        section(ui, "remote", "Remote", remote.len(), true, |ui| {
+        split.section(ui, 1, "Remote", remote.len(), |ui| {
             // `origin/feat/x`: the remote is the first folder level.
             let nodes = branch_tree(&remote);
             tree(ui, "remote", &nodes, filtering, cx, actions);
@@ -270,7 +508,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                     || w.branch.as_deref().is_some_and(|b| filter_matches(q, b))
             })
             .collect();
-        section(ui, "worktrees", "Worktrees", worktrees.len(), true, |ui| {
+        split.section(ui, 2, "Worktrees", worktrees.len(), |ui| {
             for wt in worktrees {
                 let (text, tag) = worktree_label(wt);
                 let on = wt.path == tab.active_worktree;
@@ -306,7 +544,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
-        section(ui, "stashes", "Stashes", tab.stashes.len(), true, |ui| {
+        split.section(ui, 3, "Stashes", tab.stashes.len(), |ui| {
             for st in &tab.stashes {
                 let r = row(
                     ui,
@@ -334,18 +572,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, actions: &mut Vec<Action>) 
                 });
             }
         });
-        // Last: a long tag list shouldn't push worktrees and stashes out of view.
         let tags: Vec<_> = tab
             .tags
             .iter()
             .filter(|t| filter_matches(q, &t.name))
             .collect();
-        section(ui, "tags", "Tags", tags.len(), true, |ui| {
+        split.section(ui, 4, "Tags", tags.len(), |ui| {
             for t in tags {
                 tag_row(ui, t, actions);
             }
         });
-    });
+    }
+    if let Some(k) = split.toggled {
+        split.s.toggle(k, space, min);
+    }
+    tab.sections = split.s;
 }
 
 /// "v1.0 · Annotated tag at 1a2b3c4", or "· Tag at …" for a lightweight one.
@@ -617,6 +858,138 @@ mod tests {
         assert_eq!(path, "feat");
         assert!(matches!(&children[0], Node::Folder { path, .. } if path == "feat/ui"));
         assert_eq!(count(&nodes), 6);
+    }
+
+    #[test]
+    fn branches_start_open_and_the_rest_closed() {
+        let mut s = Sections::default();
+        assert_eq!(s.open, [true, true, false, false, false]);
+        s.fit(500.0, 40.0);
+        assert_eq!(s.heights, [300.0, 200.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn fit_changes_only_the_bottom_until_it_hits_the_minimum() {
+        let mut s = Sections {
+            open: [true, false, true, false, true],
+            heights: [100.0, 50.0, 100.0, 0.0, 100.0],
+        };
+        s.fit(400.0, 40.0);
+        assert_eq!(s.heights, [100.0, 50.0, 100.0, 0.0, 200.0]);
+        s.fit(200.0, 40.0);
+        assert_eq!(s.heights, [100.0, 50.0, 60.0, 0.0, 40.0]);
+        // No room for every minimum: an equal share each.
+        s.fit(90.0, 40.0);
+        assert_eq!(s.heights, [30.0, 50.0, 30.0, 0.0, 30.0]);
+    }
+
+    #[test]
+    fn closing_folds_toward_the_nearer_end() {
+        let mut s = Sections {
+            open: [true, true, true, false, true],
+            heights: [100.0, 100.0, 300.0, 0.0, 100.0],
+        };
+        // Remote is near the top: it folds up, and Worktrees below grows into its space.
+        s.toggle(1, 600.0, 40.0);
+        assert_eq!(s.open, [true, false, true, false, true]);
+        assert_eq!(
+            s.heights,
+            [100.0, 100.0, 400.0, 0.0, 100.0],
+            "Local stays put"
+        );
+        // Tags is near the bottom: it folds down, and Worktrees above grows.
+        s.toggle(4, 600.0, 40.0);
+        assert_eq!(s.heights, [100.0, 100.0, 500.0, 0.0, 100.0]);
+        // The bottom edge never moves: what's open still fills the sidebar.
+        assert_eq!(s.heights[0] + s.heights[2], 600.0);
+    }
+
+    #[test]
+    fn opening_takes_from_the_side_it_opens_toward() {
+        // Remote, near the top, opens downward: Worktrees gives first.
+        let mut s = Sections {
+            open: [true, false, true, false, true],
+            heights: [100.0, 80.0, 200.0, 0.0, 100.0],
+        };
+        s.toggle(1, 400.0, 40.0);
+        assert_eq!(s.heights, [100.0, 80.0, 120.0, 0.0, 100.0]);
+        // Stashes, near the bottom, opens upward: Worktrees above gives first.
+        let mut s = Sections {
+            open: [true, false, true, false, true],
+            heights: [100.0, 0.0, 200.0, 60.0, 100.0],
+        };
+        s.toggle(3, 400.0, 40.0);
+        assert_eq!(s.heights, [100.0, 0.0, 140.0, 60.0, 100.0]);
+        // Below a tall Local, Remote counts as nearer the bottom: Local gives.
+        let mut s = Sections {
+            open: [true, false, true, false, false],
+            heights: [200.0, 150.0, 100.0, 0.0, 0.0],
+        };
+        s.toggle(1, 300.0, 40.0);
+        assert_eq!(s.heights, [50.0, 150.0, 100.0, 0.0, 0.0]);
+        // More than that side can spare: the rest comes from the other.
+        // Worktrees gives down to 40, then Local; Remote gets what they could spare.
+        let mut s = Sections {
+            open: [true, false, true, false, false],
+            heights: [60.0, 150.0, 100.0, 0.0, 0.0],
+        };
+        s.toggle(1, 160.0, 40.0);
+        assert_eq!(s.heights, [40.0, 80.0, 40.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn opening_never_squashes_others_below_the_minimum() {
+        // Never opened: it asks for an equal share; the others only give down to 40.
+        let mut s = Sections {
+            open: [true, true, false, false, false],
+            heights: [60.0, 60.0, 0.0, 0.0, 0.0],
+        };
+        s.toggle(2, 120.0, 40.0);
+        assert_eq!(s.heights, [40.0, 40.0, 40.0, 0.0, 0.0]);
+        // Alone, it takes everything.
+        let mut s = Sections {
+            open: [false; SECTIONS],
+            heights: [0.0; SECTIONS],
+        };
+        s.toggle(3, 300.0, 40.0);
+        assert_eq!(s.heights[3], 300.0);
+    }
+
+    #[test]
+    fn dragging_down_grows_above_and_shrinks_below_in_turn() {
+        let open = [true; SECTIONS];
+        let mut h = [100.0, 100.0, 100.0, 100.0, 100.0];
+        drag(&mut h, &open, 1, 30.0, 40.0);
+        assert_eq!(h, [100.0, 130.0, 70.0, 100.0, 100.0]);
+        // Past the next section's minimum, the one after it gives way too.
+        drag(&mut h, &open, 1, 50.0, 40.0);
+        assert_eq!(h, [100.0, 180.0, 40.0, 80.0, 100.0]);
+        // All below at the minimum: it stops, and the total never changes.
+        drag(&mut h, &open, 1, 1000.0, 40.0);
+        assert_eq!(h, [100.0, 280.0, 40.0, 40.0, 40.0]);
+        assert_eq!(h.iter().sum::<f32>(), 500.0);
+    }
+
+    #[test]
+    fn dragging_up_shrinks_above_nearest_first() {
+        let open = [true; SECTIONS];
+        let mut h = [100.0, 60.0, 100.0, 100.0, 100.0];
+        drag(&mut h, &open, 1, -50.0, 40.0);
+        assert_eq!(h, [70.0, 40.0, 150.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn dragging_skips_closed_sections() {
+        let open = [true, false, true, false, true];
+        let mut h = [100.0, 0.0, 100.0, 0.0, 100.0];
+        // The divider under closed Remote moves Local and Worktrees.
+        drag(&mut h, &open, 1, 20.0, 40.0);
+        assert_eq!(h, [120.0, 0.0, 80.0, 0.0, 100.0]);
+        // With nothing open below, there is nothing to move.
+        let open = [true, false, false, false, false];
+        let mut h = [300.0, 0.0, 0.0, 0.0, 0.0];
+        drag(&mut h, &open, 0, 20.0, 40.0);
+        assert_eq!(h, [300.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
