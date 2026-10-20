@@ -251,12 +251,15 @@ impl ProjectTab {
             Ok(w) => self.worktrees = w.into_iter().filter(|w| !w.is_bare).collect(),
             Err(e) => errors.push(format!("worktrees: {e:#}")),
         }
+        // Not listed, or its folder is gone (moved while Spinney ran): use the first that's
+        // there, or every git call below fails.
+        let here = |w: &Worktree| !w.prunable && w.path.is_dir();
         if !self
             .worktrees
             .iter()
-            .any(|w| w.path == self.active_worktree)
+            .any(|w| w.path == self.active_worktree && here(w))
         {
-            if let Some(w) = self.worktrees.first() {
+            if let Some(w) = self.worktrees.iter().find(|w| here(w)) {
                 self.active_worktree = w.path.clone();
             }
         }
@@ -1351,8 +1354,14 @@ impl SpinneyApp {
                 self.confirm_op = None;
                 self.confirm_resolve = None;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if !path.is_dir() {
+                        errors.push(format!(
+                            "{} is missing: locate or remove it",
+                            path.display()
+                        ));
+                    }
                     tab.active_worktree = path;
-                    tab.refresh(&ctx, &mut errors);
+                    tab.refresh(&ctx, &mut errors); // falls back if it's missing
                 }
             }
             Action::AskRemoveWithBranch(path) => {
@@ -2541,6 +2550,28 @@ mod tests {
         assert!(app.config.spaces[0].projects.contains(&root));
         app.apply(Action::OpenProject(root.clone()));
         assert_eq!(app.tabs.len(), 1, "same tab");
+    }
+
+    #[test]
+    fn a_worktree_gone_while_open_falls_back_to_one_that_is_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = repo(1);
+        let root = proj.path().canonicalize().unwrap();
+        let wt = tmp.path().canonicalize().unwrap().join("wt");
+        let wt_str = wt.to_str().unwrap();
+        crate::git::run(&root, &["worktree", "add", "-q", "-b", "a", wt_str]).unwrap();
+        let mut app = test_app(cfg(), &tmp.path().join("config.toml"));
+        app.apply(Action::OpenProject(root.clone()));
+        std::fs::rename(&wt, tmp.path().join("moved")).unwrap();
+        app.errors.clear();
+        app.apply(Action::ActivateWorktree(wt.clone()));
+        assert_eq!(app.tabs[0].active_worktree, root);
+        assert_eq!(app.errors.len(), 1, "{:?}", app.errors);
+        assert!(app.errors[0].contains("is missing"));
+        assert!(app.tabs[0]
+            .worktrees
+            .iter()
+            .any(|w| w.path == wt && w.prunable));
     }
 
     #[test]

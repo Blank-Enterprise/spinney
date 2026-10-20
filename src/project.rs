@@ -201,14 +201,25 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// Relink worktrees that moved, or whose project moved: every listed worktree folder that
-/// still exists (git still knows where they are) plus every folder in `worktrees_dir` (finds
-/// ones renamed there). `git worktree repair` leaves healthy links alone.
+/// still exists (git still knows where they are), every folder in `worktrees_dir` (finds
+/// ones renamed there), and where a missing one would be if it moved along with the project
+/// (`.claude/worktrees/…` inside it, `proj.x` beside it). `git worktree repair` relinks each
+/// folder to the worktree its own `.git` file names and leaves healthy links alone, so an
+/// unrelated candidate is harmless.
 pub fn repair(root: &Path) -> Result<()> {
-    let mut paths: Vec<PathBuf> = list_worktrees(root)?
+    let listed: Vec<PathBuf> = list_worktrees(root)?
         .into_iter()
-        .filter(|w| !w.is_bare && w.path.is_dir())
+        .filter(|w| !w.is_bare)
         .map(|w| w.path)
         .collect();
+    let mut paths: Vec<PathBuf> = listed.iter().filter(|p| p.is_dir()).cloned().collect();
+    for missing in listed.iter().filter(|p| !p.is_dir()) {
+        for found in moved_with(root, missing) {
+            if !paths.contains(&found) {
+                paths.push(found);
+            }
+        }
+    }
     let dir = worktrees_dir(root);
     if dir != root {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -221,6 +232,19 @@ pub fn repair(root: &Path) -> Result<()> {
         }
     }
     relink(root, &paths)
+}
+
+/// Worktree folders that could be `missing` after its project moved to `root`: the same path
+/// below any of its ancestors, re-based onto `root` or onto `root`'s parent.
+fn moved_with(root: &Path, missing: &Path) -> Vec<PathBuf> {
+    let bases = [Some(root), root.parent()];
+    missing
+        .ancestors()
+        .skip(1)
+        .filter_map(|a| missing.strip_prefix(a).ok())
+        .flat_map(|rel| bases.iter().flatten().map(move |b| b.join(rel)))
+        .filter(|p| p.join(".git").is_file())
+        .collect()
 }
 
 /// `git worktree repair` for `paths`, e.g. a missing worktree's new location.
@@ -466,14 +490,29 @@ mod tests {
 
     #[test]
     fn repair_after_the_project_folder_moves() {
-        let (_tmp, root) = normal();
+        let (tmp, root) = normal();
         let p = add_worktree(&root, "feature/new", "main").unwrap();
+        // Claude Code's, inside the project: it moves along with it.
+        let nested = root.join(".claude/worktrees/agent-1");
+        external(&root, &nested, &["-b", "agent-1"]);
         let moved = root.with_file_name("moved");
         std::fs::rename(&root, &moved).unwrap();
         assert!(git::run(&p, &["status"]).is_err(), "link broken");
         repair(&moved).unwrap();
         git::run(&p, &["status"]).unwrap();
         assert!(same_dir(&project_root(&p).unwrap(), &moved));
+        let nested = moved.join(".claude/worktrees/agent-1");
+        git::run(&nested, &["status"]).unwrap();
+        assert!(!listed(&moved, &nested).prunable);
+
+        // The whole folder holding the project and its sibling worktrees moves.
+        let away = tmp.path().join("away");
+        std::fs::rename(moved.parent().unwrap(), &away).unwrap();
+        let moved = away.join("moved");
+        repair(&moved).unwrap();
+        let sibling = away.join("proj.worktrees/feature-new");
+        git::run(&sibling, &["status"]).unwrap();
+        git::run(&moved.join(".claude/worktrees/agent-1"), &["status"]).unwrap();
     }
 
     #[test]
