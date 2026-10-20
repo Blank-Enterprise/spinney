@@ -39,7 +39,12 @@ pub fn amend(worktree: &Path, message: &str) -> Result<()> {
 
 /// The full message of HEAD, without git's trailing newline.
 pub fn head_message(worktree: &Path) -> Result<String> {
-    let out = git::run(worktree, &["log", "-1", "--format=%B", "HEAD"])?;
+    commit_message(worktree, "HEAD")
+}
+
+/// The full message of commit `rev`, without git's trailing newline.
+pub fn commit_message(worktree: &Path, rev: &str) -> Result<String> {
+    let out = git::run(worktree, &["log", "-1", "--format=%B", rev, "--"])?;
     Ok(out.trim_end().to_string())
 }
 
@@ -621,6 +626,24 @@ pub fn create_branch(worktree: &Path, name: &str, base: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create `name` at `base` and switch to it. Moving to another commit refuses over
+/// uncommitted changes, as `checkout_detached` does; from HEAD itself they come along.
+pub fn create_and_switch(worktree: &Path, name: &str, base: &str) -> Result<()> {
+    if rev_parse(worktree, &format!("{base}^{{commit}}"))? != rev_parse(worktree, "HEAD")? {
+        ensure_clean(worktree)?;
+    }
+    git::run(worktree, &["switch", "-c", name, base])?;
+    Ok(())
+}
+
+/// Check out commit `sha` with a detached HEAD, refusing over uncommitted changes or an
+/// operation in progress (git would carry the changes along, mixing them into another base).
+pub fn checkout_detached(worktree: &Path, sha: &str) -> Result<()> {
+    ensure_clean(worktree)?;
+    git::run(worktree, &["switch", "--detach", sha])?;
+    Ok(())
+}
+
 /// Fails when any worktree of the project (not just `dir`'s) has `branch` checked out.
 pub fn ensure_not_checked_out(dir: &Path, branch: &str) -> Result<()> {
     if let Some(w) = list_worktrees(dir)?
@@ -1193,6 +1216,73 @@ mod tests {
         let (_tmp, _root, main) = cloned();
         create_branch(&main, "new", "main").unwrap();
         git::run(&main, &["rev-parse", "--verify", "new"]).unwrap();
+    }
+
+    #[test]
+    fn create_branch_at_commit() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        let sha = head(&main, "HEAD~1");
+        create_branch(&main, "at-init", &sha).unwrap();
+        assert_eq!(head(&main, "at-init"), sha);
+        assert_eq!(
+            refs::current_branch(&main).unwrap().as_deref(),
+            Some("main"),
+            "not switched"
+        );
+    }
+
+    #[test]
+    fn create_and_switch_carries_changes_only_from_head() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        std::fs::write(main.join("a.txt"), "changed\n").unwrap();
+        let init = head(&main, "HEAD~1");
+        let err = create_and_switch(&main, "old", &init).unwrap_err();
+        assert!(err.to_string().contains("Commit or stash"), "{err}");
+        assert!(git::run(&main, &["rev-parse", "--verify", "-q", "old"]).is_err());
+        create_and_switch(&main, "here", "main").unwrap();
+        assert_eq!(
+            refs::current_branch(&main).unwrap().as_deref(),
+            Some("here")
+        );
+        assert_eq!(
+            std::fs::read_to_string(main.join("a.txt")).unwrap(),
+            "changed\n"
+        );
+        g(&main, &["checkout", "--", "a.txt"]);
+        create_and_switch(&main, "old", &init).unwrap();
+        assert_eq!(head(&main, "HEAD"), init);
+    }
+
+    #[test]
+    fn checkout_detached_at_commit() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        let sha = head(&main, "HEAD~1");
+        std::fs::write(main.join("a.txt"), "changed\n").unwrap();
+        let err = checkout_detached(&main, &sha).unwrap_err();
+        assert!(err.to_string().contains("Commit or stash"), "{err}");
+        assert_eq!(
+            refs::current_branch(&main).unwrap().as_deref(),
+            Some("main")
+        );
+        g(&main, &["checkout", "--", "a.txt"]);
+        checkout_detached(&main, &sha).unwrap();
+        assert_eq!(head(&main, "HEAD"), sha);
+        assert_eq!(refs::current_branch(&main).unwrap(), None, "detached");
+        assert!(!main.join("c.txt").exists());
+    }
+
+    #[test]
+    fn commit_message_of_any_commit() {
+        let (_tmp, _root, main) = cloned();
+        let sha = head(&main, "HEAD");
+        std::fs::write(main.join("c.txt"), "c\n").unwrap();
+        g(&main, &["add", "c.txt"]);
+        commit(&main, "second\n\nwhy").unwrap();
+        assert_eq!(commit_message(&main, &sha).unwrap(), "init");
+        assert_eq!(commit_message(&main, "HEAD").unwrap(), "second\n\nwhy");
     }
 
     #[test]
