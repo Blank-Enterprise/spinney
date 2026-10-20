@@ -357,10 +357,42 @@ pub fn cherry_pick(worktree: &Path, shas: &[String]) -> Result<MergeOutcome> {
     Ok(MergeOutcome::Done)
 }
 
+/// `git revert --no-edit` of `sha` on the current branch. A merge commit needs `mainline`,
+/// the parent (1-based) whose side is kept. Conflicts are left to resolve, as for merge.
+pub fn revert(worktree: &Path, sha: &str, mainline: Option<usize>) -> Result<MergeOutcome> {
+    if refs::current_branch(worktree)?.is_none() {
+        bail!("Check out a branch first");
+    }
+    ensure_clean(worktree)?;
+    let parents = parent_count(worktree, sha)?;
+    let m = match (parents > 1, mainline) {
+        (true, Some(m)) if (1..=parents).contains(&m) => Some(m.to_string()),
+        (true, Some(m)) => bail!("A merge commit with {parents} parents has no parent {m}"),
+        (true, None) => bail!("Choose which parent of the merge to keep"),
+        (false, Some(_)) => bail!("Only a merge commit takes a mainline parent"),
+        (false, None) => None,
+    };
+    let before = rev_parse(worktree, "HEAD")?;
+    let mut args = vec!["revert", "--no-edit"];
+    if let Some(m) = &m {
+        args.extend(["-m", m]);
+    }
+    args.push(sha);
+    if let Err(e) = git::run(worktree, &args) {
+        return stopped(worktree, e, false, &before);
+    }
+    Ok(MergeOutcome::Done)
+}
+
+/// The parents of commit `rev`, in order.
+pub fn parents(worktree: &Path, rev: &str) -> Result<Vec<String>> {
+    let out = git::run(worktree, &["rev-list", "--parents", "-n", "1", rev, "--"])?;
+    Ok(out.split_whitespace().skip(1).map(String::from).collect())
+}
+
 /// Number of parents of commit `rev`.
 fn parent_count(worktree: &Path, rev: &str) -> Result<usize> {
-    let out = git::run(worktree, &["rev-list", "--parents", "-n", "1", rev, "--"])?;
-    Ok(out.split_whitespace().count().saturating_sub(1))
+    Ok(parents(worktree, rev)?.len())
 }
 
 /// Anything staged (`diff --cached --quiet` exits 1 when there is).
@@ -1987,6 +2019,58 @@ mod tests {
         g(&main, &["checkout", "-q", "--detach"]);
         let err = cherry_pick(&main, &[x]).unwrap_err();
         assert!(err.to_string().contains("Check out a branch"), "{err}");
+    }
+
+    #[test]
+    fn revert_a_normal_commit() {
+        let (_tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        let c = head(&main, "HEAD");
+        assert_eq!(revert(&main, &c, None).unwrap(), MergeOutcome::Done);
+        assert!(!main.join("c.txt").exists());
+        assert_eq!(head(&main, "HEAD~1"), c);
+        assert!(head_message(&main)
+            .unwrap()
+            .starts_with("Revert \"add file\""));
+        let err = revert(&main, &c, Some(1)).unwrap_err();
+        assert!(err.to_string().contains("Only a merge commit"), "{err}");
+    }
+
+    #[test]
+    fn revert_a_merge_keeping_the_first_parent() {
+        let (_tmp, _root, main) = cloned();
+        let before = head(&main, "HEAD");
+        g(
+            &main,
+            &["merge", "-q", "--no-ff", "--no-edit", "origin/feature/x"],
+        );
+        let m = head(&main, "HEAD");
+        assert_eq!(
+            parents(&main, &m).unwrap(),
+            [before, head(&main, "origin/feature/x")]
+        );
+        let err = revert(&main, &m, None).unwrap_err();
+        assert!(err.to_string().contains("Choose which parent"), "{err}");
+        assert!(revert(&main, &m, Some(3)).is_err());
+        assert_eq!(revert(&main, &m, Some(1)).unwrap(), MergeOutcome::Done);
+        assert!(!main.join("b.txt").exists(), "feature/x's change undone");
+        assert!(main.join("a.txt").exists());
+        assert_eq!(head(&main, "HEAD~1"), m);
+    }
+
+    #[test]
+    fn conflicting_revert_is_left_in_progress() {
+        let (_tmp, _root, main) = cloned();
+        std::fs::write(main.join("a.txt"), "one\n").unwrap();
+        g(&main, &["commit", "-qam", "one"]);
+        let one = head(&main, "HEAD");
+        std::fs::write(main.join("a.txt"), "two\n").unwrap();
+        g(&main, &["commit", "-qam", "two"]);
+        let out = revert(&main, &one, None).unwrap();
+        assert_eq!(out, MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(in_progress(&main).unwrap(), Some(Operation::Revert));
+        abort_op(&main, Operation::Revert).unwrap();
+        assert_eq!(head_message(&main).unwrap(), "two");
     }
 
     /// HEAD, branch and `status` (untracked files included) before an operation.

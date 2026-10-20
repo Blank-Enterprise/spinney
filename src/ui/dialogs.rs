@@ -394,6 +394,23 @@ pub(super) struct Dialogs {
     pub(super) drop_menu: Option<super::branch_drop::DropMenu>,
     pub(super) leave_detached: Option<LeaveDetached>,
     pub(super) reset: Option<ResetDialog>,
+    pub(super) revert: Option<RevertDialog>,
+}
+
+/// Revert merge commit `sha` in `worktree`, keeping the side of parent `mainline`.
+pub(super) struct RevertDialog {
+    pub(super) root: PathBuf,
+    pub(super) worktree: PathBuf,
+    pub(super) sha: String,
+    /// Each parent's SHA and subject, in order.
+    pub(super) parents: Vec<(String, String)>,
+    /// 1-based, as `git revert -m` takes it.
+    pub(super) mainline: usize,
+}
+
+/// A merge parent's radio label: "Parent 1: 1a2b3c4d main edit".
+pub(super) fn parent_label(n: usize, sha: &str, subject: &str) -> String {
+    format!("Parent {n}: {} {subject}", &sha[..sha.len().min(8)])
 }
 
 /// Reset the branch checked out in `worktree` as `plan` describes, in `mode`.
@@ -506,6 +523,7 @@ impl Dialogs {
             || self.drop_menu.is_some()
             || self.leave_detached.is_some()
             || self.reset.is_some()
+            || self.revert.is_some()
     }
 }
 
@@ -835,6 +853,39 @@ impl SpinneyApp {
                 None => self.dialogs.merge = Some(d),
             }
         }
+        if let Some(mut d) = self.dialogs.revert.take() {
+            let mut result = None;
+            egui::Modal::new(egui::Id::unique("revert")).show(ctx, |ui| {
+                ui.label(format!("Revert merge {}", &d.sha[..d.sha.len().min(8)]));
+                ui.label(theme::caption(
+                    "Keep the side of one parent; the changes merged in from the other are \
+                     undone in a new commit.",
+                ));
+                ui.add_space(4.0);
+                for (k, (sha, subject)) in d.parents.iter().enumerate() {
+                    ui.radio_value(&mut d.mainline, k + 1, parent_label(k + 1, sha, subject));
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary("Revert")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => {
+                    let mut errors = vec![];
+                    let (root, wt) = (d.root.clone(), d.worktree.clone());
+                    self.revert(&root, &wt, &d.sha, Some(d.mainline), &mut errors);
+                    self.errors.extend(errors);
+                }
+                Some(false) => {}
+                None => self.dialogs.revert = Some(d),
+            }
+        }
         if let Some(d) = self.dialogs.reset.take() {
             let mut result = None;
             let (question, what, warnings) = reset_text(&d.plan, d.mode);
@@ -928,6 +979,66 @@ impl SpinneyApp {
                 Some(false) => {}
                 None => self.dialogs.rebase = Some(d),
             }
+        }
+    }
+
+    /// Revert `sha` at once, or for a merge commit ask which parent to keep first.
+    pub(super) fn ask_revert(&mut self, sha: String, errors: &mut Vec<String>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let (root, wt) = (tab.root.clone(), tab.active_worktree.clone());
+        let parents = match actions::parents(&wt, &sha) {
+            Ok(p) => p,
+            Err(e) => return errors.push(format!("{e:#}")),
+        };
+        if parents.len() < 2 {
+            return self.revert(&root, &wt, &sha, None, errors);
+        }
+        let parents = parents
+            .into_iter()
+            .map(|p| {
+                let subject = actions::commit_message(&wt, &p)
+                    .map(|m| m.lines().next().unwrap_or_default().to_string())
+                    .unwrap_or_default();
+                (p, subject)
+            })
+            .collect();
+        self.dialogs.revert = Some(RevertDialog {
+            root,
+            worktree: wt,
+            sha,
+            parents,
+            mainline: 1,
+        });
+    }
+
+    /// Revert synchronously, like merge; conflicts go to the in-progress banner.
+    fn revert(
+        &mut self,
+        root: &Path,
+        worktree: &Path,
+        sha: &str,
+        mainline: Option<usize>,
+        errors: &mut Vec<String>,
+    ) {
+        let ctx = self.ctx.clone();
+        // A pull or push may be moving the same branch (the toolbar disables it too).
+        if self.jobs.network_busy(root) {
+            return errors.push("Wait for the running fetch, pull or push".into());
+        }
+        let tab = self.tabs.iter_mut().find(|t| t.root == root);
+        let Some(tab) = tab.filter(|t| t.active_worktree == worktree) else {
+            return errors.push("The project or worktree changed; try again".into());
+        };
+        let res = actions::revert(worktree, sha, mainline);
+        tab.refresh(&ctx, errors);
+        match res {
+            Ok(MergeOutcome::Conflicts(files)) => {
+                self.notices.push(conflict_message("Revert", &files))
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!("{e:#}")),
         }
     }
 
@@ -2147,6 +2258,64 @@ mod tests {
             .notices
             .iter()
             .any(|n| n.starts_with("Cherry-pick stopped")));
+    }
+
+    #[test]
+    fn reverting_a_merge_asks_for_the_mainline_first() {
+        use super::super::Action;
+        use crate::actions::Operation;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap().trim().to_string();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        let init = g(&["rev-parse", "HEAD"]);
+        g(&["switch", "-q", "-c", "topic"]);
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "add b"]);
+        g(&["switch", "-q", "main"]);
+        g(&["merge", "-q", "--no-ff", "--no-edit", "topic"]);
+        let m = g(&["rev-parse", "HEAD"]);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        app.apply(Action::Revert(m.clone()));
+        let mut r = app.dialogs.revert.take().expect("asks for the mainline");
+        assert_eq!(r.parents.len(), 2);
+        assert_eq!(r.parents[0], (init.clone(), "init".to_string()));
+        assert_eq!(r.parents[1].1, "add b");
+        assert_eq!(g(&["rev-parse", "HEAD"]), m, "nothing yet");
+        r.mainline = 1;
+        let (root, wt) = (r.root.clone(), r.worktree.clone());
+        let mut errors = vec![];
+        app.revert(&root, &wt, &r.sha, Some(r.mainline), &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!d.join("b.txt").exists());
+
+        // A normal commit reverts at once; a conflicting one stops under the banner.
+        std::fs::write(d.join("a.txt"), "later\n").unwrap();
+        g(&["commit", "-qam", "later"]);
+        app.apply(Action::Revert(init));
+        assert!(app.dialogs.revert.is_none());
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(app.tabs[0].operation, Some(Operation::Revert));
+        assert!(app.notices.iter().any(|n| n.starts_with("Revert stopped")));
+    }
+
+    #[test]
+    fn parent_labels_shorten_the_sha() {
+        let sha = "83174b7246c76c9b6426a95147a715f0d26bf6c6";
+        assert_eq!(parent_label(2, sha, "add b"), "Parent 2: 83174b72 add b");
     }
 
     #[test]
