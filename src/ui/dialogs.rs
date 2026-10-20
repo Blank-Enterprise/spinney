@@ -634,6 +634,23 @@ pub(super) fn leave_question(lost: usize) -> String {
     )
 }
 
+/// The worktree Remove confirmation: what is lost for a dirty one, or for a missing one
+/// (moved, not deleted, it stops being a worktree where it is now).
+pub fn remove_question(path: &Path, missing: bool) -> String {
+    if missing {
+        format!(
+            "{} is missing. Remove it from the project? If it was moved, it stops being a \
+             worktree where it is now; use Locate… to keep it.",
+            path.display()
+        )
+    } else {
+        format!(
+            "{} has uncommitted changes. Remove it anyway?",
+            path.display()
+        )
+    }
+}
+
 /// A tag delete awaiting confirmation, bound to the tab and worktree it was asked in.
 pub(super) struct DeleteTagDialog {
     pub root: PathBuf,
@@ -892,10 +909,7 @@ impl SpinneyApp {
         if let Some(path) = self.dialogs.confirm_remove.take() {
             let mut result = None;
             egui::Modal::new(egui::Id::unique("confirm_remove")).show(ctx, |ui| {
-                ui.label(format!(
-                    "{} has uncommitted changes. Remove it anyway?",
-                    path.display()
-                ));
+                ui.label(remove_question(&path, !path.is_dir()));
                 ui.horizontal(|ui| {
                     if ui.add(danger("Remove")).clicked() {
                         result = Some(true);
