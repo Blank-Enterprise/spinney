@@ -670,8 +670,19 @@ pub fn git_pull_strategy(worktree: &Path) -> Result<PullStrategy> {
 /// banner. An error so it can come back from a background job, like `PushRejected`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PullConflicts {
+    pub worktree: PathBuf,
     pub strategy: PullStrategy,
     pub files: Vec<String>,
+}
+
+impl PullConflicts {
+    /// The operation left stopped: a rebase pull's rebase, or else a merge.
+    pub fn operation(&self) -> Operation {
+        match self.strategy {
+            PullStrategy::Rebase => Operation::Rebase,
+            _ => Operation::Merge,
+        }
+    }
 }
 
 impl std::fmt::Display for PullConflicts {

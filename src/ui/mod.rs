@@ -747,6 +747,36 @@ pub enum Action {
     TagAt(String),
 }
 
+/// A notice about the operation stopped in `worktree`, shown under its banner.
+struct StoppedNotice {
+    worktree: PathBuf,
+    op: Operation,
+    text: String,
+}
+
+/// Show `text` for the `op` stopped in `worktree`, in place of that worktree's earlier
+/// one: a rebase stopping again on its next commit replaces the last commit's notice.
+fn note_stopped(notices: &mut Vec<StoppedNotice>, worktree: &Path, op: Operation, text: String) {
+    notices.retain(|n| n.worktree != worktree);
+    notices.push(StoppedNotice {
+        worktree: worktree.to_path_buf(),
+        op,
+        text,
+    });
+}
+
+/// Drop the notices whose operation has ended, however it ended (continued, skipped past,
+/// aborted, or finished outside Spinney). `shown` is each tab's worktree and the operation
+/// in progress there; a worktree no tab shows keeps its notice, since nothing has looked.
+fn prune_stopped(notices: &mut Vec<StoppedNotice>, shown: &[(&Path, Option<Operation>)]) {
+    notices.retain(|n| {
+        shown
+            .iter()
+            .filter(|(wt, _)| *wt == n.worktree)
+            .all(|(_, op)| *op == Some(n.op))
+    });
+}
+
 pub struct SpinneyApp {
     config: Config,
     /// None when the config file failed to load, so a broken file is never overwritten.
@@ -757,6 +787,8 @@ pub struct SpinneyApp {
     errors: Vec<String>,
     /// Non-error banner messages.
     notices: Vec<String>,
+    /// "… stopped on conflicts" notices, at most one per worktree, until that operation ends.
+    stopped: Vec<StoppedNotice>,
     dialogs: Dialogs,
     /// The New Tab page is showing over the open tabs (it always shows when there are none).
     new_tab: bool,
@@ -804,6 +836,7 @@ impl SpinneyApp {
             jobs: Jobs::new(ctx.clone()),
             errors,
             notices: vec![],
+            stopped: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
@@ -879,9 +912,8 @@ impl SpinneyApp {
                 Ok(c) => {
                     self.refresh_tab(&root);
                     let what = format!("Pull ({})", c.strategy.label().to_lowercase());
-                    return self
-                        .notices
-                        .push(dialogs::conflict_message(&what, &c.files));
+                    let text = dialogs::conflict_message(&what, &c.files);
+                    return note_stopped(&mut self.stopped, &c.worktree, c.operation(), text);
                 }
                 Err(e) => e,
             };
@@ -988,9 +1020,12 @@ impl SpinneyApp {
             root,
             String::new(),
             move || match actions::pull(&wt, strategy)? {
-                MergeOutcome::Conflicts(files) => {
-                    Err(actions::PullConflicts { strategy, files }.into())
+                MergeOutcome::Conflicts(files) => Err(actions::PullConflicts {
+                    worktree: wt,
+                    strategy,
+                    files,
                 }
+                .into()),
                 _ => Ok(()),
             },
         );
@@ -1443,6 +1478,17 @@ impl SpinneyApp {
             }
         }
         self.errors.extend(errors);
+        self.prune_stopped();
+    }
+
+    /// Drop the stopped-on-conflicts notices of operations the tabs no longer show.
+    fn prune_stopped(&mut self) {
+        let shown: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|t| (t.active_worktree.as_path(), t.operation))
+            .collect();
+        prune_stopped(&mut self.stopped, &shown);
     }
 
     /// Fast-forward `branch` to `to`, or to its upstream when `to` is None.
@@ -1617,9 +1663,10 @@ impl SpinneyApp {
         };
         tab.refresh(&ctx, errors);
         match res {
-            Ok(MergeOutcome::Conflicts(files)) => self
-                .notices
-                .push(dialogs::conflict_message(&in_progress::title(op), &files)),
+            Ok(MergeOutcome::Conflicts(files)) => {
+                let text = dialogs::conflict_message(&in_progress::title(op), &files);
+                note_stopped(&mut self.stopped, worktree, op, text)
+            }
             Ok(_) => {}
             Err(e) => errors.push(format!("{op}: {e:#}")),
         }
@@ -1778,6 +1825,18 @@ impl SpinneyApp {
         }
         if let Some(i) = dismiss {
             self.errors.remove(i);
+        }
+        let mut dismiss = None;
+        for (i, n) in self.stopped.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::ACCENT_TEXT, &n.text);
+                if ui.small_button("Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
+        if let Some(i) = dismiss {
+            self.stopped.remove(i);
         }
         let mut dismiss = None;
         for (i, n) in self.notices.iter().enumerate() {
@@ -2096,6 +2155,8 @@ impl eframe::App for SpinneyApp {
             }
         }
         self.focused = focused;
+        // A refresh or a finished job may have seen an operation end.
+        self.prune_stopped();
         let mut actions = vec![];
         let strip = egui::Frame::new().fill(theme::TABS).inner_margin(Margin {
             left: 10,
@@ -2195,7 +2256,7 @@ impl eframe::App for SpinneyApp {
                 .frame(bar)
                 .show(ui, |ui| Self::push_bar(ui, r, busy, pull, &mut actions));
         }
-        if !self.errors.is_empty() || !self.notices.is_empty() {
+        if !self.errors.is_empty() || !self.notices.is_empty() || !self.stopped.is_empty() {
             egui::Panel::top("errors").show(ui, |ui| self.error_banner(ui));
         }
         let shortcuts = !self.dialogs.any_open();
@@ -2502,6 +2563,37 @@ mod tests {
         assert!(needs_commit_graph(&got));
     }
 
+    fn texts(n: &[StoppedNotice]) -> Vec<&str> {
+        n.iter().map(|n| n.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_worktree_shows_only_its_latest_stop() {
+        let (a, b) = (Path::new("/p/proj"), Path::new("/p/proj.worktrees/x"));
+        let mut n = vec![];
+        note_stopped(&mut n, a, Operation::Rebase, "chapter1".into());
+        note_stopped(&mut n, b, Operation::Merge, "other".into());
+        note_stopped(&mut n, a, Operation::Rebase, "chapter2".into());
+        assert_eq!(texts(&n), ["other", "chapter2"]);
+    }
+
+    #[test]
+    fn ending_the_operation_clears_its_notice() {
+        let (a, b) = (Path::new("/p/proj"), Path::new("/p/proj.worktrees/x"));
+        let mut n = vec![];
+        note_stopped(&mut n, a, Operation::Merge, "merge".into());
+        note_stopped(&mut n, b, Operation::Rebase, "rebase".into());
+
+        // Still stopped, or in no tab: kept.
+        prune_stopped(&mut n, &[(a, Some(Operation::Merge))]);
+        assert_eq!(texts(&n), ["merge", "rebase"]);
+        // Continued, skipped past or aborted: gone, as is one replaced by another kind.
+        prune_stopped(&mut n, &[(a, None), (b, Some(Operation::Rebase))]);
+        assert_eq!(texts(&n), ["rebase"]);
+        prune_stopped(&mut n, &[(b, Some(Operation::CherryPick))]);
+        assert!(n.is_empty());
+    }
+
     pub(super) fn test_app(config: Config, cfg_path: &Path) -> SpinneyApp {
         let ctx = egui::Context::default();
         SpinneyApp {
@@ -2512,6 +2604,7 @@ mod tests {
             jobs: Jobs::new(ctx.clone()),
             errors: vec![],
             notices: vec![],
+            stopped: vec![],
             dialogs: Dialogs::default(),
             new_tab: false,
             recent_search: String::new(),
