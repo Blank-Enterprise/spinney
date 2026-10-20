@@ -2,7 +2,7 @@
 //! convert, merge and rebase.
 
 use super::{
-    actions, add_project, checkout, graph_view, paths, project, repo_name_from_url, spaces, theme,
+    actions, add_project, graph_view, paths, project, repo_name_from_url, spaces, theme,
     toolbar::folder_name, visible_projects, JobKind, ProjectTab, SpinneyApp,
 };
 use crate::actions::{MergeMode, MergeOutcome};
@@ -228,8 +228,28 @@ fn github_label(host: &str) -> String {
 pub(super) struct NewWorktreeDialog {
     pub(super) base: String,
     pub(super) branch: String,
-    /// Create a worktree for the branch; otherwise create it and switch to it (normal clone).
-    pub(super) worktree: bool,
+    pub(super) mode: BranchMode,
+}
+
+/// What the new-branch dialog does with the branch it creates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum BranchMode {
+    /// Create a worktree for it (worktree layout).
+    Worktree,
+    /// Create it and switch to it (normal clone).
+    Switch,
+    /// Only create it (a commit's "Create branch here…" in the worktree layout).
+    Create,
+}
+
+/// The dialog's name for `base`: a full commit hash is shortened, a branch name kept.
+pub(super) fn base_label(base: &str) -> &str {
+    let full = base.len() == 40 && base.bytes().all(|b| b.is_ascii_hexdigit());
+    if full {
+        &base[..8]
+    } else {
+        base
+    }
 }
 
 /// Confirm deleting a local branch; asked again with `not_merged` when `-d` refuses.
@@ -479,16 +499,18 @@ impl SpinneyApp {
         }
         if let Some(mut d) = self.dialogs.new_worktree.take() {
             let mut result = None;
-            let title = if d.worktree {
-                "New worktree"
-            } else {
-                "New branch"
+            let title = match d.mode {
+                BranchMode::Worktree => "New worktree",
+                BranchMode::Switch | BranchMode::Create => "New branch",
             };
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(theme::caption(&format!("New branch from {}", d.base)));
+                    ui.label(theme::caption(&format!(
+                        "New branch from {}",
+                        base_label(&d.base)
+                    )));
                     ui.text_edit_singleline(&mut d.branch);
                     ui.horizontal(|ui| {
                         if ui.add(theme::primary("Create")).clicked() {
@@ -1109,16 +1131,18 @@ impl SpinneyApp {
         let mut errors = vec![];
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             let branch = d.branch.trim();
-            if d.worktree {
-                match project::add_worktree(&tab.root, branch, &d.base) {
-                    Ok(path) => tab.active_worktree = path,
-                    Err(e) => errors.push(format!("{e:#}")),
+            let wt = tab.active_worktree.clone();
+            let res = match d.mode {
+                BranchMode::Worktree => {
+                    project::add_worktree(&tab.root, branch, &d.base).map(|path| {
+                        tab.active_worktree = path;
+                    })
                 }
-            } else {
-                match actions::create_branch(&tab.active_worktree, branch, &d.base) {
-                    Ok(()) => checkout(tab, branch, &mut errors),
-                    Err(e) => errors.push(format!("{e:#}")),
-                }
+                BranchMode::Switch => actions::create_and_switch(&wt, branch, &d.base),
+                BranchMode::Create => actions::create_branch(&wt, branch, &d.base),
+            };
+            if let Err(e) = res {
+                errors.push(format!("{e:#}"));
             }
             tab.refresh(&ctx, &mut errors);
         }
@@ -1641,7 +1665,7 @@ mod tests {
         d.new_worktree = Some(NewWorktreeDialog {
             base: "main".into(),
             branch: String::new(),
-            worktree: true,
+            mode: BranchMode::Worktree,
         });
         assert!(d.any_open());
         d.new_worktree = None;
@@ -1730,6 +1754,70 @@ mod tests {
         assert!(one.starts_with("1 commit of main already pushed"), "{one}");
         let two = rebase_warning(2, "main").unwrap();
         assert!(two.starts_with("2 commits of main"), "{two}");
+    }
+
+    #[test]
+    fn base_label_shortens_only_full_hashes() {
+        let sha = "83174b7246c76c9b6426a95147a715f0d26bf6c6";
+        assert_eq!(base_label(sha), "83174b72");
+        assert_eq!(base_label("main"), "main");
+        assert_eq!(base_label("feature/x"), "feature/x");
+        assert_eq!(base_label("HEAD"), "HEAD");
+    }
+
+    #[test]
+    fn commit_menu_checks_out_and_branches_from_a_commit() {
+        use super::super::Action;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::test_app(
+            super::super::tests::cfg(),
+            &tmp.path().join("config.toml"),
+        );
+        let proj = tempfile::tempdir().unwrap();
+        let d = proj.path();
+        let g = |args: &[&str]| crate::git::run(d, args).unwrap().trim().to_string();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
+        let init = g(&["rev-parse", "HEAD"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "second"]);
+        let space = app.space().unwrap();
+        app.open_tab(d, &space);
+
+        // Refused past the disabled menu item while a tracked file is changed.
+        std::fs::write(d.join("a.txt"), "changed\n").unwrap();
+        app.apply(Action::CheckoutCommit(init.clone()));
+        assert!(app.errors.iter().any(|e| e.contains("Commit or stash")));
+        assert_eq!(g(&["symbolic-ref", "--short", "HEAD"]), "main");
+        app.apply(Action::BranchAt(init.clone()));
+        let mut b = app.dialogs.new_worktree.take().expect("dialog open");
+        assert_eq!(b.mode, BranchMode::Switch, "normal clone switches");
+        b.branch = "old".into();
+        app.errors.clear();
+        app.new_worktree(b);
+        assert!(app.errors.iter().any(|e| e.contains("Commit or stash")));
+        g(&["checkout", "--", "a.txt"]);
+        app.errors.clear();
+
+        app.apply(Action::BranchAt(init.clone()));
+        let mut b = app.dialogs.new_worktree.take().unwrap();
+        b.branch = "old".into();
+        app.new_worktree(b);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(g(&["symbolic-ref", "--short", "HEAD"]), "old");
+        assert_eq!(g(&["rev-parse", "HEAD"]), init);
+
+        g(&["switch", "-q", "main"]);
+        app.apply(Action::CheckoutCommit(init.clone()));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        assert_eq!(g(&["rev-parse", "HEAD"]), init);
+        assert!(
+            crate::refs::current_branch(d).unwrap().is_none(),
+            "detached"
+        );
     }
 
     #[test]

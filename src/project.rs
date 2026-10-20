@@ -369,6 +369,19 @@ mod tests {
     }
 
     #[test]
+    fn add_worktree_at_commit() {
+        let (_tmp, root) = cloned();
+        let main = root.join("main");
+        let sha = git::run(&main, &["rev-parse", "origin/feature/x"]).unwrap();
+        let sha = sha.trim();
+        let p = add_worktree(&root, "topic", sha).unwrap();
+        assert_eq!(git::run(&p, &["rev-parse", "HEAD"]).unwrap().trim(), sha);
+        let branch = git::run(&p, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "topic");
+        assert!(p.join("b.txt").exists());
+    }
+
+    #[test]
     fn add_existing_tracks_origin_only_branch() {
         let (tmp, root) = cloned();
         let remote = tmp.path().join("remote");

@@ -23,7 +23,9 @@ use crate::stage::Direction;
 use crate::stash::{self, Stash};
 use crate::status::{self, FileStatus, Status};
 use crate::{conflict, creds, git, mergetool};
-use dialogs::{CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog};
+use dialogs::{
+    BranchMode, CloneDialog, CreateDialog, DeleteBranchDialog, Dialogs, NewWorktreeDialog,
+};
 use eframe::egui::{self, Margin};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -578,6 +580,15 @@ pub enum Action {
     AskResolve(Resolve),
     ConfirmResolve,
     CancelResolve,
+    /// Put text (a commit's SHA) on the clipboard.
+    CopyText(String),
+    /// Copy the full message of the commit with this SHA.
+    CopyCommitMessage(String),
+    /// Check out the commit with this SHA, detaching HEAD.
+    CheckoutCommit(String),
+    /// "Create branch here…" on a commit: the new-branch dialog with the commit as base,
+    /// which creates the branch (worktree layout) or creates and switches (normal clone).
+    BranchAt(String),
 }
 
 pub struct SpinneyApp {
@@ -1058,7 +1069,7 @@ impl SpinneyApp {
                 self.dialogs.new_worktree = Some(NewWorktreeDialog {
                     base,
                     branch: String::new(),
-                    worktree: true,
+                    mode: BranchMode::Worktree,
                 });
             }
             Action::AskDeleteBranch(branch) => {
@@ -1091,11 +1102,50 @@ impl SpinneyApp {
             Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
             Action::NewBranch(base) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let mode = match tab.layout {
+                        Layout::WorktreeRoot => BranchMode::Worktree,
+                        Layout::NormalClone => BranchMode::Switch,
+                    };
                     self.dialogs.new_worktree = Some(NewWorktreeDialog {
                         base,
                         branch: String::new(),
-                        worktree: tab.layout == Layout::WorktreeRoot,
+                        mode,
                     });
+                }
+            }
+            Action::BranchAt(sha) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let mode = match tab.layout {
+                        Layout::WorktreeRoot => BranchMode::Create,
+                        Layout::NormalClone => BranchMode::Switch,
+                    };
+                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
+                        base: sha,
+                        branch: String::new(),
+                        mode,
+                    });
+                }
+            }
+            Action::CopyText(text) => ctx.copy_text(text),
+            Action::CopyCommitMessage(sha) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    match actions::commit_message(&tab.active_worktree, &sha) {
+                        Ok(m) => ctx.copy_text(m),
+                        Err(e) => errors.push(format!("{e:#}")),
+                    }
+                }
+            }
+            Action::CheckoutCommit(sha) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    // A pull or push may be rewriting the same files (the toolbar disables it).
+                    if self.jobs.network_busy(&tab.root) {
+                        errors.push("Wait for the running fetch, pull or push".into());
+                    } else {
+                        if let Err(e) = actions::checkout_detached(&tab.active_worktree, &sha) {
+                            errors.push(format!("{e:#}"));
+                        }
+                        tab.refresh(&ctx, &mut errors);
+                    }
                 }
             }
             Action::OpenTerminal => {
@@ -1855,7 +1905,19 @@ impl eframe::App for SpinneyApp {
                     remotes: &remotes,
                     branches: &branches,
                 };
-                let out = graph_view::show(ui, &tab.rows, tab.selected_commit, wip, names);
+                let menu = graph_view::MenuContext {
+                    layout: tab.layout,
+                    dirty: graph_view::clean_blocked(&tab.status, tab.operation),
+                };
+                let out = graph_view::show(
+                    ui,
+                    &tab.rows,
+                    tab.selected_commit,
+                    wip,
+                    names,
+                    &menu,
+                    &mut actions,
+                );
                 actions.extend(out.drops);
                 if let Some(i) = out.clicked {
                     actions.push(Action::SelectCommit(i));

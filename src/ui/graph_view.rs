@@ -1,5 +1,8 @@
 use super::{branch_drop, theme, Action};
+use crate::actions::Operation;
 use crate::graph::Row;
+use crate::project::Layout;
+use crate::status::{Change, Status};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::collections::HashSet;
 
@@ -81,18 +84,120 @@ pub fn parse_refs<'a>(refs: &'a str, remotes: &HashSet<&str>) -> Vec<Pill<'a>> {
         .collect()
 }
 
+/// What the commit menu needs to know about the tab.
+pub struct MenuContext {
+    pub layout: Layout,
+    /// Why entries that move HEAD are disabled, when they are (see `clean_blocked`).
+    pub dirty: Option<String>,
+}
+
+/// Why checking out another commit must wait: uncommitted changes to tracked files, or an
+/// operation in progress. Untracked files are left to git, as `actions::ensure_clean` does.
+pub fn clean_blocked(status: &Status, op: Option<Operation>) -> Option<String> {
+    if let Some(op) = op {
+        return Some(format!("Finish or abort the {op} first"));
+    }
+    let tracked = |f: &crate::status::FileStatus| f.change != Change::Untracked;
+    let dirty = !status.staged.is_empty()
+        || !status.conflicted.is_empty()
+        || status.unstaged.iter().any(tracked);
+    dirty.then(|| "Commit or stash your changes first".to_string())
+}
+
+/// One entry of the commit menu: its label, the action, and why it is disabled (if it is).
+#[derive(Debug, PartialEq)]
+pub struct MenuItem {
+    pub label: &'static str,
+    pub action: MenuAction,
+    pub blocked: Option<String>,
+}
+
+/// What a commit menu entry does, before it is bound to a commit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MenuAction {
+    CopySha,
+    CopyMessage,
+    Checkout,
+    Branch,
+    Worktree,
+}
+
+impl MenuAction {
+    fn action(self, sha: &str) -> Action {
+        let sha = sha.to_string();
+        match self {
+            MenuAction::CopySha => Action::CopyText(sha),
+            MenuAction::CopyMessage => Action::CopyCommitMessage(sha),
+            MenuAction::Checkout => Action::CheckoutCommit(sha),
+            MenuAction::Branch => Action::BranchAt(sha),
+            MenuAction::Worktree => Action::NewWorktreeFrom(sha),
+        }
+    }
+}
+
+/// The commit menu's entries in groups (separated in the menu), with enabled states.
+pub fn menu_items(ctx: &MenuContext) -> Vec<Vec<MenuItem>> {
+    let item = |label, action, blocked: Option<String>| MenuItem {
+        label,
+        action,
+        blocked,
+    };
+    let worktrees = ctx.layout == Layout::WorktreeRoot;
+    // A normal clone's new branch is switched to, moving HEAD like a checkout.
+    let branch_blocked = if worktrees { None } else { ctx.dirty.clone() };
+    let worktree_blocked = (!worktrees).then(|| {
+        "This project is a normal clone: right-click its tab and choose Convert to worktree \
+         layout"
+            .to_string()
+    });
+    vec![
+        vec![
+            item("Copy SHA", MenuAction::CopySha, None),
+            item("Copy message", MenuAction::CopyMessage, None),
+        ],
+        vec![item(
+            "Checkout this commit",
+            MenuAction::Checkout,
+            ctx.dirty.clone(),
+        )],
+        vec![
+            item("Create branch here…", MenuAction::Branch, branch_blocked),
+            item("New worktree here…", MenuAction::Worktree, worktree_blocked),
+        ],
+    ]
+}
+
+fn commit_menu(ui: &mut egui::Ui, row: &Row, ctx: &MenuContext, actions: &mut Vec<Action>) {
+    for (i, group) in menu_items(ctx).into_iter().enumerate() {
+        if i > 0 {
+            ui.separator();
+        }
+        for item in group {
+            let r = ui
+                .add_enabled(item.blocked.is_none(), egui::Button::new(item.label))
+                .on_disabled_hover_text(item.blocked.unwrap_or_default());
+            if r.clicked() {
+                actions.push(item.action.action(&row.commit.sha));
+                ui.close();
+            }
+        }
+    }
+}
+
 fn color(lane: usize) -> Color32 {
     theme::LANES[lane_color_index(lane)]
 }
 
 /// The history list. With `wip` (changed file count) a "// WIP" row comes first and is
-/// selected while no commit is.
+/// selected while no commit is. Right-clicking a commit opens its menu.
 pub fn show(
     ui: &mut egui::Ui,
     rows: &[Row],
     selected: Option<usize>,
     wip: Option<usize>,
     names: Names,
+    menu: &MenuContext,
+    actions: &mut Vec<Action>,
 ) -> GraphOutput {
     let mut out = GraphOutput {
         clicked: None,
@@ -153,6 +258,7 @@ pub fn show(
                             }
                             branch_drop::drag_and_drop(ui, &label, name, &mut out.drops);
                         }
+                        resp.context_menu(|ui| commit_menu(ui, &rows[i], menu, actions));
                     }
                 }
             }
@@ -373,6 +479,74 @@ mod tests {
         );
         assert_eq!(parse_refs("HEAD", &remotes)[0].kind, Head, "detached");
         assert!(parse_refs("", &remotes).is_empty());
+    }
+
+    fn fs(path: &str, change: Change) -> crate::status::FileStatus {
+        crate::status::FileStatus {
+            path: path.into(),
+            change,
+        }
+    }
+
+    #[test]
+    fn untracked_files_alone_do_not_block_checkout() {
+        let mut st = Status::default();
+        assert_eq!(clean_blocked(&st, None), None);
+        st.unstaged.push(fs("new.txt", Change::Untracked));
+        assert_eq!(clean_blocked(&st, None), None);
+        st.unstaged.push(fs("a.txt", Change::Modified));
+        let why = "Commit or stash your changes first";
+        assert_eq!(clean_blocked(&st, None).as_deref(), Some(why));
+        let staged = Status {
+            staged: vec![fs("b.txt", Change::Added)],
+            ..Status::default()
+        };
+        assert_eq!(clean_blocked(&staged, None).as_deref(), Some(why));
+        let op = clean_blocked(&Status::default(), Some(Operation::Rebase));
+        assert_eq!(op.as_deref(), Some("Finish or abort the rebase first"));
+    }
+
+    fn enabled(ctx: &MenuContext) -> Vec<(&'static str, bool)> {
+        menu_items(ctx)
+            .into_iter()
+            .flatten()
+            .map(|i| (i.label, i.blocked.is_none()))
+            .collect()
+    }
+
+    #[test]
+    fn commit_menu_disables_what_needs_a_clean_worktree() {
+        let clean = MenuContext {
+            layout: Layout::WorktreeRoot,
+            dirty: None,
+        };
+        assert!(enabled(&clean).iter().all(|(_, on)| *on), "all enabled");
+        let dirty = MenuContext {
+            layout: Layout::WorktreeRoot,
+            dirty: Some("Commit or stash your changes first".into()),
+        };
+        assert_eq!(
+            enabled(&dirty),
+            [
+                ("Copy SHA", true),
+                ("Copy message", true),
+                ("Checkout this commit", false),
+                ("Create branch here…", true),
+                ("New worktree here…", true),
+            ]
+        );
+        let normal = MenuContext {
+            layout: Layout::NormalClone,
+            ..dirty
+        };
+        let got = enabled(&normal);
+        assert_eq!(got[3], ("Create branch here…", false), "it switches");
+        assert_eq!(got[4], ("New worktree here…", false));
+        let checkout = &menu_items(&normal)[1][0];
+        assert_eq!(
+            checkout.blocked.as_deref(),
+            Some("Commit or stash your changes first")
+        );
     }
 
     #[test]
