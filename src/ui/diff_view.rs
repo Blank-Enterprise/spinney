@@ -53,9 +53,35 @@ pub fn selectable(fd: &FileDiff, (hi, li): (usize, usize)) -> bool {
         .is_some_and(|l| l.kind != LineKind::Context)
 }
 
-/// Line and hunk staging only for UTF-8 text files whose change is a plain modification.
-pub fn line_staging(change: &Change, fd: &FileDiff) -> bool {
-    *change == Change::Modified && !fd.binary && !fd.lossy
+/// Why line and hunk actions (stage, unstage, discard) are unavailable for this side of a
+/// file, or None when they are: only UTF-8 text files whose change is a plain modification
+/// have a diff that can be applied back in parts.
+pub fn line_actions_blocked(change: &Change, fd: &FileDiff) -> Option<&'static str> {
+    if fd.binary {
+        return Some("This is a binary file");
+    }
+    if fd.lossy {
+        return Some("This file isn't UTF-8 text");
+    }
+    match change {
+        Change::Modified => None,
+        Change::Added => Some("This file is new"),
+        Change::Untracked => Some("This file is untracked"),
+        Change::Deleted => Some("This file was deleted"),
+        Change::Renamed { .. } => Some("This file was renamed"),
+        Change::TypeChanged { .. } => Some("This file changed type"),
+        Change::Conflicted(_) => Some("This file has conflicts"),
+    }
+}
+
+/// The diff header's hint: the reason, then what to do instead on that side.
+pub fn line_hint(reason: &str, staged: bool) -> String {
+    let what = if staged {
+        "unstage the whole file"
+    } else {
+        "stage or discard the whole file"
+    };
+    format!("{reason}, so {what}")
 }
 
 /// Every Add/Del line of hunk `hi`.
@@ -133,9 +159,10 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
         Center::CommitFile(fd) => (&**fd, None),
         Center::Graph | Center::Conflict(_) | Center::Merge(_) => return,
     };
-    let lines_ok = work
+    let blocked = work
         .as_ref()
-        .is_some_and(|(_, change, ..)| line_staging(change, fd));
+        .and_then(|(_, change, ..)| line_actions_blocked(change, fd));
+    let lines_ok = work.is_some() && blocked.is_none();
     ui.horizontal(|ui| {
         ui.label(RichText::new(&fd.path).strong().color(Color32::WHITE));
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -182,6 +209,9 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
             if !*staged && ui.button(format!("Discard {n} {noun}")).clicked() {
                 actions.extend(ask_discard(fd, &sel.lines));
             }
+        }
+        if let Some(reason) = blocked {
+            ui.label(RichText::new(line_hint(reason, *staged)).color(theme::MUTED));
         }
     });
     ui.add_space(2.0);
@@ -540,36 +570,65 @@ mod tests {
     }
 
     #[test]
-    fn line_staging_only_for_modified_text() {
+    fn line_actions_blocked_gives_a_reason_per_case() {
+        use crate::status::{Conflict, Kind, Side};
         let fd = fd();
-        assert!(line_staging(&Change::Modified, &fd));
+        let why = |c: Change, fd: &FileDiff| line_actions_blocked(&c, fd);
+        assert_eq!(why(Change::Modified, &fd), None);
+        let cases = [
+            (Change::Added, "This file is new"),
+            (Change::Untracked, "This file is untracked"),
+            (Change::Deleted, "This file was deleted"),
+            (
+                Change::Renamed { from: "x".into() },
+                "This file was renamed",
+            ),
+            (
+                Change::TypeChanged {
+                    from: Kind::File,
+                    to: Kind::Symlink,
+                },
+                "This file changed type",
+            ),
+            (
+                Change::Conflicted(Conflict {
+                    ours: Side::Modified,
+                    theirs: Side::Modified,
+                }),
+                "This file has conflicts",
+            ),
+        ];
+        for (c, want) in cases {
+            assert_eq!(why(c.clone(), &fd), Some(want), "{c:?}");
+        }
         let bin = FileDiff {
             binary: true,
             hunks: vec![],
             ..fd.clone()
         };
-        assert!(!line_staging(&Change::Modified, &bin));
+        assert_eq!(why(Change::Modified, &bin), Some("This is a binary file"));
+        // Binary wins over the kind of change: it is the reason that would remain.
+        assert_eq!(why(Change::Added, &bin), Some("This is a binary file"));
         let lossy = FileDiff {
             lossy: true,
             ..fd.clone()
         };
-        assert!(!line_staging(&Change::Modified, &lossy));
-        for c in [
-            Change::Added,
-            Change::Deleted,
-            Change::Untracked,
-            Change::Conflicted(crate::status::Conflict {
-                ours: crate::status::Side::Modified,
-                theirs: crate::status::Side::Deleted,
-            }),
-            Change::Renamed { from: "x".into() },
-            Change::TypeChanged {
-                from: crate::status::Kind::File,
-                to: crate::status::Kind::Symlink,
-            },
-        ] {
-            assert!(!line_staging(&c, &fd), "{c:?}");
-        }
+        assert_eq!(
+            why(Change::Modified, &lossy),
+            Some("This file isn't UTF-8 text")
+        );
+    }
+
+    #[test]
+    fn line_hint_names_the_whole_file_action_per_side() {
+        assert_eq!(
+            line_hint("This file isn't UTF-8 text", false),
+            "This file isn't UTF-8 text, so stage or discard the whole file"
+        );
+        assert_eq!(
+            line_hint("This file is new", true),
+            "This file is new, so unstage the whole file"
+        );
     }
 
     fn g(d: &Path, args: &[&str]) -> String {
@@ -609,7 +668,7 @@ mod tests {
         assert_eq!(st.unstaged[0].change, Change::Modified);
         let fd = file_diff(d, "g.txt", false).unwrap();
         assert_eq!(fd.hunks.len(), 2);
-        assert!(line_staging(&st.unstaged[0].change, &fd));
+        assert_eq!(line_actions_blocked(&st.unstaged[0].change, &fd), None);
         let li = fd.hunks[0]
             .lines
             .iter()
