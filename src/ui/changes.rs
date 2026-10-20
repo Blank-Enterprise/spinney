@@ -2,11 +2,11 @@
 //! Also the ProjectTab handlers behind those controls.
 
 use super::diff_view::{Selection, WorkDiff};
-use super::{theme, Action, Center, Discard, ProjectTab};
-use crate::actions;
+use super::{theme, Action, Center, Discard, ProjectTab, Resolve};
+use crate::actions::{self, Operation, Version};
 use crate::diff::{commit_diff, file_diff};
 use crate::stage::{self, Direction};
-use crate::status::{self, Change, FileStatus, Status};
+use crate::status::{self, Change, Conflict, FileStatus, Side, Status};
 use anyhow::anyhow;
 use eframe::egui::{self, Align, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
@@ -38,6 +38,67 @@ pub fn discard_question(what: &Discard, status: &Status, center: &Center) -> Opt
             (open && unstaged(path)).then(|| format!("Discard {n} {noun} in {path}?"))
         }
     }
+}
+
+/// How `version` left a conflicted file during `op`, in mine/theirs terms.
+fn side_of(op: Option<Operation>, c: Conflict, version: Version) -> Side {
+    match actions::git_side(op, version) {
+        "--ours" => c.ours,
+        _ => c.theirs,
+    }
+}
+
+/// A conflicted row's hover text, for conflicts that aren't a plain edit on both sides.
+pub fn conflict_hint(op: Option<Operation>, c: Conflict) -> Option<&'static str> {
+    let (mine, theirs) = (
+        side_of(op, c, Version::Mine),
+        side_of(op, c, Version::Theirs),
+    );
+    match (mine, theirs) {
+        (Side::Deleted, Side::Deleted) => Some("Deleted on both sides"),
+        (Side::Deleted, _) => Some("You deleted it; they changed it"),
+        (_, Side::Deleted) => Some("They deleted it; you changed it"),
+        (Side::Added, Side::Added) => Some("Added on both sides"),
+        _ => None,
+    }
+}
+
+/// The resolve confirmation's question and button, or None once the file is no longer
+/// conflicted (resolved outside, or the operation ended).
+pub fn resolve_question(
+    what: &Resolve,
+    status: &Status,
+    op: Option<Operation>,
+) -> Option<(String, &'static str)> {
+    let path = match what {
+        Resolve::Use(f, _) => &f.path,
+        Resolve::Anyway(path) => path,
+    };
+    let f = status.conflicted.iter().find(|f| &f.path == path)?;
+    let Change::Conflicted(c) = f.change else {
+        return None;
+    };
+    Some(match what {
+        Resolve::Anyway(_) => (
+            format!("{path} still has conflict markers. Mark it resolved anyway?"),
+            "Mark resolved",
+        ),
+        Resolve::Use(_, v) => {
+            let (yours, other, button) = match v {
+                Version::Mine => ("your", "Their", "Use mine"),
+                Version::Theirs => ("their", "Your", "Use theirs"),
+            };
+            let q = if side_of(op, c, *v) == Side::Deleted {
+                format!("Delete {path}, as {yours} side did? {other} changes to it are lost.")
+            } else {
+                format!(
+                    "Use {yours} version of {path}? {other} changes to it, and any edits \
+                     you made, are lost."
+                )
+            };
+            (q, button)
+        }
+    })
 }
 
 /// Commit needs a non-blank summary and something staged; an amend may stage nothing.
@@ -81,7 +142,7 @@ fn badge(c: &Change) -> (&'static str, Color32) {
         Change::Deleted => ("D", theme::DELETED),
         Change::Renamed { .. } => ("R", theme::RENAMED),
         Change::Untracked => ("?", theme::UNTRACKED),
-        Change::Conflicted => ("!", theme::DELETED),
+        Change::Conflicted(_) => ("!", theme::DELETED),
     }
 }
 
@@ -126,27 +187,31 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, shortcuts: bool, actions: &
         .show(ui, |ui| {
             let st = &tab.status;
             if !st.conflicted.is_empty() {
+                let list = List::Conflicted;
                 file_list(
                     ui,
-                    List::Conflicted,
+                    list,
                     &st.conflicted,
                     st,
+                    tab.operation,
                     &open,
                     false,
                     actions,
                 );
             }
             let conflicts = !st.conflicted.is_empty();
+            let op = tab.operation;
             file_list(
                 ui,
                 List::Unstaged,
                 &st.unstaged,
                 st,
+                op,
                 &open,
                 conflicts,
                 actions,
             );
-            file_list(ui, List::Staged, &st.staged, st, &open, false, actions);
+            file_list(ui, List::Staged, &st.staged, st, op, &open, false, actions);
         });
 }
 
@@ -185,17 +250,19 @@ fn commit_card(ui: &mut egui::Ui, tab: &mut ProjectTab, enabled: bool, actions: 
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn file_list(
     ui: &mut egui::Ui,
     list: List,
     files: &[FileStatus],
     status: &Status,
+    op: Option<Operation>,
     open: &Option<(String, bool)>,
     conflicts: bool,
     actions: &mut Vec<Action>,
 ) {
     let (title, button) = match list {
-        List::Conflicted => ("Conflicted", "Stage"),
+        List::Conflicted => ("Conflicted", "Mark resolved"),
         List::Unstaged => ("Unstaged", "Stage"),
         List::Staged => ("Staged", "Unstage"),
     };
@@ -242,7 +309,10 @@ fn file_list(
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let b = egui::Button::new(RichText::new(button).size(11.5)).small();
                 if ui.add(b).clicked() {
-                    actions.push(Action::StageFile(f.clone(), staged));
+                    actions.push(match list {
+                        List::Conflicted => Action::MarkResolved(f.path.clone()),
+                        _ => Action::StageFile(f.clone(), staged),
+                    });
                 }
                 let is_open =
                     list != List::Conflicted && open.as_ref() == Some(&(f.path.clone(), staged));
@@ -264,11 +334,18 @@ fn file_list(
                 let r = ui.add(row);
                 let r = match &f.change {
                     Change::Renamed { from } => r.on_hover_text(format!("renamed from {from}")),
+                    Change::Conflicted(c) => match conflict_hint(op, *c) {
+                        Some(hint) => r.on_hover_text(hint),
+                        None => r,
+                    },
                     _ => r,
                 };
                 // Conflicted files have a combined diff the parser does not read.
                 if r.clicked() && list != List::Conflicted {
                     actions.push(Action::OpenDiff(f.clone(), staged));
+                }
+                if list == List::Conflicted {
+                    r.context_menu(|ui| conflict_menu(ui, f, actions));
                 }
                 if list == List::Unstaged {
                     r.context_menu(|ui| {
@@ -286,6 +363,28 @@ fn file_list(
         });
     }
     ui.add_space(8.0);
+}
+
+/// A conflicted file's menu: Open, Use mine…, Use theirs…, Mark resolved.
+fn conflict_menu(ui: &mut egui::Ui, f: &FileStatus, actions: &mut Vec<Action>) {
+    let items = [
+        ("Open", Action::OpenFile(f.path.clone())),
+        (
+            "Use mine…",
+            Action::AskResolve(Resolve::Use(f.clone(), Version::Mine)),
+        ),
+        (
+            "Use theirs…",
+            Action::AskResolve(Resolve::Use(f.clone(), Version::Theirs)),
+        ),
+        ("Mark resolved", Action::MarkResolved(f.path.clone())),
+    ];
+    for (label, action) in items {
+        if ui.button(label).clicked() {
+            actions.push(action);
+            ui.close();
+        }
+    }
 }
 
 fn commit_files(ui: &mut egui::Ui, tab: &ProjectTab, i: usize, actions: &mut Vec<Action>) {
@@ -457,6 +556,47 @@ impl ProjectTab {
         self.after_stage(errors);
     }
 
+    /// Mark `path` resolved. True when it still has conflict markers, so nothing was done
+    /// and "Mark resolved anyway" should be asked.
+    pub(super) fn mark_resolved(
+        &mut self,
+        path: &str,
+        anyway: bool,
+        errors: &mut Vec<String>,
+    ) -> bool {
+        let markers = match actions::mark_resolved(&self.active_worktree, path, anyway) {
+            Ok(done) => !done,
+            Err(e) => {
+                errors.push(format!("{e:#}"));
+                false
+            }
+        };
+        self.after_stage(errors);
+        markers
+    }
+
+    /// Run a confirmed resolution: keep one version, or mark resolved despite markers.
+    pub(super) fn resolve(&mut self, what: &Resolve, errors: &mut Vec<String>) {
+        match what {
+            Resolve::Use(f, v) => {
+                let res = actions::use_version(&self.active_worktree, self.operation, &f.path, *v);
+                if let Err(e) = res {
+                    errors.push(format!("{e:#}"));
+                }
+                self.after_stage(errors);
+            }
+            Resolve::Anyway(path) => {
+                self.mark_resolved(path, true, errors);
+            }
+        }
+    }
+
+    pub(super) fn open_file(&self, path: &str, errors: &mut Vec<String>) {
+        if let Err(e) = actions::open_file(&self.active_worktree.join(path)) {
+            errors.push(format!("{e:#}"));
+        }
+    }
+
     /// Tick or untick "Amend previous commit". Ticking loads HEAD's message into empty
     /// fields; without a HEAD it stays unticked. Unticking clears that message again if it
     /// is unedited, so a plain Commit never reuses it by accident.
@@ -588,6 +728,79 @@ mod tests {
         );
         assert_eq!(discard_blocked(&st, &st.unstaged[1]), None);
         assert_eq!(discard_blocked(&st, &fs_("x", Change::Untracked)), None);
+    }
+
+    #[test]
+    fn conflict_hints_follow_mine_and_theirs() {
+        use crate::status::Side::*;
+        let c = |ours, theirs| Conflict { ours, theirs };
+        let merge = Some(Operation::Merge);
+        let rebase = Some(Operation::Rebase);
+        assert_eq!(conflict_hint(merge, c(Modified, Modified)), None);
+        assert_eq!(
+            conflict_hint(merge, c(Modified, Deleted)),
+            Some("They deleted it; you changed it")
+        );
+        // During a rebase git's theirs is the branch being rebased: mine.
+        assert_eq!(
+            conflict_hint(rebase, c(Modified, Deleted)),
+            Some("You deleted it; they changed it")
+        );
+        assert_eq!(
+            conflict_hint(None, c(Deleted, Deleted)),
+            Some("Deleted on both sides")
+        );
+        assert_eq!(
+            conflict_hint(None, c(Added, Added)),
+            Some("Added on both sides")
+        );
+    }
+
+    #[test]
+    fn resolve_question_names_what_is_lost_and_drops_when_stale() {
+        use crate::status::Side::*;
+        let ud = Change::Conflicted(Conflict {
+            ours: Modified,
+            theirs: Deleted,
+        });
+        let mut st = Status {
+            conflicted: vec![fs_("f", ud)],
+            ..Default::default()
+        };
+        let f = st.conflicted[0].clone();
+        let merge = Some(Operation::Merge);
+        let q = |what: &Resolve, st: &Status, op| resolve_question(what, st, op);
+        let mine = Resolve::Use(f.clone(), Version::Mine);
+        let theirs = Resolve::Use(f.clone(), Version::Theirs);
+        assert_eq!(
+            q(&mine, &st, merge),
+            Some((
+                "Use your version of f? Their changes to it, and any edits you made, are lost."
+                    .into(),
+                "Use mine"
+            ))
+        );
+        assert_eq!(
+            q(&theirs, &st, merge),
+            Some((
+                "Delete f, as their side did? Your changes to it are lost.".into(),
+                "Use theirs"
+            ))
+        );
+        let rebase = Some(Operation::Rebase);
+        assert!(q(&mine, &st, rebase)
+            .unwrap()
+            .0
+            .starts_with("Delete f, as your"));
+        let anyway = Resolve::Anyway("f".into());
+        assert_eq!(
+            q(&anyway, &st, merge).map(|(_, b)| b),
+            Some("Mark resolved")
+        );
+        st.conflicted.clear();
+        for what in [mine, theirs, anyway] {
+            assert_eq!(q(&what, &st, merge), None, "{what:?}");
+        }
     }
 
     #[test]

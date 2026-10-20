@@ -442,6 +442,15 @@ pub enum Discard {
     },
 }
 
+/// A conflict resolution that drops work, asked in the top bar before it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resolve {
+    /// Keep one version of the file, losing the other side and any edits to it.
+    Use(FileStatus, actions::Version),
+    /// Mark the file resolved although it still has conflict markers.
+    Anyway(String),
+}
+
 /// Deferred UI intents, applied after rendering so closures need not borrow `self`.
 pub enum Action {
     SwitchSpace(String),
@@ -524,6 +533,14 @@ pub enum Action {
     AskOpStep(in_progress::Step),
     ConfirmOpStep,
     CancelOpStep,
+    /// Open a worktree file (by path) in its default app.
+    OpenFile(String),
+    /// Mark a conflicted file resolved; with conflict markers left, asks first.
+    MarkResolved(String),
+    /// Ask before a resolution that drops work; `ConfirmResolve` runs it, `CancelResolve` hides it.
+    AskResolve(Resolve),
+    ConfirmResolve,
+    CancelResolve,
 }
 
 pub struct SpinneyApp {
@@ -552,6 +569,8 @@ pub struct SpinneyApp {
     rejected_push: Option<RejectedPush>,
     /// A Skip or Abort of the operation in progress, awaiting confirmation in its banner.
     confirm_op: Option<in_progress::Pending>,
+    /// Root of the tab whose conflict resolution is awaiting confirmation, and what it is.
+    confirm_resolve: Option<(PathBuf, Resolve)>,
     /// Conversions in flight: (project root, worktree to activate afterwards).
     converting: Vec<(PathBuf, PathBuf)>,
 }
@@ -593,6 +612,7 @@ impl SpinneyApp {
             confirm_amend: None,
             rejected_push: None,
             confirm_op: None,
+            confirm_resolve: None,
         };
         app.open_visible_tabs();
         app
@@ -748,6 +768,7 @@ impl SpinneyApp {
                 self.confirm_discard = None;
                 self.confirm_amend = None;
                 self.confirm_op = None;
+                self.confirm_resolve = None;
                 self.new_tab = false;
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
@@ -893,6 +914,32 @@ impl SpinneyApp {
                 });
             }
             Action::CancelOpStep => self.confirm_op = None,
+            Action::OpenFile(path) => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    tab.open_file(&path, &mut errors);
+                }
+            }
+            Action::MarkResolved(path) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if tab.mark_resolved(&path, false, &mut errors) {
+                        self.confirm_resolve = Some((tab.root.clone(), Resolve::Anyway(path)));
+                    }
+                }
+            }
+            Action::AskResolve(what) => {
+                self.confirm_resolve = self
+                    .tabs
+                    .get(self.active_tab)
+                    .map(|t| (t.root.clone(), what))
+            }
+            Action::CancelResolve => self.confirm_resolve = None,
+            Action::ConfirmResolve => {
+                if let Some((root, what)) = self.confirm_resolve.take() {
+                    if let Some(tab) = self.asking_tab(Some(root)) {
+                        tab.resolve(&what, &mut errors);
+                    }
+                }
+            }
             Action::ConfirmOpStep => {
                 if let Some(p) = self.confirm_op.take() {
                     if self.asking_tab(Some(p.root.clone())).is_some() {
@@ -984,6 +1031,7 @@ impl SpinneyApp {
             Action::ActivateWorktree(path) => {
                 self.confirm_discard = None; // it was asked about the other worktree's files
                 self.confirm_op = None;
+                self.confirm_resolve = None;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.active_worktree = path;
                     tab.refresh(&ctx, &mut errors);
@@ -1105,6 +1153,13 @@ impl SpinneyApp {
         if self.confirm_op.as_ref().is_some_and(|p| p.root == root) {
             self.confirm_op = None;
         }
+        if self
+            .confirm_resolve
+            .as_ref()
+            .is_some_and(|(r, _)| r == root)
+        {
+            self.confirm_resolve = None;
+        }
     }
 
     /// Continue the operation stopped in `worktree`, or with `step` skip or abort it, then
@@ -1191,6 +1246,26 @@ impl SpinneyApp {
                 .small();
                 if ui.add(discard).clicked() {
                     actions.push(Action::ConfirmDiscard);
+                }
+            });
+        });
+    }
+
+    /// The resolve question (e.g. "Use your version of a.txt?") with its button / Cancel.
+    fn resolve_bar(ui: &mut egui::Ui, question: &str, button: &str, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("⚠").color(theme::DELETED));
+            ui.label(egui::RichText::new(question).color(theme::TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() {
+                    actions.push(Action::CancelResolve);
+                }
+                let go =
+                    egui::Button::new(egui::RichText::new(button).color(theme::ON_ACCENT).strong())
+                        .fill(theme::DELETED)
+                        .small();
+                if ui.add(go).clicked() {
+                    actions.push(Action::ConfirmResolve);
                 }
             });
         });
@@ -1452,6 +1527,23 @@ impl eframe::App for SpinneyApp {
                 egui::Panel::top("discard_confirm")
                     .frame(bar)
                     .show(ui, |ui| Self::discard_bar(ui, &q, &mut actions));
+            }
+            None => {}
+        }
+        let resolve = self.confirm_resolve.clone().and_then(|(root, what)| {
+            let tab = self.asking_tab(Some(root))?;
+            Some(changes::resolve_question(&what, &tab.status, tab.operation))
+        });
+        match resolve {
+            // The file is no longer conflicted.
+            Some(None) => self.confirm_resolve = None,
+            Some(Some((q, button))) => {
+                let bar = egui::Frame::new()
+                    .fill(theme::DIFF_DEL)
+                    .inner_margin(Margin::symmetric(14, 6));
+                egui::Panel::top("resolve_confirm")
+                    .frame(bar)
+                    .show(ui, |ui| Self::resolve_bar(ui, &q, button, &mut actions));
             }
             None => {}
         }
@@ -1795,6 +1887,7 @@ mod tests {
             confirm_amend: None,
             rejected_push: None,
             confirm_op: None,
+            confirm_resolve: None,
         }
     }
 

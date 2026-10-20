@@ -11,7 +11,39 @@ pub enum Change {
     Deleted,
     Renamed { from: String },
     Untracked,
-    Conflicted,
+    Conflicted(Conflict),
+}
+
+/// How each side left a conflicted file, in git's terms: `ours` is HEAD (index stage 2)
+/// and `theirs` the commit coming in (stage 3). During a rebase git's ours is the branch
+/// being rebased onto, so "mine" is not always ours: see `actions::git_side`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Conflict {
+    pub ours: Side,
+    pub theirs: Side,
+}
+
+/// One side of a conflict.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Side {
+    Modified,
+    Added,
+    Deleted,
+}
+
+impl Conflict {
+    /// From porcelain's `XY` (e.g. `UU`, `UD`, `AA`); None for anything else.
+    pub fn parse(xy: &str) -> Option<Conflict> {
+        let side = |c| match c {
+            'U' => Some(Side::Modified),
+            'A' => Some(Side::Added),
+            'D' => Some(Side::Deleted),
+            _ => None,
+        };
+        let mut c = xy.chars();
+        let (ours, theirs) = (side(c.next()?)?, side(c.next()?)?);
+        Some(Conflict { ours, theirs })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,8 +120,14 @@ pub fn status(worktree: &Path) -> Result<Status> {
                 }
             }
             "u" => {
-                let path = rest.trim_start().splitn(10, ' ').last().unwrap_or_default();
-                st.conflicted.push(fs(path, Change::Conflicted));
+                // u XY sub m1 m2 m3 mW h1 h2 h3 path
+                let f: Vec<&str> = rest.trim_start().splitn(10, ' ').collect();
+                let conflict = Conflict::parse(f[0]).unwrap_or(Conflict {
+                    ours: Side::Modified,
+                    theirs: Side::Modified,
+                });
+                let path = f.last().copied().unwrap_or_default();
+                st.conflicted.push(fs(path, Change::Conflicted(conflict)));
             }
             "?" => st.unstaged.push(fs(rest.trim_start(), Change::Untracked)),
             _ => {}
@@ -121,7 +159,7 @@ mod tests {
         st.staged.push(fs_("a", Change::Modified));
         st.unstaged.push(fs_("a", Change::Modified)); // both sides: one file
         st.unstaged.push(fs_("b", Change::Untracked));
-        st.conflicted.push(fs_("c", Change::Conflicted));
+        st.conflicted.push(fs_("c", Change::Conflicted(BOTH)));
         assert_eq!(st.changed_files(), 3);
     }
 
@@ -218,7 +256,37 @@ mod tests {
         c(&["commit", "-q", "-am", "main"]);
         let _ = git::run(d, &["merge", "other"]);
         let s = status(d).unwrap();
-        assert_eq!(s.conflicted, vec![fs_("f", Change::Conflicted)]);
+        assert_eq!(s.conflicted, vec![fs_("f", Change::Conflicted(BOTH))]);
         assert!(s.staged.is_empty() && s.unstaged.is_empty());
+
+        // Deleted on `gone`, changed on main: deleted by them.
+        c(&["merge", "--abort"]);
+        c(&["checkout", "-q", "-b", "gone", "main~1"]);
+        c(&["rm", "-q", "f"]);
+        c(&["commit", "-q", "-m", "gone"]);
+        c(&["checkout", "-q", "main"]);
+        let _ = git::run(d, &["merge", "gone"]);
+        let s = status(d).unwrap();
+        let ud = Conflict {
+            ours: Side::Modified,
+            theirs: Side::Deleted,
+        };
+        assert_eq!(s.conflicted, vec![fs_("f", Change::Conflicted(ud))]);
+    }
+
+    const BOTH: Conflict = Conflict {
+        ours: Side::Modified,
+        theirs: Side::Modified,
+    };
+
+    #[test]
+    fn conflict_codes_parse_per_side() {
+        let c = |xy| Conflict::parse(xy).map(|c| (c.ours, c.theirs));
+        assert_eq!(c("UU"), Some((Side::Modified, Side::Modified)));
+        assert_eq!(c("DU"), Some((Side::Deleted, Side::Modified)));
+        assert_eq!(c("AA"), Some((Side::Added, Side::Added)));
+        assert_eq!(c("DD"), Some((Side::Deleted, Side::Deleted)));
+        assert_eq!(c("U."), None);
+        assert_eq!(c("U"), None);
     }
 }

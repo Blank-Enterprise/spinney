@@ -555,7 +555,10 @@ mod tests {
             Change::Added,
             Change::Deleted,
             Change::Untracked,
-            Change::Conflicted,
+            Change::Conflicted(crate::status::Conflict {
+                ours: crate::status::Side::Modified,
+                theirs: crate::status::Side::Deleted,
+            }),
             Change::Renamed { from: "x".into() },
         ] {
             assert!(!line_staging(&c, &fd), "{c:?}");
