@@ -36,7 +36,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement privately through a [private vulnerability report](https://github.com/SameetKeshav/spinney/security/advisories/new) titled "Code of conduct", which only the maintainers (@SameetKeshav and @priyo5) can see, or through GitHub's [report abuse](https://docs.github.com/en/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam) tools. All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement privately through a [private vulnerability report](https://github.com/Blank-Enterprise/spinney/security/advisories/new) titled "Code of conduct", which only the maintainers (@SameetKeshav and @priyo5) can see, or through GitHub's [report abuse](https://docs.github.com/en/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam) tools. All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the reporter of any incident.
 

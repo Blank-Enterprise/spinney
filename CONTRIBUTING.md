@@ -10,8 +10,8 @@ problem, see [SECURITY.md](SECURITY.md). Don't open a public issue.
 
 - **Bugs:** open an issue with the bug report template.
 - **Features:** open an issue first, so we can agree on the shape before you write code. The
-  [roadmap issue (#31)](https://github.com/SameetKeshav/spinney/issues/31) and the
-  [milestones](https://github.com/SameetKeshav/spinney/milestones) show what's planned.
+  [roadmap issue (#31)](https://github.com/Blank-Enterprise/spinney/issues/31) and the
+  [milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's planned.
 - Issues labelled `good first issue` are a good place to start. Issues labelled
   `needs decision` aren't ready for code yet.
 

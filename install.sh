@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Install the latest Spinney release (or SPINNEY_VERSION, e.g. v1.1.0) into /Applications.
-#   curl -fsSL https://raw.githubusercontent.com/SameetKeshav/spinney/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | bash
 set -euo pipefail
 
 main() {
-  local REPO="${SPINNEY_REPO:-SameetKeshav/spinney}"
+  local REPO="${SPINNEY_REPO:-Blank-Enterprise/spinney}"
   local APP_DIR="${SPINNEY_APP_DIR:-/Applications}"
   local VERSION="${SPINNEY_VERSION:-}"
   local ASSET="Spinney-macos-arm64.zip"

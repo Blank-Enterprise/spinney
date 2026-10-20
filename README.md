@@ -33,21 +33,21 @@ Anything that can lose work asks first and says what will be lost.
 
 Requires macOS on Apple Silicon.
 
-    curl -fsSL https://raw.githubusercontent.com/SameetKeshav/spinney/main/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | bash
 
 This installs the latest release into `/Applications` after checking it against its published
 SHA-256 checksum. To install a specific release, set `SPINNEY_VERSION`:
 
-    curl -fsSL https://raw.githubusercontent.com/SameetKeshav/spinney/main/install.sh | SPINNEY_VERSION=v1.1.0 bash
+    curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | SPINNEY_VERSION=v1.1.0 bash
 
-The app isn't notarized yet ([#18](https://github.com/SameetKeshav/spinney/issues/18)). The
+The app isn't notarized yet ([#18](https://github.com/Blank-Enterprise/spinney/issues/18)). The
 install script is the supported way in. If you download the zip from the releases page in a
 browser, Gatekeeper refuses to open it until you allow it in System Settings → Privacy & Security.
 
 While the repo is private, the curl command can't reach it. Use the GitHub CLI
 (`gh auth login`) instead:
 
-    gh api repos/SameetKeshav/spinney/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
+    gh api repos/Blank-Enterprise/spinney/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
 
 ## Build from source
 
@@ -60,10 +60,10 @@ Requires Rust 1.95 or newer.
 ## Status
 
 Spinney is early and under active development. The
-[roadmap (#31)](https://github.com/SameetKeshav/spinney/issues/31) lists what's planned, and the
-[milestones](https://github.com/SameetKeshav/spinney/milestones) show what's next. Merge and
+[roadmap (#31)](https://github.com/Blank-Enterprise/spinney/issues/31) lists what's planned, and the
+[milestones](https://github.com/Blank-Enterprise/spinney/milestones) show what's next. Merge and
 rebase conflicts currently abort and list the files rather than leaving a half-done operation
-([#53](https://github.com/SameetKeshav/spinney/issues/53)).
+([#53](https://github.com/Blank-Enterprise/spinney/issues/53)).
 
 ## Contributing
 
