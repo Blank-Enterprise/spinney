@@ -743,6 +743,49 @@ pub fn rename_on_remote(worktree: &Path, r: &RemoteRename, old: &str, new: &str)
     Ok(())
 }
 
+/// `git merge-base --is-ancestor a b`: `a` is reachable from `b`.
+fn is_ancestor(worktree: &Path, a: &str, b: &str) -> Result<bool> {
+    let out = git::output(worktree, &["merge-base", "--is-ancestor", a, b])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!("git merge-base failed: {}", stderr(&out)),
+    }
+}
+
+/// Fast-forward local `branch`, checked out nowhere, to its upstream without checking it
+/// out (handy for `main` in the worktree layout).
+pub fn fast_forward(worktree: &Path, branch: &str) -> Result<MergeOutcome> {
+    let local = format!("refs/heads/{branch}");
+    let up = git::run(worktree, &["for-each-ref", "--format=%(upstream)", &local])?;
+    let up = up.trim();
+    if up.is_empty() {
+        bail!("{branch} has no upstream");
+    }
+    let short = up.strip_prefix("refs/remotes/").unwrap_or(up);
+    fast_forward_to(worktree, branch, short)
+}
+
+/// Move local `branch` forward to `target` when that only adds commits, like
+/// `git fetch . target:branch`. Refused for a branch any worktree has checked out (its
+/// files would no longer match) and when the two have diverged.
+pub fn fast_forward_to(worktree: &Path, branch: &str, target: &str) -> Result<MergeOutcome> {
+    ensure_not_checked_out(worktree, branch)?;
+    let local = format!("refs/heads/{branch}");
+    let old = rev_parse(worktree, &local)?;
+    let new = rev_parse(worktree, &format!("{target}^{{commit}}"))?;
+    if is_ancestor(worktree, &new, &old)? {
+        return Ok(MergeOutcome::UpToDate);
+    }
+    if !is_ancestor(worktree, &old, &new)? {
+        bail!("{branch} has diverged from {target}; check it out to merge or rebase");
+    }
+    // Pinned to `old`: if the branch moved since it was checked, nothing changes.
+    let msg = format!("fast-forward to {target}");
+    git::run(worktree, &["update-ref", "-m", &msg, &local, &new, &old])?;
+    Ok(MergeOutcome::Done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +1241,66 @@ mod tests {
         );
         git::run(&main, &["rev-parse", "--verify", "feature/x"]).unwrap();
         assert!(git::run(&main, &["rev-parse", "--verify", "-q", "feature/y"]).is_err());
+    }
+
+    /// Local `feature/x` tracking `origin/feature/x`, which then gains a commit on the remote
+    /// and is fetched: the branch is one behind.
+    fn behind() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        g(&main, &["branch", "feature/x", "origin/feature/x"]);
+        g(&remote, &["config", "user.name", "Test User"]);
+        g(&remote, &["switch", "-q", "feature/x"]);
+        write_commit(&remote, "r.txt");
+        g(&remote, &["switch", "-q", "main"]);
+        fetch(&main).unwrap();
+        (tmp, root, main)
+    }
+
+    #[test]
+    fn fast_forward_moves_a_branch_that_is_not_checked_out() {
+        let (_tmp, _root, main) = behind();
+        let before = snapshot(&main);
+        assert_eq!(
+            fast_forward(&main, "feature/x").unwrap(),
+            MergeOutcome::Done
+        );
+        assert_eq!(head(&main, "feature/x"), head(&main, "origin/feature/x"));
+        assert_eq!(snapshot(&main), before, "the worktree is untouched");
+        let again = fast_forward(&main, "feature/x").unwrap();
+        assert_eq!(again, MergeOutcome::UpToDate);
+        create_branch(&main, "topic", "main").unwrap();
+        let err = fast_forward(&main, "topic").unwrap_err();
+        assert!(err.to_string().contains("no upstream"), "{err}");
+    }
+
+    #[test]
+    fn fast_forward_refuses_when_diverged() {
+        let (_tmp, _root, main) = behind();
+        let tip = head(&main, "feature/x");
+        let tree = format!("{tip}^{{tree}}");
+        let local = g(&main, &["commit-tree", &tree, "-p", &tip, "-m", "local"]);
+        g(&main, &["update-ref", "refs/heads/feature/x", &local]);
+        let err = fast_forward(&main, "feature/x").unwrap_err();
+        assert!(err.to_string().contains("diverged"), "{err}");
+        assert_eq!(head(&main, "feature/x"), local, "unchanged");
+    }
+
+    #[test]
+    fn fast_forward_refuses_when_checked_out_in_a_worktree() {
+        let (_tmp, root, main) = behind();
+        let wt = add_worktree_existing(&root, "feature/x").unwrap();
+        let tip = head(&wt, "HEAD");
+        let err = fast_forward(&main, "feature/x").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("checked out in worktree feature-x"),
+            "{err}"
+        );
+        assert_eq!(head(&main, "feature/x"), tip);
+        // The active worktree's own branch too: pull is the way there.
+        let err = fast_forward_to(&main, "main", "origin/feature/x").unwrap_err();
+        assert!(err.to_string().contains("worktree main"), "{err}");
     }
 
     /// `main` and a local `other`, both from `init`, each changing `a.txt` differently.
