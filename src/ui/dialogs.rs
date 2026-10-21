@@ -2016,6 +2016,7 @@ impl SpinneyApp {
         };
         self.active_tab = i;
         self.new_tab = false;
+        self.remember_active();
         let picked = picked.canonicalize().unwrap_or(picked);
         let ctx = self.ctx.clone();
         let tab = &mut self.tabs[i];
