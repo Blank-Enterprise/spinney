@@ -14,6 +14,8 @@ pub struct Space {
     pub author_email: String,
     pub default_clone_dir: Option<PathBuf>,
     pub projects: Vec<PathBuf>,
+    /// Favourites: starred projects, listed above Recent, in the order starred.
+    pub pinned: Vec<PathBuf>,
     /// Private key git uses over SSH for this space's host; `None` = HTTPS with the token.
     pub ssh_key: Option<PathBuf>,
 }
@@ -149,6 +151,7 @@ mod tests {
                 author_email: "test@example.com".into(),
                 default_clone_dir: Some(PathBuf::from("/tmp/code")),
                 projects: vec![PathBuf::from("/tmp/code/p")],
+                pinned: vec![PathBuf::from("/tmp/code/p")],
                 ssh_key: Some(PathBuf::from("/tmp/keys/id_ed25519")),
             }],
             active_space: Some("work-abc123".into()),
@@ -170,6 +173,7 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.spaces[0].id, "w-1");
         assert!(cfg.spaces[0].projects.is_empty());
+        assert!(cfg.spaces[0].pinned.is_empty());
         assert_eq!(cfg.spaces[0].default_clone_dir, None);
         assert_eq!(cfg.spaces[0].ssh_key, None, "older configs stay on HTTPS");
     }

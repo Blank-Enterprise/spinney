@@ -3,7 +3,7 @@
 use super::{paths, theme, Action};
 use crate::config::Space;
 use eframe::egui::{self, Color32, RichText, Stroke};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut Vec<Action>) {
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -40,41 +40,107 @@ pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut
                 .hint_text("Search")
                 .desired_width(f32::INFINITY),
         );
+        let home = paths::home();
+        let (favourites, recent) = sections(space, search, home.as_deref());
+        if !favourites.is_empty() {
+            ui.add_space(10.0);
+            ui.label(theme::section("Favourites"));
+            theme::card().show(ui, |ui| {
+                for root in favourites {
+                    project_row(ui, root, true, home.as_deref(), actions);
+                }
+            });
+        }
         ui.add_space(10.0);
         ui.label(theme::section("Recent"));
         theme::card().show(ui, |ui| {
-            let home = paths::home();
-            let mut any = false;
-            for root in &space.projects {
-                let name = folder_name(root);
-                let shown = paths::abbreviate_home(root, home.as_deref());
-                if !matches(search, &name, &shown) {
-                    continue;
-                }
-                any = true;
-                let row = egui::Button::selectable(false, RichText::new(name))
-                    .right_text(RichText::new(shown).color(theme::MUTED))
-                    .min_size(egui::vec2(ui.available_width(), 0.0));
-                let r = ui.add(row);
-                if r.clicked() {
-                    actions.push(Action::OpenProject(root.clone()));
-                }
-                r.context_menu(|ui| {
-                    if ui.button("Remove from Recent").clicked() {
-                        actions.push(Action::RemoveRecent(root.clone()));
-                        ui.close();
-                    }
-                });
+            for root in &recent {
+                project_row(ui, root, false, home.as_deref(), actions);
             }
-            if !any {
+            if recent.is_empty() {
                 ui.weak(if space.projects.is_empty() {
                     "No projects yet"
+                } else if search.trim().is_empty() {
+                    "Every project is a favourite"
                 } else {
                     "No matches"
                 });
             }
         });
     });
+}
+
+/// A project's row: a star to toggle Favourites, then its name and path, which open it.
+fn project_row(
+    ui: &mut egui::Ui,
+    root: &Path,
+    favourite: bool,
+    home: Option<&Path>,
+    actions: &mut Vec<Action>,
+) {
+    ui.horizontal(|ui| {
+        let (star, tip) = if favourite {
+            ("★", "Remove from Favourites")
+        } else {
+            ("☆", "Add to Favourites")
+        };
+        let color = if favourite {
+            theme::ACCENT_TEXT
+        } else {
+            theme::MUTED
+        };
+        let star = egui::Button::new(RichText::new(star).color(color)).frame(false);
+        if ui.add(star).on_hover_text(tip).clicked() {
+            actions.push(Action::ToggleFavourite(root.to_path_buf()));
+        }
+        let shown = paths::abbreviate_home(root, home);
+        let row = egui::Button::selectable(false, RichText::new(folder_name(root)))
+            .right_text(RichText::new(shown).color(theme::MUTED))
+            .min_size(egui::vec2(ui.available_width(), 0.0));
+        let r = ui.add(row);
+        if r.clicked() {
+            actions.push(Action::OpenProject(root.to_path_buf()));
+        }
+        r.context_menu(|ui| {
+            if ui.button(tip).clicked() {
+                actions.push(Action::ToggleFavourite(root.to_path_buf()));
+                ui.close();
+            }
+            if ui.button("Remove from Recent").clicked() {
+                actions.push(Action::RemoveRecent(root.to_path_buf()));
+                ui.close();
+            }
+        });
+    });
+}
+
+/// The space's (Favourites, Recent) matching `search`: Favourites in the order starred,
+/// and Recent without them, so a project is listed once.
+fn sections<'a>(
+    space: &'a Space,
+    search: &str,
+    home: Option<&Path>,
+) -> (Vec<&'a PathBuf>, Vec<&'a PathBuf>) {
+    let hit = |root: &&PathBuf| {
+        matches(
+            search,
+            &folder_name(root),
+            &paths::abbreviate_home(root, home),
+        )
+    };
+    let favourites = space
+        .pinned
+        .iter()
+        .filter(|p| space.projects.contains(p))
+        .filter(hit)
+        .collect();
+    let recent = space
+        .projects
+        .iter()
+        .filter(|p| !space.pinned.contains(p))
+        .filter(hit)
+        .collect();
+    (favourites, recent)
 }
 
 fn folder_name(root: &Path) -> String {
@@ -101,5 +167,25 @@ mod tests {
         assert!(matches("PRO", "proj", "~/code/proj"));
         assert!(matches("code", "proj", "~/Code/proj"));
         assert!(!matches("other", "proj", "~/code/proj"));
+    }
+
+    #[test]
+    fn favourites_list_first_and_leave_recent() {
+        let p = |s: &str| PathBuf::from(s);
+        let space = Space {
+            projects: vec![p("/p/alpha"), p("/p/beta"), p("/p/gamma")],
+            pinned: vec![p("/p/gamma"), p("/p/alpha"), p("/p/gone")],
+            ..Default::default()
+        };
+        let (fav, recent) = sections(&space, "", None);
+        assert_eq!(
+            fav,
+            [&p("/p/gamma"), &p("/p/alpha")],
+            "starred order, Recent only"
+        );
+        assert_eq!(recent, [&p("/p/beta")]);
+        let (fav, recent) = sections(&space, "AL", None);
+        assert_eq!(fav, [&p("/p/alpha")]);
+        assert!(recent.is_empty());
     }
 }
