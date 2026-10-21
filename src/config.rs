@@ -15,6 +15,8 @@ pub struct Space {
     pub default_clone_dir: Option<PathBuf>,
     /// Recent: every project opened in this space, kept when its tab closes.
     pub projects: Vec<PathBuf>,
+    /// Favourites: starred projects, listed above Recent, in the order starred.
+    pub pinned: Vec<PathBuf>,
     /// The projects with a tab open, in tab order; restored on launch and space switch.
     pub open: Vec<PathBuf>,
     /// The project whose tab was last active.
@@ -154,6 +156,7 @@ mod tests {
                 author_email: "test@example.com".into(),
                 default_clone_dir: Some(PathBuf::from("/tmp/code")),
                 projects: vec![PathBuf::from("/tmp/code/p")],
+                pinned: vec![PathBuf::from("/tmp/code/p")],
                 open: vec![PathBuf::from("/tmp/code/p")],
                 active: Some(PathBuf::from("/tmp/code/p")),
                 ssh_key: Some(PathBuf::from("/tmp/keys/id_ed25519")),
@@ -177,6 +180,7 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.spaces[0].id, "w-1");
         assert!(cfg.spaces[0].projects.is_empty());
+        assert!(cfg.spaces[0].pinned.is_empty());
         assert!(
             cfg.spaces[0].open.is_empty(),
             "an older config reopens no tabs"

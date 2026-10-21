@@ -615,6 +615,8 @@ pub enum Action {
     OpenProject(PathBuf),
     /// Drop a project from the space (closing its tab if open).
     RemoveRecent(PathBuf),
+    /// Star or unstar a project in the active space's Favourites.
+    ToggleFavourite(PathBuf),
     Fetch,
     /// Pull the active worktree's upstream with this strategy.
     Pull(PullStrategy),
@@ -1120,6 +1122,13 @@ impl SpinneyApp {
                 }
                 if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
                     self.close_tab(i);
+                }
+            }
+            Action::ToggleFavourite(root) => {
+                if let Some(space) = self.space() {
+                    if toggle_favourite(&mut self.config, &space.id, &root) {
+                        self.save_config();
+                    }
                 }
             }
             Action::NewTab => {
@@ -2538,11 +2547,28 @@ pub fn remove_project(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
     };
     let before = s.projects.len();
     s.projects.retain(|p| p != path);
+    s.pinned.retain(|p| p != path);
     s.open.retain(|p| p != path);
     if s.active.as_deref() == Some(path) {
         s.active = None;
     }
     s.projects.len() != before
+}
+
+/// Star `path` in a space's Favourites, or unstar it; false if the space or the project is
+/// missing (only a project in Recent can be starred).
+pub fn toggle_favourite(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
+    let Some(s) = cfg.spaces.iter_mut().find(|s| s.id == space_id) else {
+        return false;
+    };
+    if let Some(i) = s.pinned.iter().position(|p| p == path) {
+        s.pinned.remove(i);
+    } else if s.projects.iter().any(|p| p == path) {
+        s.pinned.push(path.to_path_buf());
+    } else {
+        return false;
+    }
+    true
 }
 
 /// Default folder name for a clone URL: last path segment without `.git`.
@@ -2634,6 +2660,31 @@ mod tests {
             back.spaces[1].projects,
             [PathBuf::from("/tmp/p3"), PathBuf::from("/tmp/p4")]
         );
+    }
+
+    #[test]
+    fn favourites_toggle_and_go_with_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut c = cfg();
+        let (p1, p2) = (Path::new("/tmp/p1"), Path::new("/tmp/p2"));
+        assert!(toggle_favourite(&mut c, "a", p2));
+        assert!(toggle_favourite(&mut c, "a", p1));
+        assert_eq!(c.spaces[0].pinned, [p2, p1], "in the order starred");
+        assert!(toggle_favourite(&mut c, "a", p2));
+        assert_eq!(c.spaces[0].pinned, [p1], "unstarred");
+        assert!(
+            !toggle_favourite(&mut c, "a", Path::new("/tmp/p3")),
+            "not in Recent"
+        );
+        assert!(!toggle_favourite(&mut c, "nope", p1));
+        c.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().spaces[0].pinned, [p1]);
+        // Per space: space b has none.
+        assert!(c.spaces[1].pinned.is_empty());
+        // Removing from Recent unstars it too.
+        assert!(remove_project(&mut c, "a", p1));
+        assert!(c.spaces[0].pinned.is_empty());
     }
 
     #[test]
