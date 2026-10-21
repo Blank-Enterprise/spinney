@@ -25,19 +25,27 @@ impl SpinneyApp {
             let space = active_space(&self.config);
             repositories_button(ui, space, self.config.collapsed, search, actions);
             ui.add_space(6.0);
+            let mut rects = Vec::with_capacity(self.tabs.len());
+            let mut dragged = None;
             for (i, tab) in self.tabs.iter().enumerate() {
                 let active = i == self.active_tab && !self.new_tab;
-                let (label, close) = tab_button(ui, &tab.name(), active, true);
-                if label.clicked() {
-                    actions.push(Action::SelectTab(i));
+                let (click, label, rect) = tab_button(ui, &tab.name(), active, true);
+                rects.push(rect);
+                match click {
+                    Some(TabClick::Select) => actions.push(Action::SelectTab(i)),
+                    Some(TabClick::Close) => actions.push(Action::CloseTab(i)),
+                    None => {}
                 }
-                if close {
-                    actions.push(Action::CloseTab(i));
+                if label.dragged() || label.drag_stopped() {
+                    dragged = Some((i, label));
                 }
+            }
+            if let Some((from, label)) = dragged {
+                drag_tab(ui, from, &label, &rects, actions);
             }
             if self.new_tab {
                 let closable = !self.tabs.is_empty(); // with no tabs the page shows anyway
-                if tab_button(ui, "New Tab", true, closable).1 {
+                if tab_button(ui, "New Tab", true, closable).0 == Some(TabClick::Close) {
                     actions.push(Action::CloseNewTab);
                 }
             }
@@ -112,12 +120,78 @@ fn repositories_button(
 }
 
 /// A rounded-top tab; returns (the name label's response, close clicked).
+/// While tab `from` is dragged, mark where it would land; on release, move it there.
+fn drag_tab(
+    ui: &egui::Ui,
+    from: usize,
+    label: &egui::Response,
+    rects: &[egui::Rect],
+    actions: &mut Vec<Action>,
+) {
+    let Some(x) = label.interact_pointer_pos().map(|p| p.x) else {
+        return;
+    };
+    let centres: Vec<f32> = rects.iter().map(|r| r.center().x).collect();
+    let slot = drop_slot(x, &centres);
+    let to = moved_index(from, slot);
+    if label.drag_stopped() {
+        if to != from {
+            actions.push(Action::MoveTab { from, to });
+        }
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    if to != from {
+        let at = match slot {
+            0 => rects[0].left(),
+            n => rects[n - 1].right() + 1.0,
+        };
+        let y = rects[from].y_range();
+        ui.painter()
+            .vline(at, y, egui::Stroke::new(2.0, theme::ACCENT));
+    }
+}
+
+/// The gap a tab dropped at `x` goes into: 0 before the first tab, `centres.len()` after the last.
+fn drop_slot(x: f32, centres: &[f32]) -> usize {
+    centres.iter().filter(|&&c| c < x).count()
+}
+
+/// The index a tab moved from `from` into gap `slot` ends up at, once it's out of the list.
+fn moved_index(from: usize, slot: usize) -> usize {
+    if slot > from {
+        slot - 1
+    } else {
+        slot
+    }
+}
+
+/// What a click on a tab asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TabClick {
+    Select,
+    Close,
+}
+
+/// A middle click anywhere on the tab closes it, as the × does; a left click on the name selects it.
+fn tab_click(left: bool, middle: bool, close: bool, closable: bool) -> Option<TabClick> {
+    if closable && (close || middle) {
+        Some(TabClick::Close)
+    } else if left {
+        Some(TabClick::Select)
+    } else {
+        None
+    }
+}
+
+/// A rounded-top tab, draggable by its name; returns (what a click asked for, the name
+/// label's response, the tab's rect).
 fn tab_button(
     ui: &mut egui::Ui,
     name: &str,
     active: bool,
     closable: bool,
-) -> (egui::Response, bool) {
+) -> (Option<TabClick>, egui::Response, egui::Rect) {
     let (fill, color) = if active {
         (theme::BG, Color32::WHITE)
     } else {
@@ -143,7 +217,7 @@ fn tab_button(
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let label = egui::Label::new(RichText::new(name).size(12.5).color(color))
                     .selectable(false)
-                    .sense(Sense::click());
+                    .sense(Sense::click_and_drag());
                 let label = ui.add(label);
                 if closable {
                     let x = egui::Button::new(RichText::new("×").color(TAB_TEXT))
@@ -155,7 +229,11 @@ fn tab_button(
             })
             .inner
         });
-    (frame.inner, close)
+    // Read from the input, so the frame's padding and the × count as well as the name.
+    let middle = frame.response.contains_pointer()
+        && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+    let click = tab_click(frame.inner.clicked(), middle, close, closable);
+    (click, frame.inner, frame.response.rect)
 }
 
 /// Current branch of the tab's active worktree, for the toolbar.
@@ -387,5 +465,37 @@ mod tests {
             .map(|s| pull_item(s, PullStrategy::Rebase))
             .collect();
         assert_eq!(items, ["Fast-forward only", "Merge", "Rebase · default"]);
+    }
+
+    #[test]
+    fn a_dragged_tab_lands_in_the_gap_under_the_pointer() {
+        let centres = [50.0, 150.0, 250.0]; // three tabs, 100 wide
+        assert_eq!(drop_slot(10.0, &centres), 0, "before the first");
+        assert_eq!(drop_slot(120.0, &centres), 1);
+        assert_eq!(drop_slot(400.0, &centres), 3, "after the last");
+        // Tab 0 dragged to the end lands last; into its own gaps it stays put.
+        assert_eq!(moved_index(0, 3), 2);
+        assert_eq!(moved_index(0, 0), 0);
+        assert_eq!(moved_index(0, 1), 0);
+        // Tab 2 dragged to the front.
+        assert_eq!(moved_index(2, 0), 0);
+        assert_eq!(moved_index(2, 3), 2, "onto itself");
+    }
+
+    #[test]
+    fn middle_click_closes_a_tab_like_the_cross() {
+        use TabClick::*;
+        assert_eq!(tab_click(true, false, false, true), Some(Select));
+        assert_eq!(tab_click(false, true, false, true), Some(Close));
+        assert_eq!(tab_click(false, false, true, true), Some(Close));
+        assert_eq!(
+            tab_click(true, true, false, true),
+            Some(Close),
+            "close wins"
+        );
+        assert_eq!(tab_click(false, false, false, true), None);
+        // The New Tab page when it's all there is: a middle click does nothing.
+        assert_eq!(tab_click(false, true, false, false), None);
+        assert_eq!(tab_click(true, true, false, false), Some(Select));
     }
 }
