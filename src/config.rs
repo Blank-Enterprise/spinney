@@ -36,6 +36,40 @@ pub struct Config {
     /// What the Pull button does; `None` follows the repo's `pull.rebase` / `pull.ff`.
     /// Config-only until the Preferences window (#84).
     pub pull_strategy: Option<PullStrategy>,
+    /// Project lists folded away, on the New Tab page and the tab bar's dropdown alike.
+    pub collapsed: Collapsed,
+}
+
+/// Which of the project lists are collapsed.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Collapsed {
+    pub favourites: bool,
+    pub recent: bool,
+}
+
+/// One of the New Tab page's project lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProjectList {
+    Favourites,
+    Recent,
+}
+
+impl Collapsed {
+    pub fn get(self, list: ProjectList) -> bool {
+        match list {
+            ProjectList::Favourites => self.favourites,
+            ProjectList::Recent => self.recent,
+        }
+    }
+
+    pub fn toggle(&mut self, list: ProjectList) {
+        let flag = match list {
+            ProjectList::Favourites => &mut self.favourites,
+            ProjectList::Recent => &mut self.recent,
+        };
+        *flag = !*flag;
+    }
 }
 
 /// `pull_strategy` in config.toml: how a pull brings in the upstream's commits.
@@ -165,6 +199,10 @@ mod tests {
             diff_inline: true,
             merge_tool: MergeTool::Kaleidoscope,
             pull_strategy: Some(PullStrategy::Rebase),
+            collapsed: Collapsed {
+                favourites: true,
+                recent: false,
+            },
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), cfg);
@@ -187,6 +225,22 @@ mod tests {
         );
         assert_eq!(cfg.spaces[0].default_clone_dir, None);
         assert_eq!(cfg.spaces[0].ssh_key, None, "older configs stay on HTTPS");
+    }
+
+    #[test]
+    fn a_collapsed_list_stays_collapsed_after_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut cfg = Config::default();
+        assert!(!cfg.collapsed.get(ProjectList::Recent), "lists start open");
+        cfg.collapsed.toggle(ProjectList::Recent);
+        cfg.save_to(&path).unwrap();
+        let back = Config::load_from(&path).unwrap();
+        assert!(back.collapsed.get(ProjectList::Recent));
+        assert!(!back.collapsed.get(ProjectList::Favourites));
+        let mut c = back.collapsed;
+        c.toggle(ProjectList::Recent);
+        assert_eq!(c, Collapsed::default());
     }
 
     #[test]

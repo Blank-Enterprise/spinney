@@ -1,11 +1,17 @@
-//! The New Tab page: Open / Clone / Create and the space's recent projects.
+//! The New Tab page: Open / Clone / Create and the space's Favourites and Recent projects.
 
 use super::{paths, theme, Action};
-use crate::config::Space;
-use eframe::egui::{self, Color32, RichText, Stroke};
+use crate::config::{Collapsed, ProjectList, Space};
+use eframe::egui::{self, AtomExt, Color32, RichText, Stroke};
 use std::path::{Path, PathBuf};
 
-pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut Vec<Action>) {
+pub fn show(
+    ui: &mut egui::Ui,
+    space: &Space,
+    collapsed: Collapsed,
+    search: &mut String,
+    actions: &mut Vec<Action>,
+) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.set_max_width(640.0);
         ui.add_space(20.0);
@@ -40,19 +46,39 @@ pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut
                 .hint_text("Search")
                 .desired_width(f32::INFINITY),
         );
-        let home = paths::home();
-        let (favourites, recent) = sections(space, search, home.as_deref());
-        if !favourites.is_empty() {
-            ui.add_space(10.0);
-            ui.label(theme::section("Favourites"));
+        lists(ui, space, collapsed, search, actions);
+    });
+}
+
+/// The Favourites and Recent lists, each collapsible: on the New Tab page and in the tab
+/// bar's dropdown, so the two can't drift apart.
+pub fn lists(
+    ui: &mut egui::Ui,
+    space: &Space,
+    collapsed: Collapsed,
+    search: &str,
+    actions: &mut Vec<Action>,
+) {
+    let home = paths::home();
+    let (favourites, recent) = sections(space, search, home.as_deref());
+    if !favourites.is_empty() {
+        ui.add_space(10.0);
+        if list_header(
+            ui,
+            ProjectList::Favourites,
+            favourites.len(),
+            collapsed,
+            actions,
+        ) {
             theme::card().show(ui, |ui| {
                 for root in favourites {
                     project_row(ui, root, true, home.as_deref(), actions);
                 }
             });
         }
-        ui.add_space(10.0);
-        ui.label(theme::section("Recent"));
+    }
+    ui.add_space(10.0);
+    if list_header(ui, ProjectList::Recent, recent.len(), collapsed, actions) {
         theme::card().show(ui, |ui| {
             for root in &recent {
                 project_row(ui, root, false, home.as_deref(), actions);
@@ -67,10 +93,46 @@ pub fn show(ui: &mut egui::Ui, space: &Space, search: &mut String, actions: &mut
                 });
             }
         });
-    });
+    }
+}
+
+/// A list's clickable heading, ▾ open or ▸ collapsed; returns whether it's open.
+fn list_header(
+    ui: &mut egui::Ui,
+    list: ProjectList,
+    count: usize,
+    collapsed: Collapsed,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let shut = collapsed.get(list);
+    let header = egui::Label::new(theme::section(&header_text(list, count, shut)))
+        .selectable(false)
+        .sense(egui::Sense::click());
+    if ui
+        .add(header)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        actions.push(Action::ToggleCollapsed(list));
+    }
+    !shut
+}
+
+/// "▾ Favourites", or "▸ Recent · 12" when collapsed, so the count still shows.
+fn header_text(list: ProjectList, count: usize, collapsed: bool) -> String {
+    let name = match list {
+        ProjectList::Favourites => "Favourites",
+        ProjectList::Recent => "Recent",
+    };
+    if collapsed {
+        format!("▸ {name} · {count}")
+    } else {
+        format!("▾ {name}")
+    }
 }
 
 /// A project's row: a star to toggle Favourites, then its name and path, which open it.
+/// The path shrinks with an ellipsis so the name stays on one line.
 fn project_row(
     ui: &mut egui::Ui,
     root: &Path,
@@ -94,10 +156,12 @@ fn project_row(
             actions.push(Action::ToggleFavourite(root.to_path_buf()));
         }
         let shown = paths::abbreviate_home(root, home);
+        let path = RichText::new(&shown).color(theme::MUTED).atom_shrink(true);
         let row = egui::Button::selectable(false, RichText::new(folder_name(root)))
-            .right_text(RichText::new(shown).color(theme::MUTED))
+            .right_text(path)
+            .truncate()
             .min_size(egui::vec2(ui.available_width(), 0.0));
-        let r = ui.add(row);
+        let r = ui.add(row).on_hover_text(shown);
         if r.clicked() {
             actions.push(Action::OpenProject(root.to_path_buf()));
         }
@@ -187,5 +251,14 @@ mod tests {
         let (fav, recent) = sections(&space, "AL", None);
         assert_eq!(fav, [&p("/p/alpha")]);
         assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn a_collapsed_header_keeps_its_count() {
+        assert_eq!(
+            header_text(ProjectList::Favourites, 3, false),
+            "▾ Favourites"
+        );
+        assert_eq!(header_text(ProjectList::Recent, 12, true), "▸ Recent · 12");
     }
 }
