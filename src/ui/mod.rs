@@ -979,6 +979,7 @@ impl SpinneyApp {
                 let space = self.space().filter(|s| s.id == space_id);
                 if let Some(space) = space {
                     self.open_tab(&root, &space);
+                    self.remember_active();
                 }
             }
             JobKind::Fetch
