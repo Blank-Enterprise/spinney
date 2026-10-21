@@ -18,13 +18,12 @@ impl SpinneyApp {
             let mut dragged = None;
             for (i, tab) in self.tabs.iter().enumerate() {
                 let active = i == self.active_tab && !self.new_tab;
-                let (label, close, rect) = tab_button(ui, &tab.name(), active, true);
+                let (click, label, rect) = tab_button(ui, &tab.name(), active, true);
                 rects.push(rect);
-                if label.clicked() {
-                    actions.push(Action::SelectTab(i));
-                }
-                if close {
-                    actions.push(Action::CloseTab(i));
+                match click {
+                    Some(TabClick::Select) => actions.push(Action::SelectTab(i)),
+                    Some(TabClick::Close) => actions.push(Action::CloseTab(i)),
+                    None => {}
                 }
                 if label.dragged() || label.drag_stopped() {
                     dragged = Some((i, label));
@@ -35,7 +34,7 @@ impl SpinneyApp {
             }
             if self.new_tab {
                 let closable = !self.tabs.is_empty(); // with no tabs the page shows anyway
-                if tab_button(ui, "New Tab", true, closable).1 {
+                if tab_button(ui, "New Tab", true, closable).0 == Some(TabClick::Close) {
                     actions.push(Action::CloseNewTab);
                 }
             }
@@ -106,14 +105,32 @@ fn moved_index(from: usize, slot: usize) -> usize {
     }
 }
 
-/// A rounded-top tab, draggable by its name; returns (the name label's response, close
-/// clicked, the tab's rect).
+/// What a click on a tab asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TabClick {
+    Select,
+    Close,
+}
+
+/// A middle click anywhere on the tab closes it, as the × does; a left click on the name selects it.
+fn tab_click(left: bool, middle: bool, close: bool, closable: bool) -> Option<TabClick> {
+    if closable && (close || middle) {
+        Some(TabClick::Close)
+    } else if left {
+        Some(TabClick::Select)
+    } else {
+        None
+    }
+}
+
+/// A rounded-top tab, draggable by its name; returns (what a click asked for, the name
+/// label's response, the tab's rect).
 fn tab_button(
     ui: &mut egui::Ui,
     name: &str,
     active: bool,
     closable: bool,
-) -> (egui::Response, bool, egui::Rect) {
+) -> (Option<TabClick>, egui::Response, egui::Rect) {
     let (fill, color) = if active {
         (theme::BG, Color32::WHITE)
     } else {
@@ -151,7 +168,11 @@ fn tab_button(
             })
             .inner
         });
-    (frame.inner, close, frame.response.rect)
+    // Read from the input, so the frame's padding and the × count as well as the name.
+    let middle = frame.response.contains_pointer()
+        && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+    let click = tab_click(frame.inner.clicked(), middle, close, closable);
+    (click, frame.inner, frame.response.rect)
 }
 
 /// Current branch of the tab's active worktree, for the toolbar.
@@ -398,5 +419,22 @@ mod tests {
         // Tab 2 dragged to the front.
         assert_eq!(moved_index(2, 0), 0);
         assert_eq!(moved_index(2, 3), 2, "onto itself");
+    }
+
+    #[test]
+    fn middle_click_closes_a_tab_like_the_cross() {
+        use TabClick::*;
+        assert_eq!(tab_click(true, false, false, true), Some(Select));
+        assert_eq!(tab_click(false, true, false, true), Some(Close));
+        assert_eq!(tab_click(false, false, true, true), Some(Close));
+        assert_eq!(
+            tab_click(true, true, false, true),
+            Some(Close),
+            "close wins"
+        );
+        assert_eq!(tab_click(false, false, false, true), None);
+        // The New Tab page when it's all there is: a middle click does nothing.
+        assert_eq!(tab_click(false, true, false, false), None);
+        assert_eq!(tab_click(true, true, false, false), Some(Select));
     }
 }
