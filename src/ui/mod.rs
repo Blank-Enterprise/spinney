@@ -599,6 +599,11 @@ pub enum Action {
     EditSpace,
     SelectTab(usize),
     CloseTab(usize),
+    /// Drag a tab along the strip: it leaves index `from` and lands at `to`.
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
     /// Show the New Tab page; `CloseNewTab` hides it again.
     NewTab,
     CloseNewTab,
@@ -1098,6 +1103,15 @@ impl SpinneyApp {
                 self.remember_active();
             }
             Action::CloseTab(i) => self.close_tab(i), // the project stays in Recent
+            Action::MoveTab { from, to } => {
+                self.active_tab = move_item(&mut self.tabs, self.active_tab, from, to);
+                let order: Vec<PathBuf> = self.tabs.iter().map(|t| t.root.clone()).collect();
+                if let Some(space) = self.space() {
+                    if reorder_open(&mut self.config, &space.id, &order) {
+                        self.save_config();
+                    }
+                }
+            }
             Action::RemoveRecent(root) => {
                 if let Some(space) = self.space() {
                     if remove_project(&mut self.config, &space.id, &root) {
@@ -2455,6 +2469,37 @@ pub fn note_closed(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
     s.open.len() != before || was_active
 }
 
+/// Move `v[from]` to index `to`; returns where the item at `active` is now.
+pub fn move_item<T>(v: &mut Vec<T>, active: usize, from: usize, to: usize) -> usize {
+    if from >= v.len() || to >= v.len() || from == to {
+        return active;
+    }
+    let item = v.remove(from);
+    v.insert(to, item);
+    if active == from {
+        to
+    } else if from < active && active <= to {
+        active - 1
+    } else if to <= active && active < from {
+        active + 1
+    } else {
+        active
+    }
+}
+
+/// Save the tabs' new order as a space's open tabs. Missing projects, which have no tab,
+/// keep their place at the end. False if nothing changed.
+pub fn reorder_open(cfg: &mut Config, space_id: &str, order: &[PathBuf]) -> bool {
+    let Some(s) = cfg.spaces.iter_mut().find(|s| s.id == space_id) else {
+        return false;
+    };
+    let mut open = order.to_vec();
+    open.extend(s.open.iter().filter(|p| !order.contains(p)).cloned());
+    let changed = open != s.open;
+    s.open = open;
+    changed
+}
+
 /// Record the active tab's project; false if nothing changed.
 pub fn note_active(cfg: &mut Config, space_id: &str, path: Option<&Path>) -> bool {
     match cfg.spaces.iter_mut().find(|s| s.id == space_id) {
@@ -2622,6 +2667,42 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_tab_keeps_the_active_one_active() {
+        let order = |v: &[char]| v.iter().collect::<String>();
+        let mut v = vec!['a', 'b', 'c', 'd'];
+        assert_eq!(
+            move_item(&mut v, 0, 0, 3),
+            3,
+            "the active tab follows itself"
+        );
+        assert_eq!(order(&v), "bcda");
+        assert_eq!(move_item(&mut v, 3, 0, 2), 3, "after both: unmoved");
+        assert_eq!(order(&v), "cdba");
+        // c d b a, active `b` (2): move `c` past it, then `a` before it.
+        assert_eq!(move_item(&mut v, 2, 0, 3), 1);
+        assert_eq!(order(&v), "dbac");
+        assert_eq!(move_item(&mut v, 1, 2, 0), 2);
+        assert_eq!(order(&v), "adbc");
+        assert_eq!(move_item(&mut v, 1, 1, 1), 1, "onto itself");
+        assert_eq!(move_item(&mut v, 1, 9, 0), 1, "out of range");
+        assert_eq!(order(&v), "adbc");
+    }
+
+    #[test]
+    fn reordering_keeps_missing_projects_open() {
+        let mut c = cfg();
+        let p = |s: &str| PathBuf::from(s);
+        c.spaces[0].open = vec![p("/tmp/p1"), p("/tmp/gone"), p("/tmp/p2")];
+        assert!(reorder_open(&mut c, "a", &[p("/tmp/p2"), p("/tmp/p1")]));
+        assert_eq!(
+            c.spaces[0].open,
+            [p("/tmp/p2"), p("/tmp/p1"), p("/tmp/gone")]
+        );
+        assert!(!reorder_open(&mut c, "a", &[p("/tmp/p2"), p("/tmp/p1")]));
+        assert!(!reorder_open(&mut c, "nope", &[]));
+    }
+
+    #[test]
     fn repo_name_from_urls() {
         assert_eq!(repo_name_from_url("https://github.com/org/foo.git"), "foo");
         assert_eq!(repo_name_from_url("https://github.com/org/foo"), "foo");
@@ -2783,6 +2864,31 @@ mod tests {
         let app = reload();
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.tabs[0].root, roots[2]);
+    }
+
+    #[test]
+    fn a_moved_tab_order_comes_back_on_the_next_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let repos = [repo(1), repo(1), repo(1)];
+        let roots: Vec<PathBuf> = repos
+            .iter()
+            .map(|r| r.path().canonicalize().unwrap())
+            .collect();
+        let mut app = test_app(cfg(), &cfg_path);
+        for root in &roots {
+            app.apply(Action::OpenProject(root.clone()));
+        }
+        app.apply(Action::SelectTab(0));
+        app.apply(Action::MoveTab { from: 0, to: 2 });
+        assert_eq!(app.active_tab, 2);
+
+        let mut app = test_app(Config::load_from(&cfg_path).unwrap(), &cfg_path);
+        app.open_visible_tabs();
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let open: Vec<_> = app.tabs.iter().map(|t| t.root.clone()).collect();
+        assert_eq!(open, [roots[1].clone(), roots[2].clone(), roots[0].clone()]);
+        assert_eq!(app.active_tab, 2, "the moved tab is still the active one");
     }
 
     #[test]
