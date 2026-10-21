@@ -872,23 +872,47 @@ impl SpinneyApp {
         active_space(&self.config).cloned()
     }
 
+    /// Reopen the active space's open tabs in order, with the saved one active.
     fn open_visible_tabs(&mut self) {
         self.tabs.clear();
         self.active_tab = 0;
         let Some(space) = self.space() else { return };
         for root in visible_projects(&self.config) {
-            self.open_tab(&root, &space);
+            // Missing (deleted, or on an unmounted drive): no tab, no error, kept in `open`.
+            if root.exists() {
+                self.open_tab(&root, &space);
+            }
         }
+        if let Some(i) = space
+            .active
+            .and_then(|a| self.tabs.iter().position(|t| t.root == a))
+        {
+            self.active_tab = i;
+        }
+        self.remember_active();
     }
 
+    /// Open a tab for `root`, make it active and add it to the space's open tabs.
     fn open_tab(&mut self, root: &Path, space: &Space) {
         match ProjectTab::open(root, space, &self.ctx, &mut self.jobs, &mut self.errors) {
             Ok(tab) => {
                 self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
                 self.new_tab = false;
+                if note_open(&mut self.config, &space.id, root) {
+                    self.save_config();
+                }
             }
             Err(e) => self.errors.push(format!("{e:#}")),
+        }
+    }
+
+    /// Save which tab is active, so the next launch restores it.
+    fn remember_active(&mut self) {
+        let Some(space) = self.space() else { return };
+        let root = self.tabs.get(self.active_tab).map(|t| t.root.clone());
+        if note_active(&mut self.config, &space.id, root.as_deref()) {
+            self.save_config();
         }
     }
 
@@ -1070,6 +1094,7 @@ impl SpinneyApp {
                 if let Some(tab) = self.tabs.get_mut(i) {
                     tab.reload_changes(&mut errors);
                 }
+                self.remember_active();
             }
             Action::CloseTab(i) => self.close_tab(i), // the project stays in Recent
             Action::RemoveRecent(root) => {
@@ -1575,10 +1600,17 @@ impl SpinneyApp {
         });
     }
 
+    /// Close tab `i`; its project leaves the open tabs but stays in Recent.
     fn close_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
-            self.tabs.remove(i);
+            let tab = self.tabs.remove(i);
             self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+            if let Some(space) = self.space() {
+                if note_closed(&mut self.config, &space.id, &tab.root) {
+                    self.save_config();
+                }
+            }
+            self.remember_active();
         }
     }
 
@@ -2392,9 +2424,45 @@ pub fn active_space(cfg: &Config) -> Option<&Space> {
         .or(cfg.spaces.first())
 }
 
-/// Projects whose tabs are visible: those of the active space.
+/// Projects whose tabs are visible: the active space's open tabs, not all of Recent.
 pub fn visible_projects(cfg: &Config) -> Vec<PathBuf> {
-    active_space(cfg).map_or_else(Vec::new, |s| s.projects.clone())
+    active_space(cfg).map_or_else(Vec::new, |s| s.open.clone())
+}
+
+/// Record that `path` has a tab open in a space (at the end); false if nothing changed.
+pub fn note_open(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
+    match cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+        Some(s) if !s.open.iter().any(|p| p == path) => {
+            s.open.push(path.to_path_buf());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Record that `path`'s tab closed; it stays in Recent. False if nothing changed.
+pub fn note_closed(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
+    let Some(s) = cfg.spaces.iter_mut().find(|s| s.id == space_id) else {
+        return false;
+    };
+    let before = s.open.len();
+    s.open.retain(|p| p != path);
+    let was_active = s.active.as_deref() == Some(path);
+    if was_active {
+        s.active = None;
+    }
+    s.open.len() != before || was_active
+}
+
+/// Record the active tab's project; false if nothing changed.
+pub fn note_active(cfg: &mut Config, space_id: &str, path: Option<&Path>) -> bool {
+    match cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+        Some(s) if s.active.as_deref() != path => {
+            s.active = path.map(Path::to_path_buf);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Make `id` the active space; false when no such space exists.
@@ -2424,6 +2492,10 @@ pub fn remove_project(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
     };
     let before = s.projects.len();
     s.projects.retain(|p| p != path);
+    s.open.retain(|p| p != path);
+    if s.active.as_deref() == Some(path) {
+        s.active = None;
+    }
     s.projects.len() != before
 }
 
@@ -2484,6 +2556,9 @@ mod tests {
     #[test]
     fn switching_space_swaps_visible_projects() {
         let mut c = cfg();
+        for s in &mut c.spaces {
+            s.open = s.projects.clone();
+        }
         assert_eq!(
             visible_projects(&c),
             [PathBuf::from("/tmp/p1"), PathBuf::from("/tmp/p2")]
@@ -2513,6 +2588,36 @@ mod tests {
             back.spaces[1].projects,
             [PathBuf::from("/tmp/p3"), PathBuf::from("/tmp/p4")]
         );
+    }
+
+    #[test]
+    fn open_tabs_are_tracked_apart_from_recent() {
+        let mut c = cfg();
+        let (p1, p2) = (Path::new("/tmp/p1"), Path::new("/tmp/p2"));
+        // An older config has no open tabs: nothing reopens, Recent is untouched.
+        assert!(visible_projects(&c).is_empty());
+        assert!(note_open(&mut c, "a", p2));
+        assert!(note_open(&mut c, "a", p1));
+        assert!(!note_open(&mut c, "a", p1), "dedupe");
+        assert!(!note_open(&mut c, "nope", p1));
+        assert_eq!(visible_projects(&c), [p2, p1], "in the order opened");
+        assert!(note_active(&mut c, "a", Some(p1)));
+        assert!(!note_active(&mut c, "a", Some(p1)));
+
+        assert!(note_closed(&mut c, "a", p1));
+        assert!(!note_closed(&mut c, "a", p1));
+        assert_eq!(visible_projects(&c), [p2]);
+        assert_eq!(
+            c.spaces[0].active, None,
+            "a closed tab isn't the active one"
+        );
+        assert_eq!(c.spaces[0].projects, [p1, p2], "still in Recent");
+
+        // Removing from Recent also forgets the open tab.
+        assert!(note_active(&mut c, "a", Some(p2)));
+        assert!(remove_project(&mut c, "a", p2));
+        assert!(c.spaces[0].open.is_empty());
+        assert_eq!(c.spaces[0].active, None);
     }
 
     #[test]
@@ -2638,6 +2743,45 @@ mod tests {
             confirm_op: None,
             confirm_resolve: None,
         }
+    }
+
+    #[test]
+    fn closed_tabs_stay_closed_and_open_ones_come_back_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let (a, b, c) = (repo(1), repo(1), repo(1));
+        let roots: Vec<PathBuf> = [&a, &b, &c]
+            .iter()
+            .map(|r| r.path().canonicalize().unwrap())
+            .collect();
+        let mut app = test_app(cfg(), &cfg_path);
+        for root in &roots {
+            app.apply(Action::OpenProject(root.clone()));
+        }
+        app.apply(Action::SelectTab(0));
+        app.apply(Action::CloseTab(1));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+
+        let reload = || {
+            let mut app = test_app(Config::load_from(&cfg_path).unwrap(), &cfg_path);
+            app.open_visible_tabs();
+            assert!(app.errors.is_empty(), "{:?}", app.errors);
+            app
+        };
+        let app = reload();
+        let open: Vec<_> = app.tabs.iter().map(|t| t.root.clone()).collect();
+        assert_eq!(open, [roots[0].clone(), roots[2].clone()]);
+        assert_eq!(app.active_tab, 0, "the active tab is restored");
+        assert!(
+            app.config.spaces[0].projects.contains(&roots[1]),
+            "in Recent"
+        );
+
+        // A project deleted outside Spinney opens no tab and shows no error.
+        drop(a);
+        let app = reload();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].root, roots[2]);
     }
 
     #[test]

@@ -13,7 +13,12 @@ pub struct Space {
     pub author_name: String,
     pub author_email: String,
     pub default_clone_dir: Option<PathBuf>,
+    /// Recent: every project opened in this space, kept when its tab closes.
     pub projects: Vec<PathBuf>,
+    /// The projects with a tab open, in tab order; restored on launch and space switch.
+    pub open: Vec<PathBuf>,
+    /// The project whose tab was last active.
+    pub active: Option<PathBuf>,
     /// Private key git uses over SSH for this space's host; `None` = HTTPS with the token.
     pub ssh_key: Option<PathBuf>,
 }
@@ -149,6 +154,8 @@ mod tests {
                 author_email: "test@example.com".into(),
                 default_clone_dir: Some(PathBuf::from("/tmp/code")),
                 projects: vec![PathBuf::from("/tmp/code/p")],
+                open: vec![PathBuf::from("/tmp/code/p")],
+                active: Some(PathBuf::from("/tmp/code/p")),
                 ssh_key: Some(PathBuf::from("/tmp/keys/id_ed25519")),
             }],
             active_space: Some("work-abc123".into()),
@@ -170,6 +177,10 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.spaces[0].id, "w-1");
         assert!(cfg.spaces[0].projects.is_empty());
+        assert!(
+            cfg.spaces[0].open.is_empty(),
+            "an older config reopens no tabs"
+        );
         assert_eq!(cfg.spaces[0].default_clone_dir, None);
         assert_eq!(cfg.spaces[0].ssh_key, None, "older configs stay on HTTPS");
     }
