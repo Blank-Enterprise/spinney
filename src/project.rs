@@ -304,6 +304,7 @@ mod tests {
             default_clone_dir: None,
             projects: vec![],
             ssh_key: None,
+            ..Default::default()
         }
     }
 
