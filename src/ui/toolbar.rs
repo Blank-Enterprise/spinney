@@ -1,7 +1,7 @@
 //! Top of the window: the project tab strip and the repository toolbar.
 
-use super::{active_space, spaces, theme, Action, JobKind, ProjectTab, SpinneyApp};
-use crate::config::PullStrategy;
+use super::{active_space, new_tab, spaces, theme, Action, JobKind, ProjectTab, SpinneyApp};
+use crate::config::{Collapsed, PullStrategy, Space};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Vec2,
 };
@@ -10,10 +10,21 @@ use std::path::Path;
 /// Inactive tab text.
 const TAB_TEXT: Color32 = Color32::from_rgb(0x8b, 0x93, 0xa7);
 
+/// The tallest the Repositories dropdown's lists get before they scroll.
+const LIST_MAX_H: f32 = 420.0;
+
 impl SpinneyApp {
-    pub(super) fn tab_strip(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    pub(super) fn tab_strip(
+        &self,
+        ui: &mut egui::Ui,
+        search: &mut String,
+        actions: &mut Vec<Action>,
+    ) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let space = active_space(&self.config);
+            repositories_button(ui, space, self.config.collapsed, search, actions);
+            ui.add_space(6.0);
             for (i, tab) in self.tabs.iter().enumerate() {
                 let active = i == self.active_tab && !self.new_tab;
                 let (label, close) = tab_button(ui, &tab.name(), active, true);
@@ -30,7 +41,7 @@ impl SpinneyApp {
                     actions.push(Action::CloseNewTab);
                 }
             }
-            let has_space = active_space(&self.config).is_some();
+            let has_space = space.is_some();
             let plus =
                 egui::Button::new(RichText::new("+").size(16.0).color(TAB_TEXT)).frame(false);
             if ui
@@ -49,6 +60,55 @@ impl SpinneyApp {
             });
         });
     }
+}
+
+/// The fixed button at the left of the strip. A click opens the New Tab page; a right
+/// click drops down the same Favourites and Recent lists, to open a project from any tab.
+fn repositories_button(
+    ui: &mut egui::Ui,
+    space: Option<&Space>,
+    collapsed: Collapsed,
+    search: &mut String,
+    actions: &mut Vec<Action>,
+) {
+    let icon = egui::Button::new(RichText::new("☰").size(15.0).color(TAB_TEXT)).frame(false);
+    let r = ui
+        .add_enabled(space.is_some(), icon)
+        .on_hover_text("Repositories · right-click for a quick list");
+    if r.clicked() {
+        actions.push(Action::NewTab);
+    }
+    let Some(space) = space else { return };
+    egui::Popup::from_response(&r)
+        .open_memory(
+            r.secondary_clicked()
+                .then_some(egui::SetOpenCommand::Toggle),
+        )
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .layout(egui::Layout::top_down_justified(Align::Min))
+        .width(420.0)
+        .show(|ui| {
+            // The area starts each frame at last frame's size; let the list grow past it
+            // when a star or an unfolded list adds rows.
+            ui.set_max_height(LIST_MAX_H + 40.0);
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text("Search")
+                    .desired_width(f32::INFINITY),
+            );
+            let before = actions.len();
+            egui::ScrollArea::vertical()
+                .max_height(LIST_MAX_H)
+                .show(ui, |ui| {
+                    new_tab::lists(ui, space, collapsed, search, actions);
+                });
+            if actions[before..]
+                .iter()
+                .any(|a| matches!(a, Action::OpenProject(_)))
+            {
+                ui.close();
+            }
+        });
 }
 
 /// A rounded-top tab; returns (the name label's response, close clicked).

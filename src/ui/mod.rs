@@ -612,6 +612,8 @@ pub enum Action {
     RemoveRecent(PathBuf),
     /// Star or unstar a project in the active space's Favourites.
     ToggleFavourite(PathBuf),
+    /// Fold or unfold the Favourites or Recent list.
+    ToggleCollapsed(crate::config::ProjectList),
     Fetch,
     /// Pull the active worktree's upstream with this strategy.
     Pull(PullStrategy),
@@ -1090,6 +1092,10 @@ impl SpinneyApp {
                         self.save_config();
                     }
                 }
+            }
+            Action::ToggleCollapsed(list) => {
+                self.config.collapsed.toggle(list);
+                self.save_config();
             }
             Action::NewTab => {
                 self.new_tab = true;
@@ -2198,7 +2204,13 @@ impl eframe::App for SpinneyApp {
         egui::Panel::top("tabs")
             .frame(strip)
             .show_separator_line(false)
-            .show(ui, |ui| self.tab_strip(ui, &mut actions));
+            .show(ui, |ui| {
+                // Taken for the frame: the strip's dropdown edits the search it shares
+                // with the New Tab page.
+                let mut search = std::mem::take(&mut self.recent_search);
+                self.tab_strip(ui, &mut search, &mut actions);
+                self.recent_search = search;
+            });
         if !self.showing_new_tab() {
             if let Some(tab) = self.tabs.get(self.active_tab) {
                 let projects = active_space(&self.config).map_or(&[][..], |s| &s.projects[..]);
@@ -2376,7 +2388,13 @@ impl eframe::App for SpinneyApp {
             });
         } else {
             egui::CentralPanel::default().show(ui, |ui| match active_space(&self.config) {
-                Some(space) => new_tab::show(ui, space, &mut self.recent_search, &mut actions),
+                Some(space) => new_tab::show(
+                    ui,
+                    space,
+                    self.config.collapsed,
+                    &mut self.recent_search,
+                    &mut actions,
+                ),
                 None => {
                     ui.label("Create a space to get started.");
                     if ui.add(theme::primary("New space…")).clicked() {
