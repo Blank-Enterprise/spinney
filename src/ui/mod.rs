@@ -755,6 +755,8 @@ pub enum Action {
     AskInteractiveRebase(String),
     /// Ask before resetting the checked-out branch to the commit with this SHA.
     AskReset(String, actions::ResetMode),
+    /// Ask before hard resetting this local branch to its upstream, dropping its local commits.
+    AskResetToUpstream(String),
     /// "Create branch here…" on the detached-HEAD banner: a new branch at HEAD, switched to.
     AttachBranch,
     /// "Create branch here…" on a commit: the new-branch dialog with the commit as base,
@@ -1414,6 +1416,7 @@ impl SpinneyApp {
             Action::Revert(sha) => self.ask_revert(sha, &mut errors),
             Action::AskInteractiveRebase(sha) => self.ask_interactive(&sha, &mut errors),
             Action::AskReset(sha, mode) => self.ask_reset(&sha, mode, &mut errors),
+            Action::AskResetToUpstream(b) => self.ask_reset_to_upstream(&b, &mut errors),
             Action::AttachBranch => {
                 let head = self
                     .tabs
@@ -2406,6 +2409,7 @@ impl eframe::App for SpinneyApp {
                 let menu = graph_view::MenuContext {
                     dirty: graph_view::clean_blocked(&tab.status, tab.operation),
                     branch: branch.map(|b| b.name.clone()),
+                    upstream: branch.and_then(|b| b.upstream.clone()),
                     operation: tab.operation,
                     on_head: &tab.on_head,
                     picked: &tab.picked,

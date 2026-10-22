@@ -762,6 +762,20 @@ pub fn fast_forward_item(b: &Branch, checked_out: &[&str]) -> Option<(String, Op
     Some((format!("Fast-forward to {up}"), why))
 }
 
+/// "Reset x to origin/x…" for a local branch with an upstream, and why it is disabled (if
+/// it is): checked out in another worktree. None for a remote branch or without upstream.
+pub fn reset_upstream_item(
+    b: &Branch,
+    current: Option<&str>,
+    checked_out: &[&str],
+) -> Option<(String, Option<String>)> {
+    let up = b.upstream.as_deref().filter(|_| !b.remote)?;
+    let name = b.name.as_str();
+    let elsewhere = current != Some(name) && checked_out.contains(&name);
+    let why = elsewhere.then(|| format!("{name} is checked out in another worktree"));
+    Some((format!("Reset {name} to {up}…"), why))
+}
+
 fn branch_menu(r: &egui::Response, b: &Branch, cx: Ctx, actions: &mut Vec<Action>) {
     let Ctx { current, .. } = cx;
     let name = b.name.as_str();
@@ -812,6 +826,17 @@ fn branch_menu(r: &egui::Response, b: &Branch, cx: Ctx, actions: &mut Vec<Action
             }
         }
         ui.separator();
+        if let Some((label, why)) = reset_upstream_item(b, current, cx.checked_out) {
+            let r = ui.add_enabled(why.is_none(), egui::Button::new(label));
+            let r = match &why {
+                Some(why) => r.on_disabled_hover_text(why),
+                None => r,
+            };
+            if r.clicked() {
+                actions.push(Action::AskResetToUpstream(name.to_string()));
+                ui.close();
+            }
+        }
         if !b.remote && ui.button("Rename…").clicked() {
             actions.push(Action::AskRename(name.to_string()));
             ui.close();
@@ -1206,6 +1231,25 @@ mod tests {
         let mut r = branch("origin/main");
         (r.remote, r.behind, r.upstream) = (true, 1, Some("x".into()));
         assert_eq!(fast_forward_item(&r, &[]), None, "remote branch");
+    }
+
+    #[test]
+    fn reset_to_upstream_offered_for_local_branches_with_one() {
+        let mut b = branch("feat/x");
+        assert_eq!(reset_upstream_item(&b, None, &[]), None, "no upstream");
+        b.upstream = Some("origin/feat/x".into());
+        let offered = Some(("Reset feat/x to origin/feat/x…".into(), None));
+        assert_eq!(reset_upstream_item(&b, None, &[]), offered, "even in sync");
+        let here = reset_upstream_item(&b, Some("feat/x"), &["feat/x"]);
+        assert_eq!(here, offered, "checked out here");
+        let (_, why) = reset_upstream_item(&b, Some("main"), &["main", "feat/x"]).unwrap();
+        assert_eq!(
+            why.as_deref(),
+            Some("feat/x is checked out in another worktree")
+        );
+        let mut r = branch("origin/feat/x");
+        (r.remote, r.upstream) = (true, Some("x".into()));
+        assert_eq!(reset_upstream_item(&r, None, &[]), None, "remote branch");
     }
 
     #[test]

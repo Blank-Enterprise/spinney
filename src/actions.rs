@@ -120,9 +120,15 @@ pub struct ResetPlan {
     pub pushed: usize,
     /// Tracked files with uncommitted (staged or unstaged) changes: what a hard reset loses.
     pub changed: Vec<String>,
+    /// The branch's upstream (e.g. `origin/main`) when `target` is its tip: `dropped` are
+    /// then the local commits not on it, and `target` needn't be on the branch's history.
+    pub upstream: Option<String>,
+    /// The branch is checked out in the worktree; otherwise only its ref moves.
+    pub checked_out: bool,
 }
 
-/// Plan resetting the checked-out branch to `target`, which must be on its history.
+/// Plan resetting the checked-out branch to `target`, which must be on its history or be
+/// the tip of its upstream (after a force push, it usually isn't on the history).
 pub fn reset_plan(worktree: &Path, target: &str) -> Result<ResetPlan> {
     let Some(branch) = refs::current_branch(worktree)? else {
         bail!("Check out a branch first");
@@ -132,19 +138,62 @@ pub fn reset_plan(worktree: &Path, target: &str) -> Result<ResetPlan> {
     }
     let head = rev_parse(worktree, "HEAD")?;
     let target = rev_parse(worktree, &format!("{target}^{{commit}}"))?;
-    if !is_ancestor(worktree, &target, "HEAD")? {
+    let tip = |up: &String| rev_parse(worktree, &format!("{up}^{{commit}}")).ok();
+    let upstream = upstream_of(worktree, &branch)?.filter(|up| tip(up).as_ref() == Some(&target));
+    if upstream.is_none() && !is_ancestor(worktree, &target, "HEAD")? {
         bail!("{} isn't on {branch}'s history", &target[..8]);
     }
-    let range = format!("{target}..{head}");
-    let dropped = git::run(worktree, &["rev-list", "--count", &range])?;
     Ok(ResetPlan {
-        dropped: dropped.trim().parse()?,
+        dropped: count_range(worktree, &target, &head)?,
         pushed: pushed_not_on(worktree, &target)?,
         changed: changed_tracked(worktree)?,
+        upstream,
+        checked_out: true,
         branch,
         head,
         target,
     })
+}
+
+/// Plan resetting local `branch` to its upstream's tip, dropping its commits not on it. A
+/// branch not checked out in `worktree` only has its ref moved, and is refused when another
+/// worktree has it checked out.
+pub fn reset_to_upstream_plan(worktree: &Path, branch: &str) -> Result<ResetPlan> {
+    let Some(up) = upstream_of(worktree, branch)? else {
+        bail!("{branch} has no upstream");
+    };
+    if refs::current_branch(worktree)?.as_deref() == Some(branch) {
+        return reset_plan(worktree, &up);
+    }
+    ensure_not_checked_out(worktree, branch)?;
+    let head = rev_parse(worktree, &format!("refs/heads/{branch}"))?;
+    let target = rev_parse(worktree, &format!("{up}^{{commit}}"))?;
+    Ok(ResetPlan {
+        branch: branch.to_string(),
+        dropped: count_range(worktree, &target, &head)?,
+        pushed: 0,
+        changed: vec![],
+        upstream: Some(up),
+        checked_out: false,
+        head,
+        target,
+    })
+}
+
+/// The short name of local `branch`'s upstream (e.g. `origin/main`), if it has one.
+fn upstream_of(worktree: &Path, branch: &str) -> Result<Option<String>> {
+    let local = format!("refs/heads/{branch}");
+    let up = git::run(worktree, &["for-each-ref", "--format=%(upstream)", &local])?;
+    let up = up.trim();
+    let short = up.strip_prefix("refs/remotes/").unwrap_or(up);
+    Ok((!short.is_empty()).then(|| short.to_string()))
+}
+
+/// Commits reachable from `to` but not from `from`.
+fn count_range(worktree: &Path, from: &str, to: &str) -> Result<usize> {
+    let range = format!("{from}..{to}");
+    let n = git::run(worktree, &["rev-list", "--count", &range])?;
+    Ok(n.trim().parse()?)
 }
 
 /// Tracked files that differ from HEAD in the index or the worktree.
@@ -157,8 +206,20 @@ fn changed_tracked(worktree: &Path) -> Result<Vec<String>> {
 }
 
 /// Reset as planned in `plan`, refusing when the branch, HEAD or (for a hard reset) the
-/// uncommitted changes are no longer what the user was shown.
+/// uncommitted changes are no longer what the user was shown. A branch not checked out
+/// only has its ref moved (like `git branch -f`), refused if a worktree has it out now.
 pub fn reset(worktree: &Path, plan: &ResetPlan, mode: ResetMode) -> Result<()> {
+    if !plan.checked_out {
+        ensure_not_checked_out(worktree, &plan.branch)?;
+        // Pinned to `head`: if the branch moved since the user was asked, nothing changes.
+        let local = format!("refs/heads/{}", plan.branch);
+        let msg = format!("reset: moving to {}", plan.target);
+        let args = ["update-ref", "-m", &msg, &local, &plan.target, &plan.head];
+        if git::run(worktree, &args).is_err() {
+            bail!("{} moved since you were asked; try again", plan.branch);
+        }
+        return Ok(());
+    }
     let branch = refs::current_branch(worktree)?;
     if branch.as_deref() != Some(&plan.branch) || rev_parse(worktree, "HEAD")? != plan.head {
         bail!("{} moved since you were asked; try again", plan.branch);
@@ -1381,14 +1442,10 @@ pub(crate) fn is_ancestor(worktree: &Path, a: &str, b: &str) -> Result<bool> {
 /// Fast-forward local `branch`, checked out nowhere, to its upstream without checking it
 /// out (handy for `main` in the worktree layout).
 pub fn fast_forward(worktree: &Path, branch: &str) -> Result<MergeOutcome> {
-    let local = format!("refs/heads/{branch}");
-    let up = git::run(worktree, &["for-each-ref", "--format=%(upstream)", &local])?;
-    let up = up.trim();
-    if up.is_empty() {
+    let Some(up) = upstream_of(worktree, branch)? else {
         bail!("{branch} has no upstream");
-    }
-    let short = up.strip_prefix("refs/remotes/").unwrap_or(up);
-    fast_forward_to(worktree, branch, short)
+    };
+    fast_forward_to(worktree, branch, &up)
 }
 
 /// Whether local `branch` can move forward to `target`: it is behind and not diverged.
@@ -2476,6 +2533,91 @@ mod tests {
         assert_eq!((plan.dropped, plan.pushed), (1, 0), "only d is dropped");
         g(&main, &["switch", "-q", "-c", "topic"]);
         assert_eq!(reset_plan(&main, &init).unwrap().pushed, 0, "no upstream");
+    }
+
+    #[test]
+    fn reset_to_upstream_after_a_force_push_drops_local_commits() {
+        let (tmp, _root, main) = cloned();
+        write_commit(&main, "c.txt");
+        // The remote's tip is rewritten, as a force push would: local main has diverged.
+        let remote = remote_dir(&tmp);
+        g(&remote, &["config", "user.name", "Test User"]);
+        g(&remote, &["commit", "-q", "--amend", "-m", "rewritten"]);
+        fetch(&main).unwrap();
+        std::fs::write(main.join("a.txt"), "edited\n").unwrap();
+        let plan = reset_to_upstream_plan(&main, "main").unwrap();
+        assert_eq!(plan.upstream.as_deref(), Some("origin/main"));
+        assert!(plan.checked_out);
+        assert_eq!(
+            (plan.dropped, &plan.changed[..]),
+            (2, &["a.txt".into()][..])
+        );
+        // The graph's reset on the upstream's tip plans the same.
+        assert_eq!(reset_plan(&main, "origin/main").unwrap(), plan);
+        reset(&main, &plan, ResetMode::Hard).unwrap();
+        assert_eq!(head(&main, "HEAD"), head(&main, "origin/main"));
+        assert_eq!(std::fs::read_to_string(main.join("a.txt")).unwrap(), "a\n");
+        assert!(!main.join("c.txt").exists());
+    }
+
+    #[test]
+    fn reset_to_upstream_when_only_behind_moves_forward() {
+        let (tmp, _root, main) = cloned();
+        let remote = remote_dir(&tmp);
+        g(&remote, &["config", "user.name", "Test User"]);
+        write_commit(&remote, "r.txt");
+        fetch(&main).unwrap();
+        let plan = reset_to_upstream_plan(&main, "main").unwrap();
+        assert_eq!(plan.dropped, 0);
+        reset(&main, &plan, ResetMode::Hard).unwrap();
+        assert_eq!(head(&main, "HEAD"), head(&main, "origin/main"));
+        assert!(main.join("r.txt").exists());
+    }
+
+    #[test]
+    fn reset_to_upstream_refuses_a_branch_without_one() {
+        let (_tmp, _root, main) = cloned();
+        create_branch(&main, "topic", "main").unwrap();
+        let err = reset_to_upstream_plan(&main, "topic").unwrap_err();
+        assert!(err.to_string().contains("topic has no upstream"), "{err}");
+    }
+
+    #[test]
+    fn reset_to_upstream_moves_a_branch_that_is_not_checked_out() {
+        let (_tmp, _root, main) = behind();
+        let tip = head(&main, "feature/x");
+        let tree = format!("{tip}^{{tree}}");
+        let local = g(&main, &["commit-tree", &tree, "-p", &tip, "-m", "local"]);
+        g(&main, &["update-ref", "refs/heads/feature/x", &local]);
+        std::fs::write(main.join("a.txt"), "edited\n").unwrap();
+        let before = snapshot(&main);
+        let plan = reset_to_upstream_plan(&main, "feature/x").unwrap();
+        assert!(!plan.checked_out);
+        assert_eq!((plan.dropped, plan.changed.len()), (1, 0));
+        // Moved after asking: refused, nothing changes.
+        g(&main, &["update-ref", "refs/heads/feature/x", &tip]);
+        let err = reset(&main, &plan, ResetMode::Hard).unwrap_err();
+        assert!(err.to_string().contains("moved since"), "{err}");
+        assert_eq!(head(&main, "feature/x"), tip);
+        g(&main, &["update-ref", "refs/heads/feature/x", &local]);
+        reset(&main, &plan, ResetMode::Hard).unwrap();
+        assert_eq!(head(&main, "feature/x"), head(&main, "origin/feature/x"));
+        assert_eq!(snapshot(&main), before, "the dirty worktree is untouched");
+        let up = g(&main, &["rev-parse", "--abbrev-ref", "feature/x@{u}"]);
+        assert_eq!(up, "origin/feature/x", "still tracking");
+    }
+
+    #[test]
+    fn reset_to_upstream_refuses_a_branch_checked_out_elsewhere() {
+        let (_tmp, root, main) = behind();
+        let plan = reset_to_upstream_plan(&main, "feature/x").unwrap();
+        let wt = add_worktree_existing(&root, "feature/x").unwrap();
+        let tip = head(&wt, "HEAD");
+        let err = reset_to_upstream_plan(&main, "feature/x").unwrap_err();
+        assert!(err.to_string().contains("checked out in worktree"), "{err}");
+        let err = reset(&main, &plan, ResetMode::Hard).unwrap_err();
+        assert!(err.to_string().contains("checked out in worktree"), "{err}");
+        assert_eq!(head(&main, "feature/x"), tip);
     }
 
     #[test]

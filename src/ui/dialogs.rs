@@ -580,13 +580,16 @@ pub(super) fn reset_text(plan: &ResetPlan, mode: ResetMode) -> (String, String, 
         ResetMode::Mixed => "mixed",
         ResetMode::Hard => "hard",
     };
-    let question = format!("Reset {branch} to {short} ({name})?");
-    let moves = match plan.dropped {
-        0 => format!("{branch} stays at this commit."),
-        1 => format!("{branch} moves back 1 commit."),
-        n => format!("{branch} moves back {n} commits."),
+    let to = plan.upstream.as_deref().unwrap_or(short);
+    let question = format!("Reset {branch} to {to} ({name})?");
+    let moves = match (&plan.upstream, plan.dropped) {
+        (Some(up), _) => format!("{branch} moves to {up} as of the last fetch."),
+        (None, 0) => format!("{branch} stays at this commit."),
+        (None, 1) => format!("{branch} moves back 1 commit."),
+        (None, n) => format!("{branch} moves back {n} commits."),
     };
     let what = match mode {
+        _ if !plan.checked_out => "It isn't checked out here, so no files change.",
         ResetMode::Soft => "Their changes stay staged, and your uncommitted changes are kept.",
         ResetMode::Mixed => {
             "Their changes, and anything staged, become unstaged changes; no file is changed."
@@ -597,6 +600,15 @@ pub(super) fn reset_text(plan: &ResetPlan, mode: ResetMode) -> (String, String, 
         }
     };
     let mut warnings = vec![];
+    if let Some(up) = plan.upstream.as_ref().filter(|_| plan.dropped > 0) {
+        let commits = match plan.dropped {
+            1 => "1 local commit".to_string(),
+            n => format!("{n} local commits"),
+        };
+        warnings.push(format!(
+            "{commits} not on {up} will be dropped from {branch}; only the reflog can recover them."
+        ));
+    }
     if mode == ResetMode::Hard && !plan.changed.is_empty() {
         let files = match plan.changed.len() {
             1 => "1 file".to_string(),
@@ -1566,6 +1578,21 @@ impl SpinneyApp {
 
     /// Open the reset confirmation, refusing now what would fail anyway.
     pub(super) fn ask_reset(&mut self, sha: &str, mode: ResetMode, errors: &mut Vec<String>) {
+        self.ask_reset_with(|wt| actions::reset_plan(wt, sha), mode, errors);
+    }
+
+    /// Open the hard reset confirmation for moving local `branch` to its upstream.
+    pub(super) fn ask_reset_to_upstream(&mut self, branch: &str, errors: &mut Vec<String>) {
+        let plan = |wt: &Path| actions::reset_to_upstream_plan(wt, branch);
+        self.ask_reset_with(plan, ResetMode::Hard, errors);
+    }
+
+    fn ask_reset_with(
+        &mut self,
+        plan: impl FnOnce(&Path) -> anyhow::Result<ResetPlan>,
+        mode: ResetMode,
+        errors: &mut Vec<String>,
+    ) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -1573,7 +1600,7 @@ impl SpinneyApp {
         if self.jobs.network_busy(&tab.root) {
             return errors.push("Wait for the running fetch, pull or push".into());
         }
-        match actions::reset_plan(&tab.active_worktree, sha) {
+        match plan(&tab.active_worktree) {
             Ok(plan) => {
                 self.dialogs.reset = Some(ResetDialog {
                     root: tab.root.clone(),
@@ -2534,7 +2561,37 @@ mod tests {
             dropped,
             pushed,
             changed: changed.iter().map(|s| s.to_string()).collect(),
+            upstream: None,
+            checked_out: true,
         }
+    }
+
+    #[test]
+    fn reset_to_upstream_text_names_the_dropped_local_commits() {
+        let up = |dropped, changed: &[&str], checked_out| ResetPlan {
+            upstream: Some("origin/main".into()),
+            checked_out,
+            ..reset_plan(dropped, 0, changed)
+        };
+        let (q, what, warn) = reset_text(&up(2, &["a.txt"], true), ResetMode::Hard);
+        assert_eq!(q, "Reset main to origin/main (hard)?");
+        assert!(
+            what.starts_with("main moves to origin/main as of the last fetch. Their changes"),
+            "{what}"
+        );
+        assert_eq!(
+            warn,
+            [
+                "2 local commits not on origin/main will be dropped from main; only the reflog \
+                 can recover them.",
+                "Uncommitted changes to 1 file will be lost and can't be recovered: a.txt."
+            ]
+        );
+        let (_, _, warn) = reset_text(&up(0, &[], true), ResetMode::Hard);
+        assert!(warn.is_empty(), "only behind: nothing lost");
+        let (_, what, warn) = reset_text(&up(1, &[], false), ResetMode::Hard);
+        assert!(what.ends_with("It isn't checked out here, so no files change."));
+        assert!(warn[0].starts_with("1 local commit not on origin/main"));
     }
 
     #[test]
