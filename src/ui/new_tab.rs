@@ -165,11 +165,16 @@ fn project_row(
         }
         let shown = paths::abbreviate_home(root, home);
         let path = RichText::new(&shown).color(theme::MUTED).atom_shrink(true);
-        let mut name = RichText::new(folder_name(root));
+        let mut label = egui::Atoms::new(RichText::new(folder_name(root)));
+        // Only a missing row gets the tag: an empty one would still add spacing and shift
+        // the row's layout against its neighbours.
         if missing {
-            name = name.color(theme::MUTED);
+            label = egui::Atoms::new((
+                RichText::new(folder_name(root)).color(theme::MUTED),
+                RichText::new(tag).weak().small(),
+            ));
         }
-        let row = egui::Button::selectable(false, (name, RichText::new(tag).weak().small()))
+        let row = egui::Button::selectable(false, label)
             .right_text(path)
             .truncate()
             .min_size(egui::vec2(ui.available_width(), 0.0));
