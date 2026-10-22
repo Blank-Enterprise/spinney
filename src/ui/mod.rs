@@ -1343,11 +1343,8 @@ impl SpinneyApp {
                 }
             }
             Action::NewWorktreeFrom(base) => {
-                self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                    base,
-                    branch: String::new(),
-                    mode: BranchMode::Worktree,
-                });
+                self.dialogs.new_worktree =
+                    Some(NewWorktreeDialog::new(base, BranchMode::Worktree));
             }
             Action::AskDeleteBranch(branch) => {
                 if let Some(tab) = self.tabs.get(self.active_tab) {
@@ -1404,11 +1401,7 @@ impl SpinneyApp {
             Action::AskMerge(branch) => self.ask_merge(branch, false, &mut errors),
             Action::AskRebase(branch) => self.ask_merge(branch, true, &mut errors),
             Action::NewBranch(base) => {
-                self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                    base,
-                    branch: String::new(),
-                    mode: BranchMode::Switch,
-                });
+                self.dialogs.new_worktree = Some(NewWorktreeDialog::new(base, BranchMode::Switch));
             }
             Action::CherryPick(shas) => self.cherry_pick(&shas, &mut errors),
             Action::Revert(sha) => self.ask_revert(sha, &mut errors),
@@ -1420,19 +1413,12 @@ impl SpinneyApp {
                     .get(self.active_tab)
                     .and_then(|t| t.detached.clone());
                 if let Some(head) = head {
-                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                        base: head,
-                        branch: String::new(),
-                        mode: BranchMode::Switch,
-                    });
+                    self.dialogs.new_worktree =
+                        Some(NewWorktreeDialog::new(head, BranchMode::Switch));
                 }
             }
             Action::BranchAt(sha) => {
-                self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                    base: sha,
-                    branch: String::new(),
-                    mode: BranchMode::Switch,
-                });
+                self.dialogs.new_worktree = Some(NewWorktreeDialog::new(sha, BranchMode::Switch));
             }
             Action::TagAt(target) => self.ask_tag(target, &mut errors),
             Action::CopyText(text) => ctx.copy_text(text),

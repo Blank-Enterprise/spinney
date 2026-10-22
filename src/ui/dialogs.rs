@@ -182,19 +182,8 @@ impl CreateDialog {
         let parent = paths::existing_dir(&self.dir, home)?;
         paths::check_name(&self.name)?;
         let branch = self.branch.trim().to_string();
-        if branch.is_empty() {
-            return Err("Enter a default branch".into());
-        }
-        let valid = match &self.checked {
-            Some((b, ok)) if *b == branch => *ok,
-            _ => {
-                let ok = project::check_branch_name(&branch).is_ok();
-                self.checked = Some((branch.clone(), ok));
-                ok
-            }
-        };
-        if !valid {
-            return Err(format!("{branch} is not a valid branch name"));
+        if let Some(why) = branch_blocked(&branch, |b| branch_valid(&mut self.checked, b)) {
+            return Err(why);
         }
         let name = self.name.trim().to_string();
         let root = parent.join(&name);
@@ -214,10 +203,57 @@ fn github_label(host: &str) -> String {
     }
 }
 
+/// Why `name` (trimmed) can't name a branch, or `None`: it's empty, or `valid` (git's
+/// check, asked only for a non-empty name) refuses it. Create stays disabled while `Some`.
+pub(super) fn branch_blocked(name: &str, valid: impl FnOnce(&str) -> bool) -> Option<String> {
+    if name.is_empty() {
+        Some("Enter a branch name".into())
+    } else if !valid(name) {
+        Some(format!("{name} is not a valid branch name"))
+    } else {
+        None
+    }
+}
+
+/// Whether git accepts `name` as a branch name. `checked` holds the last name asked and
+/// the answer, so git runs once per edit and not every frame.
+fn branch_valid(checked: &mut Option<(String, bool)>, name: &str) -> bool {
+    match checked {
+        Some((n, ok)) if n == name => *ok,
+        _ => {
+            let ok = project::check_branch_name(name).is_ok();
+            *checked = Some((name.to_string(), ok));
+            ok
+        }
+    }
+}
+
 pub(super) struct NewWorktreeDialog {
     pub(super) base: String,
     pub(super) branch: String,
     pub(super) mode: BranchMode,
+    /// Last branch name checked with git, and whether it was valid (git runs once per edit).
+    checked: Option<(String, bool)>,
+}
+
+impl NewWorktreeDialog {
+    pub(super) fn new(base: String, mode: BranchMode) -> Self {
+        NewWorktreeDialog {
+            base,
+            branch: String::new(),
+            mode,
+            checked: None,
+        }
+    }
+
+    /// The trimmed branch name, or why Create is disabled.
+    fn target(&mut self) -> Result<String, String> {
+        let branch = self.branch.trim().to_string();
+        match branch_blocked(&branch, |b| branch_valid(&mut self.checked, b)) {
+            Some(why) => Err(why),
+            None => Ok(branch),
+        }
+    }
 }
 
 /// What the new-branch dialog does with the branch it creates.
@@ -327,22 +363,11 @@ impl RenameBranchDialog {
     /// The trimmed new name, or why Rename is disabled.
     fn target(&mut self) -> Result<String, String> {
         let name = self.name.trim().to_string();
-        if name.is_empty() {
-            return Err("Enter a branch name".into());
-        }
         if name == self.branch {
             return Err("Enter a new name".into());
         }
-        let valid = match &self.checked {
-            Some((n, ok)) if *n == name => *ok,
-            _ => {
-                let ok = project::check_branch_name(&name).is_ok();
-                self.checked = Some((name.clone(), ok));
-                ok
-            }
-        };
-        if !valid {
-            return Err(format!("{name} is not a valid branch name"));
+        if let Some(why) = branch_blocked(&name, |n| branch_valid(&mut self.checked, n)) {
+            return Err(why);
         }
         Ok(name)
     }
@@ -899,6 +924,7 @@ impl SpinneyApp {
         }
         if let Some(mut d) = self.dialogs.new_worktree.take() {
             let mut result = None;
+            let target = d.target();
             let title = match d.mode {
                 BranchMode::Worktree => "New worktree",
                 BranchMode::Switch => "New branch",
@@ -912,8 +938,12 @@ impl SpinneyApp {
                         base_label(&d.base)
                     )));
                     ui.text_edit_singleline(&mut d.branch);
+                    if let Err(reason) = &target {
+                        ui.colored_label(ui.visuals().error_fg_color, reason);
+                    }
                     ui.horizontal(|ui| {
-                        if ui.add(theme::primary("Create")).clicked() {
+                        let create = theme::primary("Create");
+                        if ui.add_enabled(target.is_ok(), create).clicked() {
                             result = Some(true);
                         }
                         if ui.button("Cancel").clicked() {
@@ -921,10 +951,10 @@ impl SpinneyApp {
                         }
                     });
                 });
-            match result {
-                Some(true) => self.new_worktree(d),
-                Some(false) => {}
-                None => self.dialogs.new_worktree = Some(d),
+            match (result, target) {
+                (Some(true), Ok(branch)) => self.new_worktree(d, branch),
+                (Some(false), _) => {}
+                _ => self.dialogs.new_worktree = Some(d),
             }
         }
         if let Some((path, files)) = self.dialogs.confirm_remove.take() {
@@ -1331,11 +1361,8 @@ impl SpinneyApp {
             match result {
                 Some(LeaveChoice::Leave) => self.leave_detached(d),
                 Some(LeaveChoice::Branch) => {
-                    self.dialogs.new_worktree = Some(NewWorktreeDialog {
-                        base: d.head,
-                        branch: String::new(),
-                        mode: BranchMode::Switch,
-                    })
+                    self.dialogs.new_worktree =
+                        Some(NewWorktreeDialog::new(d.head, BranchMode::Switch))
                 }
                 Some(LeaveChoice::Cancel) => {}
                 None => self.dialogs.leave_detached = Some(d),
@@ -2065,19 +2092,18 @@ impl SpinneyApp {
         }
     }
 
-    fn new_worktree(&mut self, d: NewWorktreeDialog) {
+    fn new_worktree(&mut self, d: NewWorktreeDialog, branch: String) {
         let ctx = self.ctx.clone();
         let mut errors = vec![];
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            let branch = d.branch.trim();
             let wt = tab.active_worktree.clone();
             let res = match d.mode {
                 BranchMode::Worktree => {
-                    project::add_worktree(&tab.root, branch, &d.base).map(|path| {
+                    project::add_worktree(&tab.root, &branch, &d.base).map(|path| {
                         tab.active_worktree = path;
                     })
                 }
-                BranchMode::Switch => actions::create_and_switch(&wt, branch, &d.base),
+                BranchMode::Switch => actions::create_and_switch(&wt, &branch, &d.base),
             };
             if let Err(e) = res {
                 errors.push(format!("{e:#}"));
@@ -2415,11 +2441,7 @@ mod tests {
         d.create = Some(CreateDialog::new(&Space::default()));
         assert!(d.any_open());
         d.create = None;
-        d.new_worktree = Some(NewWorktreeDialog {
-            base: "main".into(),
-            branch: String::new(),
-            mode: BranchMode::Worktree,
-        });
+        d.new_worktree = Some(NewWorktreeDialog::new("main".into(), BranchMode::Worktree));
         assert!(d.any_open());
         d.new_worktree = None;
         d.confirm_remove = Some((PathBuf::from("/tmp/wt"), vec![]));
@@ -2876,19 +2898,17 @@ mod tests {
         assert!(app.errors.iter().any(|e| e.contains("Commit or stash")));
         assert_eq!(g(&["symbolic-ref", "--short", "HEAD"]), "main");
         app.apply(Action::BranchAt(init.clone()));
-        let mut b = app.dialogs.new_worktree.take().expect("dialog open");
+        let b = app.dialogs.new_worktree.take().expect("dialog open");
         assert_eq!(b.mode, BranchMode::Switch, "normal clone switches");
-        b.branch = "old".into();
         app.errors.clear();
-        app.new_worktree(b);
+        app.new_worktree(b, "old".into());
         assert!(app.errors.iter().any(|e| e.contains("Commit or stash")));
         g(&["checkout", "--", "a.txt"]);
         app.errors.clear();
 
         app.apply(Action::BranchAt(init.clone()));
-        let mut b = app.dialogs.new_worktree.take().unwrap();
-        b.branch = "old".into();
-        app.new_worktree(b);
+        let b = app.dialogs.new_worktree.take().unwrap();
+        app.new_worktree(b, "old".into());
         assert!(app.errors.is_empty(), "{:?}", app.errors);
         assert_eq!(g(&["symbolic-ref", "--short", "HEAD"]), "old");
         assert_eq!(g(&["rev-parse", "HEAD"]), init);
@@ -3154,6 +3174,53 @@ mod tests {
         assert_eq!(d.target().unwrap_err(), "a..b is not a valid branch name");
         d.name = " feat/topic ".into();
         assert_eq!(d.target().unwrap(), "feat/topic");
+    }
+
+    #[test]
+    fn branch_blocked_names_why_create_is_disabled() {
+        let asked = std::cell::Cell::new(false);
+        let blocked = branch_blocked("", |_| {
+            asked.set(true);
+            true
+        });
+        assert_eq!(blocked.as_deref(), Some("Enter a branch name"));
+        assert!(!asked.get(), "git isn't asked about an empty name");
+        assert_eq!(
+            branch_blocked("a..b", |_| false).as_deref(),
+            Some("a..b is not a valid branch name")
+        );
+        assert_eq!(branch_blocked("feat/x", |_| true), None);
+    }
+
+    #[test]
+    fn new_branch_dialog_validates_the_name() {
+        for mode in [BranchMode::Switch, BranchMode::Worktree] {
+            let mut d = NewWorktreeDialog::new("main".into(), mode);
+            assert_eq!(d.target().unwrap_err(), "Enter a branch name", "empty");
+            d.branch = "  ".into();
+            assert_eq!(d.target().unwrap_err(), "Enter a branch name");
+            d.branch = "a..b".into();
+            assert_eq!(d.target().unwrap_err(), "a..b is not a valid branch name");
+            d.branch = " feat/x ".into();
+            assert_eq!(d.target().unwrap(), "feat/x");
+        }
+    }
+
+    #[test]
+    fn create_dialog_validates_the_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut d = CreateDialog::new(&Space::default());
+        d.dir = tmp.path().display().to_string();
+        d.name = "repo".into();
+        d.branch = " ".into();
+        assert_eq!(d.target(None).unwrap_err(), "Enter a branch name");
+        d.branch = "a..b".into();
+        assert_eq!(
+            d.target(None).unwrap_err(),
+            "a..b is not a valid branch name"
+        );
+        d.branch = "trunk".into();
+        assert_eq!(d.target(None).unwrap().2, "trunk");
     }
 
     #[test]
