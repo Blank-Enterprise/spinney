@@ -80,8 +80,13 @@ pub fn lists(
     ui.add_space(10.0);
     if list_header(ui, ProjectList::Recent, recent.len(), collapsed, actions) {
         theme::card().show(ui, |ui| {
+            let mut missing = 0;
             for root in &recent {
-                project_row(ui, root, false, home.as_deref(), actions);
+                missing += usize::from(project_row(ui, root, false, home.as_deref(), actions));
+            }
+            // Never automatic: an unmounted drive or share looks the same as a deleted folder.
+            if missing > 0 && ui.small_button("Remove missing").clicked() {
+                actions.push(Action::RemoveMissing);
             }
             if recent.is_empty() {
                 ui.weak(if space.projects.is_empty() {
@@ -132,14 +137,17 @@ fn header_text(list: ProjectList, count: usize, collapsed: bool) -> String {
 }
 
 /// A project's row: a star to toggle Favourites, then its name and path, which open it.
-/// The path shrinks with an ellipsis so the name stays on one line.
+/// The path shrinks with an ellipsis so the name stays on one line. A missing project is
+/// greyed out and tagged, and can only be located or removed. Returns whether it's missing.
 fn project_row(
     ui: &mut egui::Ui,
     root: &Path,
     favourite: bool,
     home: Option<&Path>,
     actions: &mut Vec<Action>,
-) {
+) -> bool {
+    let tag = project_tag(root);
+    let missing = !tag.is_empty();
     ui.horizontal(|ui| {
         let (star, tip) = if favourite {
             ("★", "Remove from Favourites")
@@ -157,15 +165,28 @@ fn project_row(
         }
         let shown = paths::abbreviate_home(root, home);
         let path = RichText::new(&shown).color(theme::MUTED).atom_shrink(true);
-        let row = egui::Button::selectable(false, RichText::new(folder_name(root)))
+        let mut name = RichText::new(folder_name(root));
+        if missing {
+            name = name.color(theme::MUTED);
+        }
+        let row = egui::Button::selectable(false, (name, RichText::new(tag).weak().small()))
             .right_text(path)
             .truncate()
             .min_size(egui::vec2(ui.available_width(), 0.0));
-        let r = ui.add(row).on_hover_text(shown);
-        if r.clicked() {
+        let hover = match missing {
+            true => format!("{shown} is missing: right-click to locate or remove it"),
+            false => shown,
+        };
+        let r = ui.add(row).on_hover_text(hover);
+        // A missing folder can't be opened, only located or removed.
+        if r.clicked() && !missing {
             actions.push(Action::OpenProject(root.to_path_buf()));
         }
         r.context_menu(|ui| {
+            if missing && ui.button("Locate…").clicked() {
+                actions.push(Action::LocateProject(root.to_path_buf()));
+                ui.close();
+            }
             if ui.button(tip).clicked() {
                 actions.push(Action::ToggleFavourite(root.to_path_buf()));
                 ui.close();
@@ -176,6 +197,17 @@ fn project_row(
             }
         });
     });
+    missing
+}
+
+/// A project row's muted tag: "missing" when its folder is gone (deleted, moved, or on a
+/// drive that isn't mounted), else empty.
+fn project_tag(root: &Path) -> &'static str {
+    if root.exists() {
+        ""
+    } else {
+        "missing"
+    }
 }
 
 /// The space's (Favourites, Recent) matching `search`: Favourites in the order starred,
@@ -251,6 +283,13 @@ mod tests {
         let (fav, recent) = sections(&space, "AL", None);
         assert_eq!(fav, [&p("/p/alpha")]);
         assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn recent_marks_a_missing_project() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(project_tag(dir.path()), "");
+        assert_eq!(project_tag(Path::new("/p/gone")), "missing");
     }
 
     #[test]
