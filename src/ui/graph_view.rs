@@ -131,6 +131,8 @@ pub struct MenuContext<'a> {
     pub dirty: Option<String>,
     /// The checked-out branch; None when HEAD is detached.
     pub branch: Option<String>,
+    /// The checked-out branch's upstream, e.g. `origin/main`.
+    pub upstream: Option<String>,
     /// The merge, rebase, cherry-pick or revert in progress, if any.
     pub operation: Option<Operation>,
     /// Per row: the commit is HEAD or one of its ancestors.
@@ -184,13 +186,16 @@ pub struct Facts {
     pub on_head: bool,
     /// Has more than one parent.
     pub merge: bool,
+    /// The tip of the checked-out branch's upstream.
+    pub upstream_tip: bool,
 }
 
 impl Facts {
-    fn of(row: &Row, on_head: bool) -> Facts {
+    fn of(row: &Row, on_head: bool, upstream: Option<&str>) -> Facts {
         Facts {
             on_head,
             merge: row.commit.parents.len() > 1,
+            upstream_tip: upstream.is_some_and(|up| row.commit.refs.split(", ").any(|r| r == up)),
         }
     }
 }
@@ -259,8 +264,8 @@ pub const RESET_MODES: [(ResetMode, &str); 3] = [
 ];
 
 /// "Reset <branch> to this commit", and why it is disabled for this commit, if it is.
-/// Only commits on the checked-out branch's history are offered.
-fn reset_item(ctx: &MenuContext, on_head: bool) -> (String, Option<String>) {
+/// Only commits on the checked-out branch's history, or its upstream's tip, are offered.
+fn reset_item(ctx: &MenuContext, this: Facts) -> (String, Option<String>) {
     let Some(branch) = &ctx.branch else {
         return (
             "Reset to this commit".into(),
@@ -270,7 +275,7 @@ fn reset_item(ctx: &MenuContext, on_head: bool) -> (String, Option<String>) {
     let label = format!("Reset {branch} to this commit");
     let blocked = if let Some(op) = ctx.operation {
         Some(format!("Finish or abort the {op} first"))
-    } else if !on_head {
+    } else if !this.on_head && !this.upstream_tip {
         Some(format!("This commit isn't on {branch}'s history"))
     } else {
         None
@@ -296,13 +301,12 @@ fn history_blocked(ctx: &MenuContext, this: Facts) -> Option<String> {
 /// The commit menu's entries in groups (separated in the menu), with enabled states, for a
 /// commit described by `this`; `picks` are the commits a cherry-pick would apply.
 pub fn menu_items(ctx: &MenuContext, this: Facts, picks: &[Facts]) -> Vec<Vec<MenuItem>> {
-    let on_head = this.on_head;
     let item = |label: &str, action, blocked: Option<String>| MenuItem {
         label: label.to_string(),
         action,
         blocked,
     };
-    let (reset_label, reset_blocked) = reset_item(ctx, on_head);
+    let (reset_label, reset_blocked) = reset_item(ctx, this);
     let (pick_label, pick_blocked) = cherry_pick_item(ctx, picks);
     // A new branch is switched to, moving HEAD like a checkout.
     let branch_blocked = ctx.dirty.clone();
@@ -353,8 +357,12 @@ fn commit_menu(
         .into_iter()
         .filter(|&k| k < rows.len())
         .collect();
-    let facts: Vec<Facts> = picks.iter().map(|&k| Facts::of(&rows[k], on(k))).collect();
-    let items = menu_items(ctx, Facts::of(row, on(i)), &facts);
+    let up = ctx.upstream.as_deref();
+    let facts: Vec<Facts> = picks
+        .iter()
+        .map(|&k| Facts::of(&rows[k], on(k), up))
+        .collect();
+    let items = menu_items(ctx, Facts::of(row, on(i), up), &facts);
     for (g, group) in items.into_iter().enumerate() {
         if g > 0 {
             ui.separator();
@@ -806,16 +814,19 @@ mod tests {
     const ON: Facts = Facts {
         on_head: true,
         merge: false,
+        upstream_tip: false,
     };
     const OFF: Facts = Facts {
         on_head: false,
         merge: false,
+        upstream_tip: false,
     };
 
     fn ctx(dirty: Option<&str>) -> MenuContext<'static> {
         MenuContext {
             dirty: dirty.map(str::to_string),
             branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
             operation: None,
             on_head: &[],
             picked: &[],
@@ -866,6 +877,7 @@ mod tests {
         let merge = Facts {
             on_head: false,
             merge: true,
+            upstream_tip: false,
         };
         assert_eq!(
             pick(&c, &[OFF, merge]).1.as_deref(),
@@ -915,6 +927,7 @@ mod tests {
             let f = Facts {
                 on_head,
                 merge: false,
+                upstream_tip: false,
             };
             let items = menu_items(c, f, &[f]);
             let it = items
@@ -930,6 +943,14 @@ mod tests {
             reset(&c, false).1.as_deref(),
             Some("This commit isn't on main's history")
         );
+        // The upstream's tip, off the history after a force push, can be reset to.
+        let tip = Facts {
+            upstream_tip: true,
+            ..OFF
+        };
+        let items = menu_items(&c, tip, &[tip]).into_iter().flatten();
+        let it = items.into_iter().find(|i| i.action == MenuAction::Reset);
+        assert_eq!(it.unwrap().blocked, None);
         let detached = MenuContext {
             branch: None,
             ..ctx(None)
