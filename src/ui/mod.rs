@@ -615,6 +615,10 @@ pub enum Action {
     OpenProject(PathBuf),
     /// Drop a project from the space (closing its tab if open).
     RemoveRecent(PathBuf),
+    /// Pick a missing project's new folder: it takes the old entry's place, then opens.
+    LocateProject(PathBuf),
+    /// Drop every missing project from Recent (Favourites stay).
+    RemoveMissing,
     /// Star or unstar a project in the active space's Favourites.
     ToggleFavourite(PathBuf),
     /// Fold or unfold the Favourites or Recent list.
@@ -916,6 +920,26 @@ impl SpinneyApp {
         }
     }
 
+    /// Put `picked`, a missing project's new folder, in `old`'s place in the space's lists,
+    /// then open it, which relinks its worktrees (`project::repair`). A folder that isn't a
+    /// project leaves the entry as it was.
+    fn locate_project(&mut self, old: &Path, picked: PathBuf) {
+        let Some(space) = self.space() else { return };
+        // As `open_folder` resolves it, so it finds the entry rather than adding another.
+        let root = match project::project_root(&picked) {
+            Ok(r) if !project::same_dir(&r, &picked) => r,
+            _ => picked,
+        };
+        if let Err(e) = project::ensure_project(&root) {
+            self.errors.push(format!("{e:#}"));
+            return;
+        }
+        if replace_project(&mut self.config, &space.id, old, &root) {
+            self.save_config();
+        }
+        self.open_folder(root);
+    }
+
     /// Save which tab is active, so the next launch restores it.
     fn remember_active(&mut self) {
         let Some(space) = self.space() else { return };
@@ -1124,6 +1148,21 @@ impl SpinneyApp {
                 }
                 if let Some(i) = self.tabs.iter().position(|t| t.root == root) {
                     self.close_tab(i);
+                }
+            }
+            Action::LocateProject(old) => {
+                let start = old.ancestors().find(|a| a.is_dir()).map(Path::to_path_buf);
+                let title = "Where is this project now?";
+                if let Some(picked) = paths::pick_folder(title, start.as_deref()) {
+                    self.locate_project(&old, picked);
+                }
+                ctx.request_repaint();
+            }
+            Action::RemoveMissing => {
+                if let Some(space) = self.space() {
+                    if remove_missing(&mut self.config, &space.id) {
+                        self.save_config();
+                    }
                 }
             }
             Action::ToggleFavourite(root) => {
@@ -2559,6 +2598,49 @@ pub fn remove_project(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
     s.projects.len() != before
 }
 
+/// Put `new` in `old`'s place in a space's Recent, Favourites and open tabs, or just drop
+/// `old` where `new` is already listed; false if nothing changed.
+pub fn replace_project(cfg: &mut Config, space_id: &str, old: &Path, new: &Path) -> bool {
+    let Some(s) = cfg.spaces.iter_mut().find(|s| s.id == space_id) else {
+        return false;
+    };
+    let mut changed = false;
+    for list in [&mut s.projects, &mut s.pinned, &mut s.open] {
+        let Some(i) = list.iter().position(|p| p == old) else {
+            continue;
+        };
+        if list.iter().any(|p| p == new) {
+            list.remove(i);
+        } else {
+            list[i] = new.to_path_buf();
+        }
+        changed = true;
+    }
+    if s.active.as_deref() == Some(old) {
+        s.active = Some(new.to_path_buf());
+        changed = true;
+    }
+    changed
+}
+
+/// Drop a space's missing projects from Recent, keeping Favourites: a missing folder may
+/// be on a drive that isn't mounted, so this is only ever asked for. False if none were.
+pub fn remove_missing(cfg: &mut Config, space_id: &str) -> bool {
+    let Some(s) = cfg.spaces.iter().find(|s| s.id == space_id) else {
+        return false;
+    };
+    let missing: Vec<PathBuf> = s
+        .projects
+        .iter()
+        .filter(|p| !s.pinned.contains(p) && !p.exists())
+        .cloned()
+        .collect();
+    for p in &missing {
+        remove_project(cfg, space_id, p);
+    }
+    !missing.is_empty()
+}
+
 /// Star `path` in a space's Favourites, or unstar it; false if the space or the project is
 /// missing (only a project in Recent can be starred).
 pub fn toggle_favourite(cfg: &mut Config, space_id: &str, path: &Path) -> bool {
@@ -2758,6 +2840,66 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_project_keeps_its_place() {
+        let p = PathBuf::from;
+        let mut c = cfg();
+        c.spaces[0].projects = vec![p("/p/a"), p("/p/old"), p("/p/b")];
+        c.spaces[0].pinned = vec![p("/p/old")];
+        c.spaces[0].open = vec![p("/p/b"), p("/p/old")];
+        c.spaces[0].active = Some(p("/p/old"));
+        assert!(replace_project(
+            &mut c,
+            "a",
+            Path::new("/p/old"),
+            Path::new("/p/new")
+        ));
+        let s = &c.spaces[0];
+        assert_eq!(s.projects, [p("/p/a"), p("/p/new"), p("/p/b")]);
+        assert_eq!(s.pinned, [p("/p/new")]);
+        assert_eq!(s.open, [p("/p/b"), p("/p/new")]);
+        assert_eq!(s.active, Some(p("/p/new")));
+        assert!(!replace_project(
+            &mut c,
+            "a",
+            Path::new("/p/old"),
+            Path::new("/p/x")
+        ));
+
+        // Already listed: the old entry goes rather than a duplicate.
+        assert!(replace_project(
+            &mut c,
+            "a",
+            Path::new("/p/a"),
+            Path::new("/p/b")
+        ));
+        assert_eq!(c.spaces[0].projects, [p("/p/new"), p("/p/b")]);
+    }
+
+    #[test]
+    fn remove_missing_removes_only_missing_projects() {
+        let here = tempfile::tempdir().unwrap();
+        let here = here.path().to_path_buf();
+        let p = PathBuf::from;
+        let mut c = cfg();
+        let s = &mut c.spaces[0];
+        s.projects = vec![p("/p/gone"), here.clone(), p("/p/starred")];
+        s.pinned = vec![p("/p/starred")];
+        s.open = vec![p("/p/gone"), here.clone()];
+        s.active = Some(p("/p/gone"));
+        assert!(remove_missing(&mut c, "a"));
+        let s = &c.spaces[0];
+        assert_eq!(
+            s.projects,
+            [here.clone(), p("/p/starred")],
+            "Favourites stay"
+        );
+        assert_eq!(s.open, [here]);
+        assert_eq!(s.active, None);
+        assert!(!remove_missing(&mut c, "a"), "nothing left to remove");
+        assert!(!remove_missing(&mut c, "nope"));
+    }
+
+    #[test]
     fn repo_name_from_urls() {
         assert_eq!(repo_name_from_url("https://github.com/org/foo.git"), "foo");
         assert_eq!(repo_name_from_url("https://github.com/org/foo"), "foo");
@@ -2919,6 +3061,70 @@ mod tests {
         let app = reload();
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.tabs[0].root, roots[2]);
+    }
+
+    #[test]
+    fn switching_to_a_space_with_a_missing_project_opens_no_tab_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let r = repo(1);
+        let root = r.path().canonicalize().unwrap();
+        let mut c = cfg();
+        c.spaces[1].projects = vec![PathBuf::from("/p/gone"), root.clone()];
+        c.spaces[1].open = c.spaces[1].projects.clone();
+        let mut app = test_app(c, &cfg_path);
+        app.apply(Action::SwitchSpace("b".into()));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let open: Vec<_> = app.tabs.iter().map(|t| t.root.clone()).collect();
+        assert_eq!(open, [root]);
+    }
+
+    #[test]
+    fn locating_a_moved_project_keeps_its_place_and_repairs_its_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let root = tmp.path().canonicalize().unwrap().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let g = |args: &[&str]| crate::git::run(&root, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "Test User"]);
+        g(&["config", "user.email", "test@example.com"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "c0"]);
+        let wt = project::add_worktree(&root, "feature/x", "main").unwrap();
+        let p = PathBuf::from;
+        let mut c = cfg();
+        c.spaces[0].projects = vec![p("/p/one"), root.clone(), p("/p/two")];
+        c.spaces[0].pinned = vec![root.clone()];
+        c.spaces[0].open = vec![root.clone()];
+        c.spaces[0].active = Some(root.clone());
+        let moved = root.with_file_name("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let mut app = test_app(c, &cfg_path);
+        app.open_visible_tabs();
+        assert!(
+            app.tabs.is_empty() && app.errors.is_empty(),
+            "{:?}",
+            app.errors
+        );
+
+        // Not a project: the entry stays as it was.
+        app.locate_project(&root, tmp.path().to_path_buf());
+        assert_eq!(app.errors.len(), 1);
+        assert_eq!(app.config.spaces[0].projects[1], root);
+        app.errors.clear();
+
+        app.locate_project(&root, moved.clone());
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let s = &app.config.spaces[0];
+        assert_eq!(s.projects, [p("/p/one"), moved.clone(), p("/p/two")]);
+        assert_eq!(s.pinned, std::slice::from_ref(&moved));
+        assert_eq!(s.open, std::slice::from_ref(&moved));
+        assert_eq!(s.active.as_ref(), Some(&moved));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].root, moved);
+        crate::git::run(&wt, &["status"]).expect("worktree relinked");
+        let saved = Config::load_from(&cfg_path).unwrap();
+        assert_eq!(saved.spaces[0].projects[1], moved, "saved");
     }
 
     #[test]

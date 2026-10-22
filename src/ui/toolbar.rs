@@ -112,7 +112,7 @@ fn repositories_button(
                 });
             if actions[before..]
                 .iter()
-                .any(|a| matches!(a, Action::OpenProject(_)))
+                .any(|a| matches!(a, Action::OpenProject(_) | Action::LocateProject(_)))
             {
                 ui.close();
             }
@@ -271,8 +271,11 @@ pub(super) fn toolbar(
         ui.spacing_mut().item_spacing.x = 18.0;
         picker(ui, "repository", &tab.name(), |ui| {
             for root in projects {
+                // A missing project can't be opened: locate or remove it from Recent.
+                let item = egui::Button::selectable(*root == tab.root, folder_name(root));
                 if ui
-                    .selectable_label(*root == tab.root, folder_name(root))
+                    .add_enabled(root.exists(), item)
+                    .on_disabled_hover_text("Missing: locate or remove it in Recent")
                     .clicked()
                 {
                     actions.push(Action::OpenProject(root.clone()));
