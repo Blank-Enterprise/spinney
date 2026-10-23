@@ -19,11 +19,13 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Before the fixture identity is set, or the script flags that email in this file.
       - run: bash scripts/leak-check.sh
       - run: rustup update stable && rustup component add clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Git identity for test fixtures
         run: |
           git config --global user.name "CI"
@@ -32,8 +34,23 @@ jobs:
       - run: cargo build --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: cargo-audit
-      - name: No known vulnerabilities in dependencies
-        run: cargo audit
+          tool: cargo-deny
+      # Advisories (vulnerable or yanked crates), licences and sources; see deny.toml.
+      - name: Dependencies pass cargo-deny
+        run: cargo deny --locked check
+
+  # Lints the workflows themselves: unpinned actions, injection through ${{ }}, over-broad tokens.
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          version: 1.31.1
+          # Findings fail the job here instead of going to code scanning.
+          advanced-security: false

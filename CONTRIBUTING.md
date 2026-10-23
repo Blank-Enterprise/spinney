@@ -26,8 +26,9 @@ bash scripts/check.sh          # everything CI runs
 ```
 
 `scripts/check.sh` runs what CI runs: `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, `cargo test`, `scripts/leak-check.sh`, and `cargo audit` if `cargo-audit` is installed
-(`cargo install cargo-audit --locked`). Run it before opening a PR.
+warnings`, `cargo test`, `scripts/leak-check.sh`, and, if they're installed, `cargo deny check`
+(dependency advisories, licences and sources; see `deny.toml`) and `zizmor` (workflow lint):
+`brew install cargo-deny zizmor`. Run it before opening a PR.
 
 - **Tests** create temporary git repos and need a global git identity
   (`git config --global user.name` and `user.email`).

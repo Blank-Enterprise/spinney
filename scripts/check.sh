@@ -13,10 +13,16 @@ step "cargo clippy (-D warnings)"
 cargo clippy --locked --all-targets -- -D warnings
 step "cargo test"
 cargo test --locked
-if command -v cargo-audit >/dev/null 2>&1; then
-  step "cargo audit"
-  cargo audit
+if command -v cargo-deny >/dev/null 2>&1; then
+  step "cargo deny check"
+  cargo deny --locked check
 else
-  step "cargo audit skipped (install with: cargo install cargo-audit --locked)"
+  step "cargo deny skipped (install with: brew install cargo-deny)"
+fi
+if command -v zizmor >/dev/null 2>&1; then
+  step "zizmor (workflow lint)"
+  zizmor --offline .github/workflows
+else
+  step "zizmor skipped (install with: brew install zizmor)"
 fi
 printf '\nAll checks passed.\n'

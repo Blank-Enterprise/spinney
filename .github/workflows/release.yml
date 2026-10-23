@@ -28,10 +28,12 @@ jobs:
       - name: Refuse anything that isn't a version tag
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.TAG }}
           fetch-depth: 0
+          # Publishing uses GH_TOKEN, and the repo is public, so git itself needs no token.
+          persist-credentials: false
       - name: Tag is on main
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
@@ -43,17 +45,18 @@ jobs:
       # Before the fixture identity is set, or the script flags that email in this file.
       - run: bash scripts/leak-check.sh
       - run: rustup update stable && rustup component add clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache here: a release builds from scratch, so no cached artifact can end up in what we publish.
       - name: Builds on the declared rust-version
         run: |
           msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
           rustup toolchain install "$msrv" --profile minimal
           cargo +"$msrv" check --locked --all-targets
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: cargo-audit
-      - name: No known vulnerabilities in dependencies
-        run: cargo audit
+          tool: cargo-deny
+      # Advisories (vulnerable or yanked crates), licences and sources; see deny.toml.
+      - name: Dependencies pass cargo-deny
+        run: cargo deny --locked check
       - name: Git identity for test fixtures
         run: |
           git config --global user.name "CI"
