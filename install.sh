@@ -27,7 +27,7 @@ main() {
   tmp="$(mktemp -d)" # global: the EXIT trap runs after main returns
   trap 'rm -rf "$tmp"' EXIT
 
-  # The zip and its checksum; gh first (works while the repo is private), then plain curl.
+  # The zip and its checksum; gh first when signed in (no anonymous rate limit), then plain curl.
   if [ -n "${SPINNEY_ZIP:-}" ]; then
     cp "$SPINNEY_ZIP" "$tmp/$ASSET"
   elif command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1 \
@@ -39,7 +39,7 @@ main() {
     :
   else
     echo "Could not download ${VERSION:-the latest} $ASSET from $REPO." >&2
-    echo "If the repo is private, install the GitHub CLI and run 'gh auth login'." >&2
+    echo "Check the version exists: https://github.com/$REPO/releases" >&2
     return 1
   fi
   if [ -z "${SPINNEY_ZIP:-}" ] && ! (cd "$tmp" && shasum -a 256 -c -s "$ASSET.sha256"); then
