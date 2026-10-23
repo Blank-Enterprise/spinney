@@ -12,9 +12,11 @@ cargo test --locked <name>     # one test, or every test whose name contains <na
 cargo build --locked           # debug build: target/debug/spinney
 cargo run                      # run the app (debug)
 bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the release workflow does)
+bash scripts/smoke-install.sh 1.2.0  # install that zip into a temp folder with install.sh, and check it
+bash scripts/msrv-check.sh     # build on the declared rust-version (check.sh runs it when installed)
 ```
 
-- **Rust 1.95+** (`rust-version` in `Cargo.toml`). The release workflow checks that the declared version still builds.
+- **Rust 1.95+** (`rust-version` in `Cargo.toml`). CI (the `msrv` job) and the release workflow check that the declared version still builds.
 - **Tests** create temporary git repos and need a global git identity (`git config --global user.name` and `user.email`). CI sets one.
 - **The leak check** (`scripts/leak-check.sh`) fails if any tracked file contains a macOS or Linux home-directory path, your username, your hostname or your global git email. Use neutral paths such as `/p/project` or `/tmp/x` in tests and docs.
 
@@ -78,3 +80,4 @@ bash scripts/bundle.sh 1.2.0   # release .app and .zip in dist/ (what the releas
 - **Pushing changes to `.github/workflows/` needs a token with the `workflow` scope.** Spinney's sign-in requests it. Older tokens and `gh` logins may not have it.
 - **Terminals can't screenshot the app** without macOS screen-recording permission. Say in the PR that UI changes weren't checked on screen.
 - **Releases:** bump `version` in `Cargo.toml`, merge to `main`, then push a `vX.Y.Z` tag on `main`. The release workflow refuses a tag that's off `main` or doesn't match `Cargo.toml`.
+  - **Pre-releases** (`vX.Y.Z-beta.N`, `vX.Y.Z-rc.N`) need no bump: `X.Y.Z` is the `Cargo.toml` version, the release it leads to, and they stop once `vX.Y.Z` is out. Cut one with the **prerelease** workflow in Actions, or `bash scripts/tag-prerelease.sh beta` (or `rc`). The tag rules live in `scripts/release-tag.sh`. A pre-release is never "latest", so `install.sh` keeps installing the stable release. Its plist has `X.Y.Z` in the bundle versions, which allow only digits, and the full version in `SpinneyVersion`.
