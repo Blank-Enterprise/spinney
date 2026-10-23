@@ -335,30 +335,28 @@ impl ProjectTab {
 
     /// Branches, tags and HEAD: what a checkout, fetch or commit can change.
     fn load_branches(&mut self, errors: &mut Vec<String>) {
-        match refs::branches(&self.active_worktree) {
-            Ok(b) => self.branches = b,
-            Err(e) => errors.push(format!("branches: {e:#}")),
-        }
-        match refs::tags(&self.active_worktree) {
-            Ok(t) => self.tags = t,
-            Err(e) => errors.push(format!("tags: {e:#}")),
-        }
         let wt = &self.active_worktree;
-        self.refs_stamp = refs::stamp(wt).ok();
-        self.head = actions::head_commit(wt).unwrap_or_else(|e| {
-            errors.push(format!("HEAD: {e:#}"));
-            None
-        });
-        self.detached = actions::detached_head(wt).unwrap_or_else(|e| {
-            errors.push(format!("HEAD: {e:#}"));
-            None
-        });
+        let current = match refs::snapshot(wt) {
+            Ok(s) => {
+                self.branches = s.branches;
+                self.tags = s.tags;
+                self.refs_stamp = Some(s.stamp);
+                self.detached = s.current.is_none().then(|| s.head.clone()).flatten();
+                self.head = s.head;
+                s.current
+            }
+            Err(e) => {
+                errors.push(format!("branches: {e:#}"));
+                self.refs_stamp = None;
+                None
+            }
+        };
         self.previous_branch = match &self.detached {
             None => None,
             Some(_) => actions::previous_branch(wt).unwrap_or_default(),
         };
         // Per branch (`branch.<name>.rebase`), so it is read again with the branches.
-        self.git_pull = actions::git_pull_strategy(wt).unwrap_or_else(|e| {
+        self.git_pull = actions::git_pull_strategy_on(wt, current.as_deref()).unwrap_or_else(|e| {
             errors.push(format!("pull config: {e:#}"));
             PullStrategy::default()
         });
