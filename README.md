@@ -56,6 +56,14 @@ SHA-256 checksum. To install a specific release, set `SPINNEY_VERSION`:
 
     curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | SPINNEY_VERSION=v1.0.0 bash
 
+To try the newest beta or release candidate, set `SPINNEY_VERSION=beta`. It installs the newest
+release, so once a stable release is out, it installs that.
+
+Each release zip also has a build provenance attestation. To check that a zip you downloaded was
+built by this repository's release workflow:
+
+    gh attestation verify Spinney-macos-arm64.zip --repo Blank-Enterprise/spinney
+
 The app isn't notarized yet ([#18](https://github.com/Blank-Enterprise/spinney/issues/18)). The
 install script is the supported way in. If you download the zip from the releases page in a
 browser, Gatekeeper refuses to open it until you allow it in System Settings → Privacy & Security.

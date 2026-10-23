@@ -1,0 +1,39 @@
+# cargo-deny: what CI allows into the dependency tree. Run with `cargo deny check`.
+[graph]
+# Spinney only ships for Apple Silicon, so Windows and Linux-only crates never reach the app.
+targets = ["aarch64-apple-darwin"]
+
+[advisories]
+# Vulnerabilities always fail. Unmaintained crates fail only when we depend on them directly;
+# transitive ones come from egui and wgpu, and we can't swap them.
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+# Every licence must be compatible with distributing the app as MIT OR Apache-2.0.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0", # webpki-roots: the Mozilla CA list
+  "ISC",
+  "MIT",
+  "MPL-2.0",             # option-ext: file-level copyleft, fine in a binary
+  "OFL-1.1",             # egui's bundled fonts
+  "Ubuntu-font-1.0",     # egui's bundled fonts
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions come from the egui/wgpu tree, where we can't unify them.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+# Only crates.io: no git or alternative-registry dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"

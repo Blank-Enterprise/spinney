@@ -74,6 +74,19 @@ impl LogPager {
         }
     }
 
+    /// A pager with no history, for a tab that isn't loaded yet.
+    fn idle() -> LogPager {
+        let (req, _) = mpsc::channel();
+        let (_, pages) = mpsc::channel();
+        LogPager {
+            req,
+            pages,
+            asked: 0,
+            pending: false,
+            done: true,
+        }
+    }
+
     /// Ask for `n` more rows unless a page is in flight or history is exhausted.
     pub fn request(&mut self, n: usize) {
         if self.pending || self.done {
@@ -165,6 +178,15 @@ pub struct ProjectTab {
     view: worktrees_view::View,
     /// The Worktrees view's data, loaded while it shows.
     review: worktrees_view::Review,
+    /// Whether `load` has run. Tabs restored with a space start as shells.
+    loaded: bool,
+}
+
+/// A space's tabs while another space is showing.
+struct Parked {
+    space: String,
+    tabs: Vec<ProjectTab>,
+    active_tab: usize,
 }
 
 /// `<git common dir>` of a project: its `.git`.
@@ -201,37 +223,21 @@ impl ProjectTab {
         jobs: &mut Jobs,
         errors: &mut Vec<String>,
     ) -> anyhow::Result<ProjectTab> {
-        project::ensure_project(root)?;
-        match common_dir(root) {
-            Ok(common) => {
-                if let Err(e) = creds::configure_repo(&common, space) {
-                    errors.push(format!("configuring {}: {e:#}", root.display()));
-                }
-                if needs_commit_graph(&common) {
-                    jobs.commit_graph(root.to_path_buf(), common);
-                }
-            }
-            Err(e) => errors.push(format!("{}: {e:#}", root.display())),
-        }
-        // Relink worktrees an agent or the user moved, before listing them.
-        if let Err(e) = project::repair(root) {
-            errors.push(format!("repairing worktrees: {e:#}"));
-        }
-        let worktrees = match project::list_worktrees(root) {
-            Ok(w) => w.into_iter().filter(|w| !w.is_bare).collect(),
-            Err(e) => {
-                errors.push(format!("worktrees: {e:#}"));
-                vec![]
-            }
-        };
-        let active_worktree = worktrees
-            .first()
-            .map_or_else(|| root.to_path_buf(), |w: &Worktree| w.path.clone());
-        let mut tab = ProjectTab {
+        let mut tab = ProjectTab::shell(root);
+        tab.load(space, ctx, jobs, errors)?;
+        Ok(tab)
+    }
+
+    /// A tab for `root` that knows only its folder: no git has run yet. Restored tabs start
+    /// like this, so a space with many tabs opens as fast as one; `load` fills it in when
+    /// it is first shown.
+    fn shell(root: &Path) -> ProjectTab {
+        ProjectTab {
             root: root.to_path_buf(),
-            worktrees,
-            log: LogPager::start(active_worktree.clone(), ctx.clone()),
-            active_worktree,
+            loaded: false,
+            worktrees: vec![],
+            log: LogPager::idle(),
+            active_worktree: root.to_path_buf(),
             branches: vec![],
             tags: vec![],
             stashes: vec![],
@@ -256,12 +262,54 @@ impl ProjectTab {
             git_pull: PullStrategy::default(),
             view: worktrees_view::View::default(),
             review: worktrees_view::Review::default(),
+        }
+    }
+
+    /// Configure the project for `space`, list its worktrees and branches, and start paging
+    /// history. Only a folder that is no longer a project fails.
+    fn load(
+        &mut self,
+        space: &Space,
+        ctx: &egui::Context,
+        jobs: &mut Jobs,
+        errors: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        let root = self.root.clone();
+        let root = root.as_path();
+        project::ensure_project(root)?;
+        self.loaded = true;
+        match common_dir(root) {
+            Ok(common) => {
+                if let Err(e) = creds::configure_repo(&common, space) {
+                    errors.push(format!("configuring {}: {e:#}", root.display()));
+                }
+                if needs_commit_graph(&common) {
+                    jobs.commit_graph(root.to_path_buf(), common);
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e:#}", root.display())),
+        }
+        // Relink worktrees an agent or the user moved, before listing them.
+        if let Err(e) = project::repair(root) {
+            errors.push(format!("repairing worktrees: {e:#}"));
+        }
+        let worktrees = match project::list_worktrees(root) {
+            Ok(w) => w.into_iter().filter(|w| !w.is_bare).collect(),
+            Err(e) => {
+                errors.push(format!("worktrees: {e:#}"));
+                vec![]
+            }
         };
-        tab.log.request(PAGE);
-        tab.load_branches(errors);
-        tab.load_stashes(errors);
-        tab.reload_changes(errors);
-        Ok(tab)
+        self.active_worktree = worktrees
+            .first()
+            .map_or_else(|| root.to_path_buf(), |w: &Worktree| w.path.clone());
+        self.worktrees = worktrees;
+        self.log = LogPager::start(self.active_worktree.clone(), ctx.clone());
+        self.log.request(PAGE);
+        self.load_branches(errors);
+        self.load_stashes(errors);
+        self.reload_changes(errors);
+        Ok(())
     }
 
     fn name(&self) -> String {
@@ -276,6 +324,9 @@ impl ProjectTab {
     /// checkout or reset outside Spinney, needs the full refresh; otherwise only the active
     /// worktree's changes and stashes, so history paging isn't restarted.
     fn refocus(&mut self, ctx: &egui::Context, errors: &mut Vec<String>) {
+        if !self.loaded {
+            return; // loads when shown
+        }
         let listed = project::list_worktrees(&self.root)
             .map(|w| w.into_iter().filter(|w| !w.is_bare).collect::<Vec<_>>());
         if changed_outside(&self.worktrees, listed.ok().as_ref())
@@ -804,6 +855,10 @@ pub struct SpinneyApp {
     config_path: Option<PathBuf>,
     tabs: Vec<ProjectTab>,
     active_tab: usize,
+    /// The space `tabs` belong to.
+    tabs_space: Option<String>,
+    /// The tabs of spaces switched away from, kept open so switching back is instant.
+    parked: Vec<Parked>,
     jobs: Jobs,
     errors: Vec<String>,
     /// Non-error banner messages.
@@ -854,6 +909,8 @@ impl SpinneyApp {
             config_path,
             tabs: vec![],
             active_tab: 0,
+            tabs_space: None,
+            parked: vec![],
             jobs: Jobs::new(ctx.clone()),
             errors,
             notices: vec![],
@@ -885,30 +942,90 @@ impl SpinneyApp {
         active_space(&self.config).cloned()
     }
 
-    /// Reopen the active space's open tabs in order, with the saved one active.
+    /// Reopen the active space's open tabs in order, with the saved one active. Only the
+    /// active tab loads now; the others load when first shown.
     fn open_visible_tabs(&mut self) {
         self.tabs.clear();
         self.active_tab = 0;
+        self.tabs_space = None;
         let Some(space) = self.space() else { return };
-        for root in visible_projects(&self.config) {
-            // Missing (deleted, or on an unmounted drive): no tab, no error, kept in `open`.
-            if root.exists() {
-                self.open_tab(&root, &space);
-            }
-        }
+        self.tabs_space = Some(space.id.clone());
+        // Missing (deleted, or on an unmounted drive): no tab, no error, kept in `open`.
+        self.tabs = visible_projects(&self.config)
+            .iter()
+            .filter(|root| root.exists())
+            .map(|root| ProjectTab::shell(root))
+            .collect();
         if let Some(i) = space
             .active
             .and_then(|a| self.tabs.iter().position(|t| t.root == a))
         {
             self.active_tab = i;
         }
+        self.load_active_tab();
         self.remember_active();
+    }
+
+    /// Show the active space's tabs: the ones it had when it was last showing, or its saved
+    /// open tabs the first time. The tabs being replaced are parked, not closed.
+    fn show_active_space(&mut self) {
+        let Some(id) = self.space().map(|s| s.id) else {
+            return self.open_visible_tabs();
+        };
+        if self.tabs_space.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if let Some(space) = self.tabs_space.take() {
+            self.parked.retain(|p| p.space != space);
+            self.parked.push(Parked {
+                space,
+                tabs: std::mem::take(&mut self.tabs),
+                active_tab: self.active_tab,
+            });
+        }
+        let Some(i) = self.parked.iter().position(|p| p.space == id) else {
+            return self.open_visible_tabs();
+        };
+        let parked = self.parked.remove(i);
+        self.tabs = parked.tabs;
+        self.active_tab = parked.active_tab;
+        self.tabs_space = Some(id);
+        // Deleted or unmounted while parked: as on a fresh open, no tab and no error.
+        let active = self.tabs.get(self.active_tab).map(|t| t.root.clone());
+        self.tabs.retain(|t| t.root.exists());
+        self.active_tab = active
+            .and_then(|a| self.tabs.iter().position(|t| t.root == a))
+            .unwrap_or(0);
+        self.load_active_tab();
+        let ctx = self.ctx.clone();
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.refocus(&ctx, &mut self.errors); // it may have changed while parked
+        }
+        self.remember_active();
+    }
+
+    /// Load the active tab if it is still a shell. A folder that is no longer a project
+    /// loses its tab, as it would get none on a fresh open.
+    fn load_active_tab(&mut self) {
+        let i = self.active_tab;
+        if self.tabs.get(i).is_none_or(|t| t.loaded) {
+            return;
+        }
+        let Some(space) = self.space() else { return };
+        let ctx = self.ctx.clone();
+        if let Err(e) = self.tabs[i].load(&space, &ctx, &mut self.jobs, &mut self.errors) {
+            self.errors.push(format!("{e:#}"));
+            self.tabs.remove(i);
+            self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+            self.load_active_tab();
+        }
     }
 
     /// Open a tab for `root`, make it active and add it to the space's open tabs.
     fn open_tab(&mut self, root: &Path, space: &Space) {
         match ProjectTab::open(root, space, &self.ctx, &mut self.jobs, &mut self.errors) {
             Ok(tab) => {
+                self.tabs_space.get_or_insert_with(|| space.id.clone());
                 self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
                 self.new_tab = false;
@@ -1111,7 +1228,7 @@ impl SpinneyApp {
             Action::SwitchSpace(id) => {
                 if switch_space(&mut self.config, &id) {
                     self.save_config();
-                    self.open_visible_tabs();
+                    self.show_active_space();
                 }
             }
             Action::NewSpace => self.dialogs.space = Some(spaces::SpaceEdit::new_space()),
@@ -1125,8 +1242,9 @@ impl SpinneyApp {
                 self.confirm_op = None;
                 self.confirm_resolve = None;
                 self.new_tab = false;
-                if let Some(tab) = self.tabs.get_mut(i) {
-                    tab.reload_changes(&mut errors);
+                match self.tabs.get_mut(i) {
+                    Some(tab) if tab.loaded => tab.reload_changes(&mut errors),
+                    _ => self.load_active_tab(),
                 }
                 self.remember_active();
             }
@@ -1715,7 +1833,7 @@ impl SpinneyApp {
             }
         }
         if edit.id.is_none() {
-            self.open_visible_tabs(); // the new space is now active
+            self.show_active_space(); // the new space is now active
         }
     }
 
@@ -2258,6 +2376,8 @@ impl eframe::App for SpinneyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        // Closing or moving tabs can make a shell the active one.
+        self.load_active_tab();
         let focused = ui.input(|i| i.focused);
         if focused && !self.focused {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -3009,6 +3129,8 @@ mod tests {
             config_path: Some(cfg_path.to_path_buf()),
             tabs: vec![],
             active_tab: 0,
+            tabs_space: None,
+            parked: vec![],
             jobs: Jobs::new(ctx.clone()),
             errors: vec![],
             notices: vec![],
@@ -3063,6 +3185,106 @@ mod tests {
         let app = reload();
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.tabs[0].root, roots[2]);
+    }
+
+    /// Spaces "a" with `a` open and "b" with `b` open, both real repos.
+    fn two_spaces(a: &[PathBuf], b: &[PathBuf]) -> Config {
+        let mut c = cfg();
+        c.spaces[0].projects = a.to_vec();
+        c.spaces[0].open = a.to_vec();
+        c.spaces[1].projects = b.to_vec();
+        c.spaces[1].open = b.to_vec();
+        c
+    }
+
+    #[test]
+    fn only_the_active_tab_loads_until_another_is_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos: Vec<_> = (0..3).map(|_| repo(1)).collect();
+        let roots: Vec<_> = repos
+            .iter()
+            .map(|r| r.path().canonicalize().unwrap())
+            .collect();
+        let mut c = two_spaces(&roots, &[]);
+        c.spaces[0].active = Some(roots[1].clone());
+        let mut app = test_app(c, &tmp.path().join("config.toml"));
+        app.open_visible_tabs();
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let loaded = |app: &SpinneyApp| app.tabs.iter().map(|t| t.loaded).collect::<Vec<_>>();
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(loaded(&app), [false, true, false]);
+        assert!(
+            !app.tabs[1].branches.is_empty(),
+            "the active tab is filled in"
+        );
+
+        app.apply(Action::SelectTab(2));
+        assert_eq!(loaded(&app), [false, true, true]);
+        assert!(!app.tabs[2].branches.is_empty());
+        app.apply(Action::CloseTab(2)); // tab 1 becomes active: already loaded
+        app.apply(Action::SelectTab(0));
+        assert_eq!(loaded(&app), [true, true]);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+    }
+
+    #[test]
+    fn switching_back_to_a_space_keeps_its_tabs_as_they_were() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r1, r2, r3) = (repo(1), repo(1), repo(1));
+        let canon = |r: &tempfile::TempDir| r.path().canonicalize().unwrap();
+        let c = two_spaces(&[canon(&r1), canon(&r2)], &[canon(&r3)]);
+        let mut app = test_app(c, &tmp.path().join("config.toml"));
+        app.open_visible_tabs();
+        app.apply(Action::SelectTab(1));
+        app.tabs[1].filter = "typed before switching".into();
+
+        app.apply(Action::SwitchSpace("b".into()));
+        let open: Vec<_> = app.tabs.iter().map(|t| t.root.clone()).collect();
+        assert_eq!(open, [canon(&r3)]);
+        app.apply(Action::SwitchSpace("a".into()));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let open: Vec<_> = app.tabs.iter().map(|t| t.root.clone()).collect();
+        assert_eq!(open, [canon(&r1), canon(&r2)]);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(
+            app.tabs[1].filter, "typed before switching",
+            "the same tab, not reopened"
+        );
+
+        // Committed outside Spinney while parked: seen when switching back.
+        app.apply(Action::SwitchSpace("b".into()));
+        crate::git::run(
+            r2.path(),
+            &["commit", "-q", "--allow-empty", "-m", "outside"],
+        )
+        .unwrap();
+        let before = app.parked[0].tabs[1].head.clone();
+        app.apply(Action::SwitchSpace("a".into()));
+        assert_ne!(app.tabs[1].head, before, "refreshed on the way back");
+    }
+
+    #[test]
+    fn a_project_deleted_while_its_space_was_parked_loses_its_tab_quietly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r1, r2, r3) = (repo(1), repo(1), repo(1));
+        let canon = |r: &tempfile::TempDir| r.path().canonicalize().unwrap();
+        let (kept, gone) = (canon(&r1), canon(&r2));
+        let c = two_spaces(&[kept.clone(), gone.clone()], &[canon(&r3)]);
+        let mut app = test_app(c, &tmp.path().join("config.toml"));
+        app.open_visible_tabs();
+        app.apply(Action::SelectTab(1));
+        app.apply(Action::SwitchSpace("b".into()));
+        drop(r2);
+        app.apply(Action::SwitchSpace("a".into()));
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let open: Vec<_> = app.tabs.iter().map(|t| t.root.clone()).collect();
+        assert_eq!(open, [kept]);
+        assert_eq!(app.active_tab, 0);
+        assert!(app.tabs[0].loaded, "the tab that became active loaded");
+        assert!(
+            app.config.spaces[0].open.contains(&gone),
+            "kept in open, as on a fresh launch"
+        );
     }
 
     #[test]
@@ -3833,6 +4055,66 @@ mod tests {
             matches!(app.tabs[0].center, Center::Graph),
             "resolved: closed"
         );
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+    }
+}
+
+#[cfg(test)]
+mod switch_timing {
+    use super::tests::{cfg, test_app};
+    use super::*;
+    use std::time::Instant;
+
+    /// Times switching between two spaces of five tabs each, cloned from this repo.
+    /// `cargo test --release switch_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn time_space_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let src = std::env::current_dir().unwrap();
+        let mut roots = vec![];
+        for i in 0..10 {
+            let dst = base.join(format!("r{i}"));
+            let out = std::process::Command::new("git")
+                .args(["clone", "-q", "--no-local"])
+                .arg(&src)
+                .arg(&dst)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // As a project Spinney has opened before has; otherwise its background write
+            // competes with the timings.
+            crate::git::run(&dst, &["commit-graph", "write", "--reachable"]).unwrap();
+            roots.push(dst);
+        }
+        let mut c = cfg();
+        c.spaces[0].projects = roots[..5].to_vec();
+        c.spaces[0].open = roots[..5].to_vec();
+        c.spaces[1].projects = roots[5..].to_vec();
+        c.spaces[1].open = roots[5..].to_vec();
+        let cfg_path = base.join("config.toml");
+        let mut app = test_app(c, &cfg_path);
+        let t = Instant::now();
+        app.open_visible_tabs();
+        eprintln!("first open of 5 tabs: {:?}", t.elapsed());
+        for round in 0..3 {
+            for id in ["b", "a"] {
+                // Let background history paging settle, as it would between clicks.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let t = Instant::now();
+                app.apply(Action::SwitchSpace(id.into()));
+                eprintln!(
+                    "round {round}: switch to {id}: {:?} ({} tabs)",
+                    t.elapsed(),
+                    app.tabs.len()
+                );
+            }
+        }
         assert!(app.errors.is_empty(), "{:?}", app.errors);
     }
 }
