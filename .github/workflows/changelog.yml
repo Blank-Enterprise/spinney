@@ -1,0 +1,33 @@
+name: changelog
+
+# A nudge, not a required check: a PR that changes the app adds a line under Unreleased in
+# CHANGELOG.md, or carries the "skip changelog" label. Its own workflow, so adding the label
+# re-runs only this.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: changelog-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: CHANGELOG.md is well formed
+        run: bash scripts/changelog.sh check && bash scripts/test-changelog.sh
+      - name: App changes are in CHANGELOG.md
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip changelog') }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/changelog.sh pr "$BASE"

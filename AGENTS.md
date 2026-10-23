@@ -70,7 +70,8 @@ bash scripts/msrv-check.sh     # build on the declared rust-version (check.sh ru
   - follow `.github/pull_request_template.md`, with `Resolves #N` and a **Testing** section that says plainly what wasn't checked in the running app;
   - set the issue's milestone;
   - one issue per PR;
-  - never paste links to AI or chat sessions in PRs.
+  - never paste links to AI or chat sessions in PRs;
+  - add a line under **Unreleased** in `CHANGELOG.md` for anything users will notice, written for them, or label the PR `skip changelog` (`scripts/changelog.sh`; the `changelog` workflow checks it).
 - **Issues:** epics (label `epic`) hold sub-issues. Labels mark type (`bug`, `enhancement`, `security`, `release`, `ci`, `chore`), `priority: …`, `size: XS…XL`, and state (`blocked`, `needs decision`, `needs QA`). Start from the roadmap, #31.
 - **Board:** the [Spinney roadmap project](https://github.com/orgs/Blank-Enterprise/projects/1), with Status Backlog → Ready → In progress → In review → Blocked → Done. Move an issue to **In review** when its PR opens.
 
@@ -80,4 +81,5 @@ bash scripts/msrv-check.sh     # build on the declared rust-version (check.sh ru
 - **Pushing changes to `.github/workflows/` needs a token with the `workflow` scope.** Spinney's sign-in requests it. Older tokens and `gh` logins may not have it.
 - **Terminals can't screenshot the app** without macOS screen-recording permission. Say in the PR that UI changes weren't checked on screen.
 - **Releases:** bump `version` in `Cargo.toml`, merge to `main`, then push a `vX.Y.Z` tag on `main`. The release workflow refuses a tag that's off `main` or doesn't match `Cargo.toml`.
+  - **Changelog:** the version-bump PR for a stable release also runs `bash scripts/changelog.sh release X.Y.Z`. The release workflow takes a stable release's notes from its section, and refuses the tag without one; a beta or rc takes the Unreleased section.
   - **Pre-releases** (`vX.Y.Z-beta.N`, `vX.Y.Z-rc.N`) need no bump: `X.Y.Z` is the `Cargo.toml` version, the release it leads to, and they stop once `vX.Y.Z` is out. Cut one with the **prerelease** workflow in Actions, or `bash scripts/tag-prerelease.sh beta` (or `rc`). The tag rules live in `scripts/release-tag.sh`. A pre-release is never "latest", so `install.sh` keeps installing the stable release. Its plist has `X.Y.Z` in the bundle versions, which allow only digits, and the full version in `SpinneyVersion`.
