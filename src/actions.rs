@@ -815,21 +815,44 @@ pub fn strategy_from_git(
 
 /// `strategy_from_git` for the branch checked out in `worktree`.
 pub fn git_pull_strategy(worktree: &Path) -> Result<PullStrategy> {
-    // Exit 1 is an unset key.
-    let get = |key: &str| -> Result<Option<String>> {
-        let v = git::run_ok_codes(worktree, &["config", "--get", key], &[0, 1])?;
-        Ok(Some(v.trim().to_string()).filter(|v| !v.is_empty()))
-    };
-    let branch_rebase = match refs::current_branch(worktree)? {
-        Some(b) => get(&format!("branch.{b}.rebase"))?,
-        None => None,
-    };
-    let (pull_rebase, pull_ff) = (get("pull.rebase")?, get("pull.ff")?);
+    git_pull_strategy_on(worktree, refs::current_branch(worktree)?.as_deref())
+}
+
+/// `git_pull_strategy` with the checked-out branch already known: one git call.
+pub fn git_pull_strategy_on(worktree: &Path, branch: Option<&str>) -> Result<PullStrategy> {
+    let listed = git::run(worktree, &["config", "-z", "--list"])?;
+    let get = |key: &str| config_value(&listed, key);
+    let branch_rebase = branch.and_then(|b| get(&format!("branch.{b}.rebase")));
     Ok(strategy_from_git(
-        branch_rebase.as_deref(),
-        pull_rebase.as_deref(),
-        pull_ff.as_deref(),
+        branch_rebase,
+        get("pull.rebase"),
+        get("pull.ff"),
     ))
+}
+
+/// What `git config --get <key>` prints, from `git config -z --list` output: the last
+/// value set, or `None` when unset or empty. Section and variable names match in any case,
+/// a subsection (`branch.<name>`) exactly.
+fn config_value<'a>(listed: &'a str, key: &str) -> Option<&'a str> {
+    let norm = |k: &str| match (k.split_once('.'), k.rsplit_once('.')) {
+        (Some((section, _)), Some((rest, var))) if rest.len() > section.len() => format!(
+            "{}{}.{}",
+            section.to_lowercase(),
+            &rest[section.len()..],
+            var.to_lowercase()
+        ),
+        _ => k.to_lowercase(),
+    };
+    let key = norm(key);
+    listed
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        // A key with no value (`[pull] rebase`) has no newline; `--get` prints nothing for it.
+        .map(|e| e.split_once('\n').unwrap_or((e, "")))
+        .filter(|(k, _)| norm(k) == key)
+        .map(|(_, v)| v.trim())
+        .next_back()
+        .filter(|v| !v.is_empty())
 }
 
 /// A merge or rebase pull that stopped on conflicts, left in place for the in-progress
@@ -1564,6 +1587,34 @@ mod tests {
     fn explained(dir: &Path, e: anyhow::Error) -> SyncError {
         let e = explain_sync(dir, e);
         e.downcast::<SyncError>().expect("a known sync error")
+    }
+
+    #[test]
+    fn config_value_is_what_git_config_get_prints() {
+        let listed = "pull.rebase\nfalse\0Pull.Rebase\ntrue\0branch.Feature/X.rebase\nmerges\0\
+                      pull.ff\nonly\0pull.ff\0core.editor\n\0";
+        assert_eq!(
+            config_value(listed, "pull.rebase"),
+            Some("true"),
+            "the last one wins"
+        );
+        assert_eq!(config_value(listed, "PULL.REBASE"), Some("true"));
+        assert_eq!(
+            config_value(listed, "branch.Feature/X.rebase"),
+            Some("merges")
+        );
+        assert_eq!(
+            config_value(listed, "branch.feature/x.rebase"),
+            None,
+            "subsection exact"
+        );
+        assert_eq!(
+            config_value(listed, "pull.ff"),
+            None,
+            "a valueless key prints nothing"
+        );
+        assert_eq!(config_value(listed, "core.editor"), None);
+        assert_eq!(config_value(listed, "merge.ff"), None);
     }
 
     #[test]
