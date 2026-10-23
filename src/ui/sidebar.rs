@@ -1,72 +1,70 @@
 use super::worktrees_view::{self, View};
-use super::{theme, toolbar::folder_name, Action, ProjectTab};
+use super::{offscreen, theme, toolbar::folder_name, Action, ProjectTab};
 use crate::project::Worktree;
 use crate::refs::{Branch, Tag};
 use eframe::egui::{self, RichText};
 use std::path::Path;
 
 /// Branches grouped into folders by their `/` segments: `feat/login` sits in `feat`.
-#[derive(Debug, PartialEq)]
-pub enum Node<'a> {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Node {
     Folder {
         name: String,
         /// Segments up to and including this folder (`feat/ui`): a stable id.
         path: String,
-        children: Vec<Node<'a>>,
+        children: Vec<Node>,
+        /// Branches under it, at any depth.
+        count: usize,
+        /// The first of them is a remote branch (so they all are).
+        remote: bool,
     },
-    Branch(&'a Branch),
+    /// An index into the branch list the tree was built from.
+    Branch(usize),
 }
 
-/// Folders first (by name), then branches in their listed order, at every level.
-pub fn branch_tree<'a>(branches: &[&'a Branch]) -> Vec<Node<'a>> {
-    let mut root = vec![];
-    for &b in branches {
+/// One level while building: folders by name, then branches in their listed order.
+#[derive(Default)]
+struct Level<'a> {
+    folders: std::collections::BTreeMap<&'a str, Level<'a>>,
+    branches: Vec<usize>,
+}
+
+/// The `picked` branches (indices into `branches`) as a tree: folders first (by name),
+/// then branches in their listed order, at every level.
+pub fn branch_tree(branches: &[Branch], picked: &[usize]) -> Vec<Node> {
+    let mut root = Level::default();
+    for &i in picked {
         let mut level = &mut root;
-        let mut path = String::new();
-        let segments: Vec<&str> = b.name.split('/').collect();
-        for seg in &segments[..segments.len() - 1] {
-            if !path.is_empty() {
-                path.push('/');
-            }
-            path += seg;
-            let i = match level
-                .iter()
-                .position(|n| matches!(n, Node::Folder { name, .. } if name == seg))
-            {
-                Some(i) => i,
-                None => {
-                    level.push(Node::Folder {
-                        name: seg.to_string(),
-                        path: path.clone(),
-                        children: vec![],
-                    });
-                    level.len() - 1
-                }
-            };
-            let Node::Folder { children, .. } = &mut level[i] else {
-                unreachable!("position matched a folder")
-            };
-            level = children;
+        let mut segments = branches[i].name.split('/');
+        let mut seg = segments.next().unwrap_or_default();
+        for next in segments {
+            level = level.folders.entry(seg).or_default();
+            seg = next;
         }
-        level.push(Node::Branch(b));
+        level.branches.push(i);
     }
-    sort(&mut root);
-    root
+    nodes(root, "", branches)
 }
 
-fn sort(nodes: &mut [Node]) {
-    // Stable: branches keep their order; folders sort by name ahead of them.
-    nodes.sort_by(|a, b| match (a, b) {
-        (Node::Folder { name: x, .. }, Node::Folder { name: y, .. }) => x.cmp(y),
-        (Node::Folder { .. }, Node::Branch(_)) => std::cmp::Ordering::Less,
-        (Node::Branch(_), Node::Folder { .. }) => std::cmp::Ordering::Greater,
-        _ => std::cmp::Ordering::Equal,
-    });
-    for n in nodes {
-        if let Node::Folder { children, .. } = n {
-            sort(children);
-        }
+fn nodes(level: Level, parent: &str, branches: &[Branch]) -> Vec<Node> {
+    let mut out = Vec::with_capacity(level.folders.len() + level.branches.len());
+    for (name, sub) in level.folders {
+        let path = match parent {
+            "" => name.to_string(),
+            _ => format!("{parent}/{name}"),
+        };
+        let children = nodes(sub, &path, branches);
+        let first = leaves(&children).next();
+        out.push(Node::Folder {
+            name: name.to_string(),
+            count: count(&children),
+            remote: first.is_some_and(|i| branches[i].remote),
+            path,
+            children,
+        });
     }
+    out.extend(level.branches.into_iter().map(Node::Branch));
+    out
 }
 
 /// Branches under these nodes.
@@ -75,21 +73,76 @@ fn count(nodes: &[Node]) -> usize {
         .iter()
         .map(|n| match n {
             Node::Branch(_) => 1,
-            Node::Folder { children, .. } => count(children),
+            Node::Folder { count, .. } => *count,
         })
         .sum()
 }
 
 /// The branches under these nodes, in the order they are drawn.
-pub fn leaves<'a>(nodes: &[Node<'a>]) -> Vec<&'a Branch> {
-    let mut out = vec![];
-    for n in nodes {
-        match n {
-            Node::Branch(b) => out.push(*b),
-            Node::Folder { children, .. } => out.extend(leaves(children)),
-        }
+pub fn leaves(nodes: &[Node]) -> Box<dyn Iterator<Item = usize> + '_> {
+    Box::new(
+        nodes
+            .iter()
+            .flat_map(|n| -> Box<dyn Iterator<Item = usize> + '_> {
+                match n {
+                    Node::Branch(i) => Box::new(std::iter::once(*i)),
+                    Node::Folder { children, .. } => leaves(children),
+                }
+            }),
+    )
+}
+
+/// A section's tree, and how many branches it holds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tree {
+    pub nodes: Vec<Node>,
+    pub len: usize,
+}
+
+/// The Local and Remote trees, kept between frames: filtering and building them for
+/// thousands of branches is too slow to redo on every repaint. They hold indices into
+/// the branch list, so they are rebuilt whenever a name, its side or the filter changes;
+/// the rest of a branch (ahead, behind, checked out) is read when drawn.
+#[derive(Clone, Default)]
+pub struct TreeCache {
+    /// What the trees were built from: each branch's name and side, and the filter.
+    names: Vec<(String, bool)>,
+    filter: String,
+    trees: std::sync::Arc<(Tree, Tree)>,
+}
+
+impl TreeCache {
+    fn fits(&self, branches: &[Branch], filter: &str) -> bool {
+        self.filter == filter
+            && self.names.len() == branches.len()
+            && (self.names.iter().zip(branches)).all(|((n, r), b)| *n == b.name && *r == b.remote)
     }
-    out
+
+    /// The (local, remote) trees of the branches matching `filter`, rebuilt only when
+    /// they would come out different. True when rebuilt.
+    pub fn update(&mut self, branches: &[Branch], filter: &str) -> bool {
+        if self.fits(branches, filter) {
+            return false;
+        }
+        let q = query(filter);
+        let (mut local, mut remote) = (vec![], vec![]);
+        for (i, b) in branches.iter().enumerate() {
+            if matches_query(&q, &b.name) {
+                if b.remote { &mut remote } else { &mut local }.push(i);
+            }
+        }
+        let tree = |picked: Vec<usize>| Tree {
+            nodes: branch_tree(branches, &picked),
+            len: picked.len(),
+        };
+        self.trees = std::sync::Arc::new((tree(local), tree(remote)));
+        self.names = branches
+            .iter()
+            .map(|b| (b.name.clone(), b.remote))
+            .collect();
+        self.filter = filter.to_string();
+        true
+    }
 }
 
 /// "Delete N branches in feat…" for a folder's menu; None for a remote's own folder
@@ -126,12 +179,15 @@ fn tip(r: egui::Response, tips: bool, text: impl Into<egui::WidgetText>) -> egui
 }
 
 /// Draw `nodes`: folders start open and collapse; a filter opens them all so every match shows.
+#[allow(clippy::too_many_arguments)]
 fn tree(
     ui: &mut egui::Ui,
     id: &str,
     nodes: &[Node],
+    branches: &[Branch],
     filtering: bool,
     cx: Ctx,
+    rows: &mut offscreen::Rows,
     actions: &mut Vec<Action>,
 ) {
     for n in nodes {
@@ -140,6 +196,8 @@ fn tree(
                 name,
                 path,
                 children,
+                count,
+                remote,
             } => {
                 let label = RichText::new(format!("📁 {name}")).color(theme::TEXT);
                 let header = egui::CollapsingHeader::new(label)
@@ -150,26 +208,27 @@ fn tree(
                 } else {
                     header
                 };
-                let r = header.show(ui, |ui| tree(ui, id, children, filtering, cx, actions));
-                let text = format!("{path} · {}", count(children));
-                let r = tip(r.header_response, cx.tips, text);
+                let r = header.show(ui, |ui| {
+                    tree(ui, id, children, branches, filtering, cx, rows, actions)
+                });
+                let r = tip(r.header_response, cx.tips, format!("{path} · {count}"));
                 // Only the branches drawn under it: with a filter on, the ones that match.
-                let branches = leaves(children);
-                let remote = branches.first().is_some_and(|b| b.remote);
-                if let Some(label) = folder_delete_label(remote, path, branches.len()) {
+                if let Some(label) = folder_delete_label(*remote, path, *count) {
                     r.context_menu(|ui| {
                         if ui.button(label).clicked() {
                             actions.push(Action::AskDeleteFolder {
                                 folder: path.clone(),
-                                branches: branches.iter().map(|b| b.name.clone()).collect(),
-                                remote,
+                                branches: leaves(children)
+                                    .map(|i| branches[i].name.clone())
+                                    .collect(),
+                                remote: *remote,
                             });
                             ui.close();
                         }
                     });
                 }
             }
-            Node::Branch(b) => branch_row(ui, b, cx, actions),
+            Node::Branch(i) => rows.row(ui, |ui| branch_row(ui, &branches[*i], cx, actions)),
         }
     }
 }
@@ -196,8 +255,17 @@ fn branch_row(ui: &mut egui::Ui, b: &Branch, cx: Ctx, actions: &mut Vec<Action>)
 }
 
 /// Case-insensitive substring match of the sidebar filter on a branch or worktree name.
-pub fn filter_matches(query: &str, name: &str) -> bool {
-    name.to_lowercase().contains(&query.trim().to_lowercase())
+pub fn filter_matches(filter: &str, name: &str) -> bool {
+    matches_query(&query(filter), name)
+}
+
+/// The filter as `matches_query` takes it, lowercased once for a whole list.
+fn query(filter: &str) -> String {
+    filter.trim().to_lowercase()
+}
+
+fn matches_query(q: &str, name: &str) -> bool {
+    q.is_empty() || name.to_lowercase().contains(q)
 }
 
 /// Full-width sidebar row; `right` is muted, right-aligned text. Text that doesn't fit is
@@ -566,11 +634,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, tips: bool, actions: &mut V
     {
         let tab = &*tab;
         let q = tab.filter.as_str();
-        let local: Vec<_> = tab
-            .branches
-            .iter()
-            .filter(|b| !b.remote && filter_matches(q, &b.name))
-            .collect();
+        let trees = ui.data_mut(|d| {
+            let cache = d.get_temp_mut_or_default::<TreeCache>(egui::Id::unique("sidebar_trees"));
+            cache.update(&tab.branches, q);
+            cache.trees.clone()
+        });
+        let (local, remote) = &*trees;
         let filtering = !q.trim().is_empty();
         // None when HEAD is detached.
         let current = tab
@@ -588,19 +657,33 @@ pub fn show(ui: &mut egui::Ui, tab: &mut ProjectTab, tips: bool, actions: &mut V
             checked_out: &checked_out,
             tips,
         };
-        split.section(ui, 0, "Local", local.len(), |ui| {
-            let nodes = branch_tree(&local);
-            tree(ui, "local", &nodes, filtering, cx, actions);
+        let bs = &tab.branches;
+        split.section(ui, 0, "Local", local.len, |ui| {
+            let mut rows = offscreen::Rows::new(ui.ctx());
+            tree(
+                ui,
+                "local",
+                &local.nodes,
+                bs,
+                filtering,
+                cx,
+                &mut rows,
+                actions,
+            );
         });
-        let remote: Vec<_> = tab
-            .branches
-            .iter()
-            .filter(|b| b.remote && filter_matches(q, &b.name))
-            .collect();
-        split.section(ui, 1, "Remote", remote.len(), |ui| {
+        split.section(ui, 1, "Remote", remote.len, |ui| {
             // `origin/feat/x`: the remote is the first folder level.
-            let nodes = branch_tree(&remote);
-            tree(ui, "remote", &nodes, filtering, cx, actions);
+            let mut rows = offscreen::Rows::new(ui.ctx());
+            tree(
+                ui,
+                "remote",
+                &remote.nodes,
+                bs,
+                filtering,
+                cx,
+                &mut rows,
+                actions,
+            );
         });
         let worktrees: Vec<_> = tab
             .worktrees
@@ -958,15 +1041,20 @@ mod tests {
         }
     }
 
+    /// Every branch, as `branch_tree` picks them.
+    fn all(bs: &[Branch]) -> Vec<usize> {
+        (0..bs.len()).collect()
+    }
+
     /// The tree as indented lines: folders end in `/`.
-    fn outline(nodes: &[Node], depth: usize, out: &mut Vec<String>) {
+    fn outline(nodes: &[Node], bs: &[Branch], depth: usize, out: &mut Vec<String>) {
         for n in nodes {
             match n {
                 Node::Folder { name, children, .. } => {
                     out.push(format!("{}{name}/", "  ".repeat(depth)));
-                    outline(children, depth + 1, out);
+                    outline(children, bs, depth + 1, out);
                 }
-                Node::Branch(b) => out.push(format!("{}{}", "  ".repeat(depth), b.name)),
+                Node::Branch(i) => out.push(format!("{}{}", "  ".repeat(depth), bs[*i].name)),
             }
         }
     }
@@ -982,10 +1070,9 @@ mod tests {
             "feat/ui/bar",
         ];
         let bs: Vec<Branch> = names.iter().map(|n| branch(n)).collect();
-        let refs: Vec<&Branch> = bs.iter().collect();
-        let nodes = branch_tree(&refs);
+        let nodes = branch_tree(&bs, &all(&bs));
         let mut out = vec![];
-        outline(&nodes, 0, &mut out);
+        outline(&nodes, &bs, 0, &mut out);
         assert_eq!(
             out,
             [
@@ -1000,11 +1087,18 @@ mod tests {
                 "dev",
             ]
         );
-        let Node::Folder { path, children, .. } = &nodes[0] else {
+        let Node::Folder {
+            path,
+            children,
+            count: n,
+            remote,
+            ..
+        } = &nodes[0]
+        else {
             panic!("feat is a folder")
         };
-        assert_eq!(path, "feat");
-        assert!(matches!(&children[0], Node::Folder { path, .. } if path == "feat/ui"));
+        assert_eq!((path.as_str(), *n, *remote), ("feat", 3, false));
+        assert!(matches!(&children[0], Node::Folder { path, count: 2, .. } if path == "feat/ui"));
         assert_eq!(count(&nodes), 6);
     }
 
@@ -1014,14 +1108,13 @@ mod tests {
             .into_iter()
             .map(branch)
             .collect();
-        let refs: Vec<&Branch> = bs.iter().collect();
-        let nodes = branch_tree(&refs);
+        let nodes = branch_tree(&bs, &all(&bs));
         let Node::Folder { children, .. } = &nodes[0] else {
             panic!("feat folder first: {nodes:?}")
         };
-        let names: Vec<_> = leaves(children).iter().map(|b| b.name.as_str()).collect();
+        let names: Vec<_> = leaves(children).map(|i| bs[i].name.as_str()).collect();
         assert_eq!(names, ["feat/ui/a", "feat/b"]);
-        assert_eq!(leaves(&nodes).len(), 3);
+        assert_eq!(leaves(&nodes).count(), 3);
     }
 
     #[test]
@@ -1175,9 +1268,8 @@ mod tests {
             .iter()
             .map(|n| branch(n))
             .collect();
-        let refs: Vec<&Branch> = bs.iter().collect();
         let mut out = vec![];
-        outline(&branch_tree(&refs), 0, &mut out);
+        outline(&branch_tree(&bs, &all(&bs)), &bs, 0, &mut out);
         assert_eq!(
             out,
             [
@@ -1271,5 +1363,89 @@ mod tests {
         assert!(filter_matches("FEAT", "feat/music-sync"));
         assert!(filter_matches("sync ", "feat/Music-Sync"));
         assert!(!filter_matches("fix", "main"));
+    }
+
+    fn remote(name: &str) -> Branch {
+        Branch {
+            remote: true,
+            ..branch(name)
+        }
+    }
+
+    /// The names in a section's tree, in the order they are drawn.
+    fn drawn(t: &Tree, bs: &[Branch]) -> Vec<String> {
+        leaves(&t.nodes).map(|i| bs[i].name.clone()).collect()
+    }
+
+    #[test]
+    fn trees_split_by_side_and_filter() {
+        let bs = vec![
+            branch("main"),
+            branch("feat/Login"),
+            remote("origin/main"),
+            remote("origin/feat/login"),
+        ];
+        let mut c = TreeCache::default();
+        c.update(&bs, " LOGIN ");
+        let (local, remote) = &*c.trees;
+        assert_eq!((local.len, remote.len), (1, 1));
+        assert_eq!(drawn(local, &bs), ["feat/Login"]);
+        assert_eq!(drawn(remote, &bs), ["origin/feat/login"]);
+        let Node::Folder { remote: r, .. } = &remote.nodes[0] else {
+            panic!("origin is a folder")
+        };
+        assert!(*r, "a remote's folder knows it");
+    }
+
+    #[test]
+    fn trees_are_rebuilt_only_when_names_or_filter_change() {
+        let mut bs = vec![branch("main"), branch("feat/a"), remote("origin/main")];
+        let mut c = TreeCache::default();
+        assert!(c.update(&bs, ""), "first build");
+        assert!(!c.update(&bs, ""), "nothing changed");
+        bs[0].ahead = 3;
+        bs[0].head = true;
+        assert!(!c.update(&bs, ""), "tracking is read when drawn");
+        assert!(c.update(&bs, "fe"), "filter changed");
+        assert_eq!(drawn(&c.trees.0, &bs), ["feat/a"]);
+        assert!(c.update(&bs, "fe "), "even only by a space");
+        assert!(!c.update(&bs, "fe "));
+        bs[1].name = "feat/b".into();
+        assert!(c.update(&bs, "fe "), "a branch was renamed");
+        assert_eq!(drawn(&c.trees.0, &bs), ["feat/b"]);
+        bs.push(branch("feat/c"));
+        assert!(c.update(&bs, "fe "), "a branch was added");
+        assert_eq!(drawn(&c.trees.0, &bs), ["feat/b", "feat/c"]);
+        bs.remove(0);
+        assert!(c.update(&bs, "fe "), "a branch went, moving the rest");
+        assert_eq!(drawn(&c.trees.0, &bs), ["feat/b", "feat/c"]);
+        bs[0].remote = true;
+        assert!(c.update(&bs, "fe "), "a branch changed side");
+        assert_eq!(c.trees.1.len, 1);
+    }
+
+    /// `cargo test --locked -- --ignored --nocapture sidebar_tree_timing`
+    #[test]
+    #[ignore]
+    fn sidebar_tree_timing() {
+        let mut bs: Vec<Branch> = (0..500)
+            .map(|i| branch(&format!("feat/team{}/x{i}", i % 20)))
+            .collect();
+        bs.extend((0..4500).map(|i| remote(&format!("origin/user{}/topic-{i}", i % 300))));
+        for q in ["", "topic-1"] {
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                assert!(TreeCache::default().update(&bs, q));
+            }
+            let rebuild = t.elapsed() / 20;
+            let mut c = TreeCache::default();
+            c.update(&bs, q);
+            let t = std::time::Instant::now();
+            for _ in 0..1000 {
+                assert!(!c.update(&bs, q));
+            }
+            let hit = t.elapsed() / 1000;
+            println!("5,000 branches, filter {q:?}: rebuild {rebuild:?}; cache hit {hit:?}");
+        }
     }
 }

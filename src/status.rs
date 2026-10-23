@@ -102,12 +102,25 @@ pub struct Status {
     pub staged: Vec<FileStatus>,
     pub unstaged: Vec<FileStatus>,
     pub conflicted: Vec<FileStatus>,
+    /// `changed_files`, counted once by `status` (or `recount`): panels show it every frame.
+    pub changed: usize,
 }
 
 impl Status {
     /// Distinct paths with any change (a file changed on both sides counts once).
     pub fn changed_files(&self) -> usize {
-        self.changed_paths().len()
+        self.changed
+    }
+
+    /// Count `changed_files` again, after the lists were edited.
+    pub fn recount(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let all = self
+            .conflicted
+            .iter()
+            .chain(&self.staged)
+            .chain(&self.unstaged);
+        self.changed = all.filter(|f| seen.insert(f.path.as_str())).count();
     }
 
     /// Those paths, conflicted first, then staged, then unstaged and untracked.
@@ -194,6 +207,7 @@ pub fn status(worktree: &Path) -> Result<Status> {
             _ => {}
         }
     }
+    st.recount();
     Ok(st)
 }
 
@@ -221,6 +235,8 @@ mod tests {
         st.unstaged.push(fs_("a", Change::Modified)); // both sides: one file
         st.unstaged.push(fs_("b", Change::Untracked));
         st.conflicted.push(fs_("c", Change::Conflicted(BOTH)));
+        assert_eq!(st.changed_files(), 0, "not counted until asked");
+        st.recount();
         assert_eq!(st.changed_files(), 3);
         assert_eq!(st.changed_paths(), ["c", "a", "b"]);
     }
@@ -298,6 +314,11 @@ mod tests {
 
         let s = status(d).unwrap();
         assert_eq!(
+            s.changed_files(),
+            s.changed_paths().len(),
+            "counted on load"
+        );
+        assert_eq!(
             s.staged,
             vec![
                 fs_("added.txt", Change::Added),
@@ -359,6 +380,7 @@ mod tests {
         let s = status(d).unwrap();
         assert_eq!(s.conflicted, vec![fs_("f", Change::Conflicted(BOTH))]);
         assert!(s.staged.is_empty() && s.unstaged.is_empty());
+        assert_eq!(s.changed_files(), 1, "counted on load");
 
         // Deleted on `gone`, changed on main: deleted by them.
         c(&["merge", "--abort"]);

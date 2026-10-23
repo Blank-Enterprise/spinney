@@ -6,6 +6,7 @@ use crate::stage::{build_patch, discard_patch, Direction};
 use crate::status::{Change, FileStatus};
 use eframe::egui::{self, Align, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Vec2};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Selected `(hunk_idx, line_idx)` lines of the displayed diff, all in one hunk.
 #[derive(Default, Debug, PartialEq)]
@@ -124,10 +125,51 @@ impl WorkDiff {
 
 const ROW_H: f32 = 18.0;
 
+#[derive(Clone, Debug, PartialEq)]
 enum Row {
     Hunk(usize),
     Line(usize, usize),
     Pair(usize, Option<usize>, Option<usize>),
+}
+
+/// The open diff's rows, kept between frames: `rows` pairs every hunk's lines, too slow
+/// to redo on each repaint of a long diff. Rows are indices into the diff's lines, and
+/// depend only on the mode and each hunk's line kinds, so those are the key.
+#[derive(Clone, Default)]
+struct RowCache {
+    inline: bool,
+    /// Each hunk's line count, and every line's kind end to end.
+    lens: Vec<usize>,
+    kinds: Vec<LineKind>,
+    rows: Arc<Vec<Row>>,
+}
+
+impl RowCache {
+    fn fits(&self, fd: &FileDiff, inline: bool) -> bool {
+        let mut kinds = self.kinds.iter();
+        self.inline == inline
+            && self.lens.len() == fd.hunks.len()
+            && fd.hunks.iter().zip(&self.lens).all(|(h, &n)| {
+                h.lines.len() == n && h.lines.iter().all(|l| kinds.next() == Some(&l.kind))
+            })
+    }
+
+    /// The rows for `fd`, rebuilt only when they would come out different. True when rebuilt.
+    fn update(&mut self, fd: &FileDiff, inline: bool) -> bool {
+        if self.fits(fd, inline) {
+            return false;
+        }
+        self.inline = inline;
+        self.lens = fd.hunks.iter().map(|h| h.lines.len()).collect();
+        self.kinds = fd
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .map(|l| l.kind)
+            .collect();
+        self.rows = Arc::new(rows(fd, inline));
+        true
+    }
 }
 
 fn rows(fd: &FileDiff, inline: bool) -> Vec<Row> {
@@ -228,7 +270,11 @@ pub fn show(ui: &mut egui::Ui, center: &mut Center, inline: bool, actions: &mut 
         ui.weak("No textual changes.");
         return;
     }
-    let rows = rows(fd, inline);
+    let rows = ui.data_mut(|d| {
+        let cache = d.get_temp_mut_or_default::<RowCache>(egui::Id::unique("diff_rows"));
+        cache.update(fd, inline);
+        cache.rows.clone()
+    });
     let hunk_stage = work.as_ref().filter(|_| lines_ok).map(|w| (w.0, w.2));
     let mut sel = work.and_then(|w| lines_ok.then_some(w.3));
     let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -505,6 +551,61 @@ mod tests {
     }
 
     use LineKind::{Add, Context as Ctx, Del};
+
+    fn diff(hunks: Vec<Hunk>) -> FileDiff {
+        FileDiff {
+            path: "f".into(),
+            binary: false,
+            lossy: false,
+            hunks,
+        }
+    }
+
+    #[test]
+    fn diff_rows_are_rebuilt_only_when_they_would_change() {
+        let mut fd = diff(vec![hunk(&[Ctx, Del, Add]), hunk(&[Add])]);
+        let mut c = RowCache::default();
+        assert!(c.update(&fd, false), "first build");
+        assert!(!c.update(&fd, false), "same diff, same mode");
+        assert_eq!(*c.rows, rows(&fd, false));
+        fd.hunks[0].lines[1].text = "edited".into();
+        assert!(!c.update(&fd, false), "only text changed: same rows");
+        assert!(c.update(&fd, true), "mode changed");
+        assert_eq!(*c.rows, rows(&fd, true));
+        assert!(!c.update(&fd, true));
+        fd.hunks[0].lines[2].kind = Del;
+        assert!(c.update(&fd, true), "a line's kind changed");
+        fd.hunks[1].lines.push(line(Ctx));
+        assert!(c.update(&fd, true), "a line was added");
+        // Same kinds end to end, split between the hunks differently.
+        let moved = diff(vec![hunk(&[Ctx, Del]), hunk(&[Del, Add, Ctx])]);
+        assert!(c.update(&moved, true), "lines moved between hunks");
+        assert_eq!(*c.rows, rows(&moved, true));
+        assert!(c.update(&diff(vec![]), true), "no hunks");
+        assert!(c.rows.is_empty());
+    }
+
+    /// `cargo test --locked -- --ignored --nocapture diff_rows_timing`
+    #[test]
+    #[ignore]
+    fn diff_rows_timing() {
+        let kinds = [Ctx, Ctx, Del, Del, Add, Ctx, Add, Ctx, Del, Ctx];
+        let hunks = (0..2000).map(|_| hunk(&kinds)).collect();
+        let fd = diff(hunks); // 20,000 lines
+        let mut c = RowCache::default();
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(rows(&fd, false));
+        }
+        let cold = t.elapsed() / 100;
+        c.update(&fd, false);
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(!c.update(&fd, false));
+        }
+        let hit = t.elapsed() / 100;
+        println!("rows() for 20k lines: {cold:?} per frame; cache hit: {hit:?}");
+    }
 
     #[test]
     fn side_by_side_columns_split_the_width_evenly() {
