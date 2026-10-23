@@ -4,6 +4,8 @@
 use crate::diff::{self, FileDiff};
 use crate::git;
 use anyhow::Result;
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 
 /// Where a changed file's change lives, relative to the worktree's HEAD.
@@ -152,24 +154,14 @@ pub fn changes_since(worktree: &Path, base: &str) -> Result<Vec<Change>> {
     let files = untracked
         .split('\0')
         .filter(|p| !p.is_empty() && !p.ends_with('/'));
+    let files: Vec<&str> = files.collect();
+    let no_diff = no_diff_attr(worktree, &files)?;
     for path in files {
-        // --no-index exits 1 when the files differ.
-        let out = git::run_ok_codes(
-            worktree,
-            &[
-                "-c",
-                "core.quotepath=off",
-                "diff",
-                "--numstat",
-                "-z",
-                "--no-index",
-                "--",
-                "/dev/null",
-                path,
-            ],
-            &[0, 1],
-        )?;
-        let lines = parse_numstat(&out).into_iter().next().and_then(|(_, l)| l);
+        let lines = if no_diff.contains(path) {
+            None
+        } else {
+            untracked_lines(worktree, path)
+        };
         changes.push(Change {
             path: path.to_string(),
             origin: Origin::Untracked,
@@ -178,6 +170,80 @@ pub fn changes_since(worktree: &Path, base: &str) -> Result<Vec<Change>> {
     }
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(changes)
+}
+
+/// The `paths` whose `diff` attribute is unset (`-diff`, `binary`), which git shows as binary
+/// whatever they hold. One `check-attr` for all of them.
+fn no_diff_attr(worktree: &Path, paths: &[&str]) -> Result<HashSet<String>> {
+    if paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut stdin = Vec::new();
+    for p in paths {
+        stdin.extend_from_slice(p.as_bytes());
+        stdin.push(0);
+    }
+    let out = git::run_stdin(worktree, &["check-attr", "-z", "--stdin", "diff"], &stdin)?;
+    // `<path>\0diff\0<value>\0` per path.
+    let fields: Vec<&str> = out.split('\0').collect();
+    let (records, _) = fields.as_chunks::<3>();
+    Ok(records
+        .iter()
+        .filter(|[_, _, value]| *value == "unset")
+        .map(|[path, _, _]| path.to_string())
+        .collect())
+}
+
+/// How many bytes git looks at for a NUL to call a file binary.
+const BINARY_SNIFF: usize = 8000;
+/// Files bigger than this are binary to git (`core.bigFileThreshold`'s default).
+const BIG_FILE: u64 = 512 << 20;
+
+/// An untracked file's diff, counted without running git: every line is added. Matches
+/// `git diff --no-index /dev/null <path>`: a symlink is one line (its target, never
+/// followed), a NUL in the first 8000 bytes or a huge file is binary (None), and a last
+/// line without a newline still counts. Only a regular file inside the worktree is read;
+/// anything else, or a file that can't be read, has no count.
+fn untracked_lines(worktree: &Path, path: &str) -> Option<(u32, u32)> {
+    let full = worktree.join(path);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if meta.is_symlink() {
+        return Some((1, 0));
+    }
+    if !meta.is_file() || meta.len() > BIG_FILE || !inside(worktree, &full) {
+        return None;
+    }
+    count_lines(std::fs::File::open(&full).ok()?).map(|n| (n, 0))
+}
+
+/// Whether `full`'s folder resolves inside `worktree`, so no symlinked folder leads out.
+fn inside(worktree: &Path, full: &Path) -> bool {
+    let (Some(dir), Ok(root)) = (full.parent(), worktree.canonicalize()) else {
+        return false;
+    };
+    dir.canonicalize().is_ok_and(|d| d.starts_with(root))
+}
+
+/// Lines in `r` as git counts them, or None when it's binary.
+fn count_lines(mut r: impl Read) -> Option<u32> {
+    let mut buf = [0u8; 64 * 1024];
+    let (mut seen, mut lines, mut last) = (0usize, 0u32, b'\n');
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        let chunk = &buf[..n];
+        if seen < BINARY_SNIFF && chunk[..n.min(BINARY_SNIFF - seen)].contains(&0) {
+            return None;
+        }
+        seen += n;
+        lines += chunk.iter().filter(|&&b| b == b'\n').count() as u32;
+        last = chunk[n - 1];
+    }
+    Some(lines + u32::from(last != b'\n'))
 }
 
 /// A commit on a worktree's branch since it branched.
@@ -233,8 +299,11 @@ pub fn line_counts(fd: &FileDiff) -> Option<(u32, u32)> {
         return None;
     }
     let lines = fd.hunks.iter().flat_map(|h| &h.lines);
-    let count = |k| lines.clone().filter(|l| l.kind == k).count() as u32;
-    Some((count(diff::LineKind::Add), count(diff::LineKind::Del)))
+    Some(lines.fold((0, 0), |(a, r), l| match l.kind {
+        diff::LineKind::Add => (a + 1, r),
+        diff::LineKind::Del => (a, r + 1),
+        _ => (a, r),
+    }))
 }
 
 /// One file's change since `base`'s branch point, working tree included.
@@ -402,6 +471,103 @@ mod tests {
         let got = changes_since(&root, "HEAD").unwrap();
         assert_eq!(got[0].path, "bin");
         assert_eq!(got[0].lines, None);
+    }
+
+    /// What git itself says for an untracked file, the way `changes_since` used to ask.
+    fn git_lines(wt: &Path, path: &str) -> Option<(u32, u32)> {
+        let args = [
+            "diff",
+            "--numstat",
+            "-z",
+            "--no-index",
+            "--",
+            "/dev/null",
+            path,
+        ];
+        let out = git::run_ok_codes(wt, &args, &[0, 1]).unwrap();
+        parse_numstat(&out).into_iter().next().and_then(|(_, l)| l)
+    }
+
+    #[test]
+    fn untracked_counts_match_git() {
+        let (tmp, root) = clone();
+        let outside = tmp.path().join("outside.bin");
+        std::fs::write(&outside, [0u8; 4]).unwrap();
+        let mut late_nul = "a".repeat(9000).into_bytes();
+        late_nul.extend_from_slice(b"\n\0\n");
+        type File<'a> = (&'a str, &'a [u8], Option<(u32, u32)>);
+        let files: [File; 8] = [
+            ("text.txt", b"one\ntwo\n", Some((2, 0))),
+            ("empty.txt", b"", Some((0, 0))),
+            ("no-newline.txt", b"one\ntwo", Some((2, 0))),
+            ("blank-lines.txt", b"\n\n\n", Some((3, 0))),
+            ("crlf.txt", b"a\r\nb\r\n", Some((2, 0))),
+            ("bin", b"x\0y", None),
+            ("late-nul.txt", &late_nul, Some((2, 0))),
+            ("marked.txt", b"text, but marked binary\n", None),
+        ];
+        for (name, bytes, _) in &files {
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+        write(&root, ".gitattributes", "marked.txt binary\n");
+        std::os::unix::fs::symlink("text.txt", root.join("link")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out-link")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("dangling")).unwrap();
+        let links = [("link", Some((1, 0))), ("out-link", Some((1, 0)))];
+        let links = links.into_iter().chain([("dangling", Some((1, 0)))]);
+
+        let got = changes_since(&root, "HEAD").unwrap();
+        let want = files.iter().map(|(n, _, l)| (*n, *l)).chain(links);
+        for (name, lines) in want {
+            let c = got.iter().find(|c| c.path == name).expect(name);
+            assert_eq!(c.origin, Origin::Untracked, "{name}");
+            assert_eq!(c.lines, lines, "{name}");
+            assert_eq!(c.lines, git_lines(&root, name), "{name}: same as git");
+        }
+    }
+
+    #[test]
+    fn untracked_files_are_only_read_inside_the_worktree() {
+        let (tmp, root) = clone();
+        let away = tmp.path().join("away");
+        std::fs::create_dir(&away).unwrap();
+        write(&away, "f.txt", "a\nb\nc\n");
+        // A path whose folder is a symlink out of the worktree is never read.
+        std::os::unix::fs::symlink(&away, root.join("dir")).unwrap();
+        assert_eq!(untracked_lines(&root, "dir/f.txt"), None);
+        assert_eq!(untracked_lines(&root, "missing.txt"), None);
+        std::fs::create_dir(root.join("sub")).unwrap();
+        write(&root.join("sub"), "f.txt", "a\n");
+        assert_eq!(untracked_lines(&root, "sub/f.txt"), Some((1, 0)));
+    }
+
+    #[test]
+    fn lines_count_like_git() {
+        assert_eq!(count_lines(&b""[..]), Some(0));
+        assert_eq!(count_lines(&b"a"[..]), Some(1));
+        assert_eq!(count_lines(&b"a\n\nb"[..]), Some(3));
+        assert_eq!(count_lines(&b"\0"[..]), None);
+        let mut nul_at_edge = vec![b'a'; BINARY_SNIFF - 1];
+        nul_at_edge.push(0);
+        assert_eq!(count_lines(&nul_at_edge[..]), None);
+        let mut nul_past = vec![b'a'; BINARY_SNIFF];
+        nul_past.push(0);
+        assert_eq!(count_lines(&nul_past[..]), Some(1));
+    }
+
+    /// `cargo test changes_since_timing -- --ignored --nocapture`: how long
+    /// `changes_since` takes with 300 untracked files.
+    #[test]
+    #[ignore]
+    fn changes_since_timing() {
+        let (_tmp, root) = clone();
+        for i in 0..300 {
+            write(&root, &format!("new{i}.txt"), "one\ntwo\nthree\n");
+        }
+        let start = std::time::Instant::now();
+        let got = changes_since(&root, "HEAD").unwrap();
+        eprintln!("changes_since, 300 untracked files: {:?}", start.elapsed());
+        assert_eq!(got.len(), 300);
     }
 
     #[test]

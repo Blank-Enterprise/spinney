@@ -26,8 +26,12 @@ bash scripts/check.sh          # everything CI runs
 ```
 
 `scripts/check.sh` runs what CI runs: `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, `cargo test`, `scripts/leak-check.sh`, and `cargo audit` if `cargo-audit` is installed
-(`cargo install cargo-audit --locked`). Run it before opening a PR.
+warnings`, `cargo test`, `scripts/leak-check.sh`, and, if they're installed, a build on the declared
+`rust-version`, `cargo deny check` (dependency advisories, licences and sources; see
+`deny.toml`), `zizmor` and `actionlint` (workflow lint): `rustup toolchain install 1.95` and
+`brew install cargo-deny zizmor actionlint`. Run it before opening a PR. CI also bundles the app
+and installs it with `install.sh`; to try that locally, run `scripts/bundle.sh` and
+`scripts/smoke-install.sh` in a worktree.
 
 - **Tests** create temporary git repos and need a global git identity
   (`git config --global user.name` and `user.email`).
@@ -53,6 +57,14 @@ for human and AI contributors alike. Read it before your first code change.
 
 CI must pass before a PR merges. A first-time contributor's CI run waits for a maintainer to
 approve it.
+
+## Releases
+
+Maintainers release by bumping `version` in `Cargo.toml`, merging to `main`, and pushing a
+`vX.Y.Z` tag on `main`. Before that, a beta or release candidate of the version in `Cargo.toml`
+needs no bump: run the **prerelease** workflow from the Actions tab (pick `beta` or `rc`), or
+`bash scripts/tag-prerelease.sh beta` locally. Either tags `main` as the next `vX.Y.Z-beta.N` or
+`vX.Y.Z-rc.N`, and the release workflow publishes it as a pre-release.
 
 ## Labels
 

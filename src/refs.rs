@@ -43,24 +43,29 @@ pub fn branches(dir: &Path) -> Result<Vec<Branch>> {
         .filter_map(|line| {
             let mut f = line.split('\0');
             let (refname, upstream, track, head) = (f.next()?, f.next()?, f.next()?, f.next()?);
-            let (name, remote) = match refname.strip_prefix("refs/heads/") {
-                Some(n) => (n, false),
-                None => (refname.strip_prefix("refs/remotes/")?, true),
-            };
-            if remote && name.ends_with("/HEAD") {
-                return None;
-            }
-            let (ahead, behind) = parse_track(track);
-            Some(Branch {
-                name: name.to_string(),
-                remote,
-                upstream: (!upstream.is_empty()).then(|| upstream.to_string()),
-                ahead,
-                behind,
-                head: head == "*",
-            })
+            branch(refname, upstream, track, head)
         })
         .collect())
+}
+
+/// A local or remote branch from `for-each-ref` fields; `None` for other refs and `<remote>/HEAD`.
+fn branch(refname: &str, upstream: &str, track: &str, head: &str) -> Option<Branch> {
+    let (name, remote) = match refname.strip_prefix("refs/heads/") {
+        Some(n) => (n, false),
+        None => (refname.strip_prefix("refs/remotes/")?, true),
+    };
+    if remote && name.ends_with("/HEAD") {
+        return None;
+    }
+    let (ahead, behind) = parse_track(track);
+    Some(Branch {
+        name: name.to_string(),
+        remote,
+        upstream: (!upstream.is_empty()).then(|| upstream.to_string()),
+        ahead,
+        behind,
+        head: head == "*",
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,17 +81,21 @@ fn parse_tags(out: &str) -> Vec<Tag> {
     out.lines()
         .filter_map(|line| {
             let mut f = line.split('\0');
-            let (refname, object, peeled, kind) = (f.next()?, f.next()?, f.next()?, f.next()?);
-            // Not `refname:short`: it turns into `tags/x` when a branch is also called x.
-            let name = refname.strip_prefix("refs/tags/")?;
-            let target = if peeled.is_empty() { object } else { peeled };
-            Some(Tag {
-                name: name.to_string(),
-                target: target.to_string(),
-                annotated: kind == "tag",
-            })
+            tag(f.next()?, f.next()?, f.next()?, f.next()?)
         })
         .collect()
+}
+
+/// A tag from `for-each-ref` fields; `None` for any other ref.
+fn tag(refname: &str, object: &str, peeled: &str, kind: &str) -> Option<Tag> {
+    // Not `refname:short`: it turns into `tags/x` when a branch is also called x.
+    let name = refname.strip_prefix("refs/tags/")?;
+    let target = if peeled.is_empty() { object } else { peeled };
+    Some(Tag {
+        name: name.to_string(),
+        target: target.to_string(),
+        annotated: kind == "tag",
+    })
 }
 
 /// Tags, newest first: by tagger date, or the commit date for a lightweight tag.
@@ -115,8 +124,8 @@ pub fn current_branch(worktree: &Path) -> Result<Option<String>> {
 }
 
 /// Every branch and tag tip, which branch the worktree has checked out (`*`) and the commit
-/// HEAD is at: what a commit, checkout, reset or fetch made outside Spinney changes. Two
-/// cheap git calls, so it can be compared on every focus.
+/// HEAD is at: what a commit, checkout, reset or fetch made outside Spinney changes. One
+/// cheap git call on a branch, so it can be compared on every focus.
 pub fn stamp(worktree: &Path) -> Result<String> {
     let tips = git::run(
         worktree,
@@ -128,8 +137,97 @@ pub fn stamp(worktree: &Path) -> Result<String> {
             "refs/tags",
         ],
     )?;
-    let head = git::run_ok_codes(worktree, &["rev-parse", "--verify", "-q", "HEAD"], &[0, 1])?;
-    Ok(format!("HEAD {}\n{tips}", head.trim()))
+    // The checked-out branch's tip is HEAD.
+    let on_branch = tips
+        .lines()
+        .find_map(|l| l.strip_prefix('*')?.rsplit_once(' '))
+        .map(|(_, sha)| sha.to_string());
+    let head = match on_branch {
+        Some(sha) => Some(sha),
+        None => off_branch_head(worktree)?.1,
+    };
+    Ok(stamp_text(head.as_deref(), &tips))
+}
+
+/// `stamp` from HEAD's commit and `for-each-ref` lines of `%(HEAD)%(refname) %(objectname)`.
+fn stamp_text(head: Option<&str>, tips: &str) -> String {
+    format!("HEAD {}\n{tips}", head.unwrap_or(""))
+}
+
+/// Where HEAD is when `for-each-ref` marks no branch as checked out: (branch, commit). An
+/// unborn branch has a name but no commit, a detached HEAD a commit but no branch.
+fn off_branch_head(worktree: &Path) -> Result<(Option<String>, Option<String>)> {
+    if let Some(branch) = current_branch(worktree)? {
+        return Ok((Some(branch), None));
+    }
+    let out = git::run_ok_codes(worktree, &["rev-parse", "--verify", "-q", "HEAD"], &[0, 1])?;
+    let sha = out.trim();
+    Ok((None, (!sha.is_empty()).then(|| sha.to_string())))
+}
+
+/// What a tab shows of a worktree's refs, read together.
+#[derive(Debug, PartialEq)]
+pub struct Snapshot {
+    pub branches: Vec<Branch>,
+    /// Newest first, as `tags` returns them.
+    pub tags: Vec<Tag>,
+    /// As `stamp` returns it.
+    pub stamp: String,
+    /// The commit HEAD is at; `None` on an unborn branch.
+    pub head: Option<String>,
+    /// The checked-out branch; `None` when HEAD is detached.
+    pub current: Option<String>,
+}
+
+/// `branches`, `tags`, `stamp`, HEAD and the current branch from one `for-each-ref` (and one
+/// or two more calls only when no branch is checked out), instead of six calls. Runs on
+/// every refresh: after each commit, checkout, fetch and stash.
+pub fn snapshot(worktree: &Path) -> Result<Snapshot> {
+    let out = git::run(
+        worktree,
+        &[
+            "for-each-ref",
+            "--format=%(HEAD)%00%(refname)%00%(objectname)%00%(*objectname)%00%(objecttype)\
+             %00%(upstream:short)%00%(upstream:track,nobracket)%00%(creatordate:unix)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    )?;
+    let rows: Vec<Vec<&str>> = out
+        .lines()
+        .map(|l| l.split('\0').collect::<Vec<_>>())
+        .filter(|f| f.len() == 8)
+        .collect();
+    let checked_out = rows.iter().find(|f| f[0] == "*");
+    let (current, head) = match checked_out {
+        Some(f) => (
+            f[1].strip_prefix("refs/heads/").map(str::to_string),
+            Some(f[2].to_string()),
+        ),
+        None => off_branch_head(worktree)?,
+    };
+    let tips: String = rows
+        .iter()
+        .map(|f| format!("{}{} {}\n", f[0], f[1], f[2]))
+        .collect();
+    let branches = rows
+        .iter()
+        .filter_map(|f| branch(f[1], f[5], f[6], f[0]))
+        .collect();
+    let mut tags: Vec<(i64, Tag)> = rows
+        .iter()
+        .filter_map(|f| Some((f[7].parse().unwrap_or(0), tag(f[1], f[2], f[3], f[4])?)))
+        .collect();
+    // Stable, so equal dates keep refname order, as `--sort=-creatordate` does.
+    tags.sort_by_key(|(date, _)| std::cmp::Reverse(*date));
+    Ok(Snapshot {
+        branches,
+        tags: tags.into_iter().map(|(_, t)| t).collect(),
+        stamp: stamp_text(head.as_deref(), &tips),
+        head,
+        current,
+    })
 }
 
 #[cfg(test)]
@@ -166,6 +264,79 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         let root = clone_into(&url, &parent, "proj", &space()).unwrap();
         (tmp, root)
+    }
+
+    /// Each of `snapshot`'s fields is what the separate calls return.
+    fn assert_snapshot_matches(dir: &Path) {
+        let s = snapshot(dir).unwrap();
+        assert_eq!(s.branches, branches(dir).unwrap());
+        assert_eq!(s.tags, tags(dir).unwrap());
+        assert_eq!(s.stamp, stamp(dir).unwrap());
+        assert_eq!(s.current, current_branch(dir).unwrap());
+        let head = git::run_ok_codes(dir, &["rev-parse", "--verify", "-q", "HEAD"], &[0, 1]);
+        let head = head.unwrap().trim().to_string();
+        assert_eq!(s.head, (!head.is_empty()).then_some(head.clone()));
+        // The stamp as it was built before: tips plus `rev-parse HEAD`.
+        let tips = git::run(
+            dir,
+            &[
+                "for-each-ref",
+                "--format=%(HEAD)%(refname) %(objectname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.stamp, format!("HEAD {head}\n{tips}"));
+    }
+
+    #[test]
+    fn snapshot_matches_the_separate_calls() {
+        let (_tmp, root) = cloned();
+        let g = |args: &[&str]| git::run(&root, args).unwrap();
+        // Tags with distinct dates, and two on one commit (equal dates).
+        let dated = |date: &str, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&root)
+                .env("GIT_COMMITTER_DATE", date)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        dated(
+            "2026-01-01T00:00:00Z",
+            &["commit", "--allow-empty", "-q", "-m", "a"],
+        );
+        dated(
+            "2026-01-02T00:00:00Z",
+            &["tag", "-a", "-m", "annotated", "v2"],
+        );
+        g(&["tag", "v1"]);
+        g(&["tag", "also-v1"]);
+        dated(
+            "2026-01-03T00:00:00Z",
+            &["commit", "--allow-empty", "-q", "-m", "b"],
+        );
+        g(&["tag", "v3"]);
+        g(&["branch", "feature/x", "HEAD~1"]);
+        g(&["branch", "--set-upstream-to=origin/main", "feature/x"]);
+        assert_snapshot_matches(&root);
+        assert_eq!(snapshot(&root).unwrap().current.as_deref(), Some("main"));
+
+        g(&["checkout", "-q", "--detach", "HEAD~1"]);
+        assert_snapshot_matches(&root);
+        assert_eq!(snapshot(&root).unwrap().current, None);
+
+        g(&["checkout", "-q", "--orphan", "unborn"]);
+        assert_snapshot_matches(&root);
+        let s = snapshot(&root).unwrap();
+        assert_eq!((s.current.as_deref(), s.head), (Some("unborn"), None));
     }
 
     #[test]
