@@ -26,9 +26,12 @@ bash scripts/check.sh          # everything CI runs
 ```
 
 `scripts/check.sh` runs what CI runs: `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, `cargo test`, `scripts/leak-check.sh`, and, if they're installed, `cargo deny check`
-(dependency advisories, licences and sources; see `deny.toml`) and `zizmor` (workflow lint):
-`brew install cargo-deny zizmor`. Run it before opening a PR.
+warnings`, `cargo test`, `scripts/leak-check.sh`, and, if they're installed, a build on the declared
+`rust-version`, `cargo deny check` (dependency advisories, licences and sources; see
+`deny.toml`), `zizmor` and `actionlint` (workflow lint): `rustup toolchain install 1.95` and
+`brew install cargo-deny zizmor actionlint`. Run it before opening a PR. CI also bundles the app
+and installs it with `install.sh`; to try that locally, run `scripts/bundle.sh` and
+`scripts/smoke-install.sh` in a worktree.
 
 - **Tests** create temporary git repos and need a global git identity
   (`git config --global user.name` and `user.email`).
