@@ -95,6 +95,11 @@ fn helper_value(space: &Space) -> Result<String> {
 /// `git_dir` is a bare repo or a `.git` directory.
 pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
     let helper = helper_value(space)?;
+    // Every tab open lands here: one read instead of 6-8 writes when nothing changed.
+    let listed = git::run(git_dir, &["config", "--local", "--list", "-z"]);
+    if listed.is_ok_and(|l| already_configured(&l, space, &helper)) {
+        return Ok(());
+    }
     // A blank identity would make every commit fail ("empty ident name"); leave it unset.
     for (key, value) in [
         ("user.name", &space.author_name),
@@ -125,6 +130,57 @@ pub fn configure_repo(git_dir: &Path, space: &Space) -> Result<()> {
         &["config", "--local", "push.autoSetupRemote", "true"],
     )?;
     configure_ssh(git_dir, space)
+}
+
+/// Whether `git config --local --list -z` output already holds everything `configure_repo`
+/// would write for `space`.
+fn already_configured(listed: &str, space: &Space, helper: &str) -> bool {
+    // `--list` lowercases section and variable names but keeps a subsection's case.
+    let norm = |key: &str| match (key.split_once('.'), key.rsplit_once('.')) {
+        (Some((section, _)), Some((rest, var))) if rest.len() > section.len() => format!(
+            "{}{}.{}",
+            section.to_lowercase(),
+            &rest[section.len()..],
+            var.to_lowercase()
+        ),
+        _ => key.to_lowercase(),
+    };
+    let entries: Vec<(String, &str)> = listed
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        .map(|e| match e.split_once('\n') {
+            Some((k, v)) => (norm(k), v),
+            None => (norm(e), ""),
+        })
+        .collect();
+    let values = |key: &str| -> Vec<&str> {
+        let key = norm(key);
+        entries
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+            .collect()
+    };
+    let identity = [
+        ("user.name", &space.author_name),
+        ("user.email", &space.author_email),
+    ]
+    .iter()
+    .all(|(k, v)| v.trim().is_empty() || values(k) == [v.as_str()]);
+    let (url_key, https) = ssh::insteadof(&space.host);
+    let ssh = match &space.ssh_key {
+        Some(key) => {
+            values("core.sshCommand") == [ssh::ssh_command(key).as_str()]
+                && values(&url_key) == [https.as_str()]
+        }
+        None => !values("core.sshCommand")
+            .last()
+            .is_some_and(|c| ssh::is_ours(c.trim())),
+    };
+    identity
+        && values("credential.helper") == ["", helper]
+        && values("push.autoSetupRemote") == ["true"]
+        && ssh
 }
 
 /// With an SSH key: `https://host/` remotes go over SSH with only that key. Without: remove
@@ -279,6 +335,56 @@ mod tests {
                 "{key} set"
             );
         }
+    }
+
+    #[test]
+    fn already_configured_only_when_nothing_would_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git::run(dir, &["init", "-q", "--bare"]).unwrap();
+        let check = |space: &Space| {
+            let listed = git::run(dir, &["config", "--local", "--list", "-z"]).unwrap();
+            already_configured(&listed, space, &helper_value(space).unwrap())
+        };
+        let ssh_space = Space {
+            ssh_key: Some("/k/it's here/id".into()),
+            ..space()
+        };
+        assert!(!check(&space()), "a fresh repo");
+        configure_repo(dir, &space()).unwrap();
+        assert!(check(&space()));
+
+        let renamed = Space {
+            author_name: "Someone Else".into(),
+            ..space()
+        };
+        assert!(!check(&renamed), "the space's author changed");
+        assert!(!check(&ssh_space), "the space gained an SSH key");
+        configure_repo(dir, &ssh_space).unwrap();
+        assert!(check(&ssh_space));
+        assert!(!check(&space()), "our sshCommand must be removed");
+
+        configure_repo(dir, &space()).unwrap();
+        git::run(
+            dir,
+            &[
+                "config",
+                "--local",
+                "--add",
+                "credential.helper",
+                "osxkeychain",
+            ],
+        )
+        .unwrap();
+        assert!(!check(&space()), "a helper added outside Spinney");
+        configure_repo(dir, &space()).unwrap();
+        assert!(check(&space()));
+        git::run(
+            dir,
+            &["config", "--local", "core.sshCommand", "ssh -i ~/.ssh/mine"],
+        )
+        .unwrap();
+        assert!(check(&space()), "a hand-written sshCommand is left alone");
     }
 
     #[test]
