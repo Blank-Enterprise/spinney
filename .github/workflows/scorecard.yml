@@ -2,7 +2,7 @@ name: scorecard
 
 # OpenSSF Scorecard: branch protection, pinned actions, token permissions and the like.
 # It runs on the default branch only. To publish results, the job must keep to the action's
-# rules: no env or defaults, an Ubuntu runner, and only its approved actions.
+# rules: no env or defaults, Ubuntu (ubuntu-latest), and only its approved actions.
 on:
   push:
     branches: [main]
