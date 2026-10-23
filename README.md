@@ -60,11 +60,6 @@ The app isn't notarized yet ([#18](https://github.com/Blank-Enterprise/spinney/i
 install script is the supported way in. If you download the zip from the releases page in a
 browser, Gatekeeper refuses to open it until you allow it in System Settings → Privacy & Security.
 
-While the repo is private, the curl command can't reach it. Use the GitHub CLI
-(`gh auth login`) instead:
-
-    gh api repos/Blank-Enterprise/spinney/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
-
 ## Build from source
 
 Requires Rust 1.95 or newer.
