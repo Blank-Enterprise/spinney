@@ -8,9 +8,14 @@ on:
       tag:
         description: Existing tag to build and release (e.g. v1.0.0)
         required: true
+  # From prerelease.yml, which creates the tag: a tag pushed with its token starts no workflow.
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -20,6 +25,10 @@ jobs:
   release:
     runs-on: macos-15
     timeout-minutes: 45
+    permissions:
+      contents: write # create the release and upload its files
+      id-token: write # sign the build provenance
+      attestations: write # store the build provenance
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       ASSET: Spinney-macos-arm64.zip
@@ -28,32 +37,31 @@ jobs:
       - name: Refuse anything that isn't a version tag
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "not a version tag: $TAG"; exit 1; }
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.TAG }}
           fetch-depth: 0
+          # Publishing uses GH_TOKEN, and the repo is public, so git itself needs no token.
+          persist-credentials: false
       - name: Tag is on main
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main || { echo "$TAG is not on main"; exit 1; }
+      # v1.1.0 must be the Cargo.toml version; v1.1.0-beta.N and -rc.N are for it, before it's out.
       - name: Tag matches the Cargo.toml version
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          [ "$version" = "${TAG#v}" ] || { echo "Cargo.toml is $version but the tag is $TAG"; exit 1; }
+        run: bash scripts/release-tag.sh check "$TAG"
       # Before the fixture identity is set, or the script flags that email in this file.
       - run: bash scripts/leak-check.sh
       - run: rustup update stable && rustup component add clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache here: a release builds from scratch, so no cached artifact can end up in what we publish.
       - name: Builds on the declared rust-version
-        run: |
-          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
-          rustup toolchain install "$msrv" --profile minimal
-          cargo +"$msrv" check --locked --all-targets
-      - uses: taiki-e/install-action@v2
+        run: bash scripts/msrv-check.sh --install
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: cargo-audit
-      - name: No known vulnerabilities in dependencies
-        run: cargo audit
+          tool: cargo-deny
+      # Advisories (vulnerable or yanked crates), licences and sources; see deny.toml.
+      - name: Dependencies pass cargo-deny
+        run: cargo deny --locked check
       - name: Git identity for test fixtures
         run: |
           git config --global user.name "CI"
@@ -63,15 +71,14 @@ jobs:
       - run: cargo test --locked
       - run: bash scripts/bundle.sh "${TAG#v}"
       - name: Installer installs the bundle
-        run: |
-          plutil -lint dist/Spinney.app/Contents/Info.plist
-          apps="$RUNNER_TEMP/apps" && mkdir -p "$apps"
-          out=$(SPINNEY_ZIP="dist/$ASSET" SPINNEY_APP_DIR="$apps" bash install.sh </dev/null)
-          echo "$out"
-          [ "$out" = "Installed Spinney ${TAG#v} to $apps/Spinney.app" ] || { echo "unexpected install result"; exit 1; }
-          lipo -archs "$apps/Spinney.app/Contents/MacOS/spinney" | grep -qw arm64
+        run: bash scripts/smoke-install.sh "${TAG#v}"
       - name: Checksum
         run: cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256" && cat "$ASSET.sha256"
+      # Lets anyone check the zip was built here: gh attestation verify <zip> --repo <this repo>.
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ASSET }}
       # A prerelease (v1.2.0-rc.1) is never "latest", which install.sh downloads.
       - name: Publish release
         run: |

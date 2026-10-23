@@ -13,10 +13,28 @@ step "cargo clippy (-D warnings)"
 cargo clippy --locked --all-targets -- -D warnings
 step "cargo test"
 cargo test --locked
-if command -v cargo-audit >/dev/null 2>&1; then
-  step "cargo audit"
-  cargo audit
+step "release tag rules"
+bash scripts/test-release-tag.sh >/dev/null
+step "build on the declared rust-version"
+bash scripts/msrv-check.sh --if-installed
+if command -v cargo-deny >/dev/null 2>&1; then
+  step "cargo deny check"
+  cargo deny --locked check
 else
-  step "cargo audit skipped (install with: cargo install cargo-audit --locked)"
+  step "cargo deny skipped (install with: brew install cargo-deny)"
 fi
+if command -v zizmor >/dev/null 2>&1; then
+  step "zizmor (workflow lint)"
+  zizmor --offline .github/workflows
+else
+  step "zizmor skipped (install with: brew install zizmor)"
+fi
+if command -v actionlint >/dev/null 2>&1; then
+  step "actionlint"
+  actionlint
+else
+  step "actionlint skipped (install with: brew install actionlint)"
+fi
+# Not run here: bundle.sh rebuilds target/release, which may be your credential helper (AGENTS.md).
+step "bundle smoke test skipped (CI's bundle job runs it; locally, in a worktree: bash scripts/bundle.sh 0.0.0 && bash scripts/smoke-install.sh 0.0.0)"
 printf '\nAll checks passed.\n'
