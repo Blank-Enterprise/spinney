@@ -56,6 +56,9 @@ SHA-256 checksum. To install a specific release, set `SPINNEY_VERSION`:
 
     curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | SPINNEY_VERSION=v1.0.0 bash
 
+To try the newest beta or release candidate, set `SPINNEY_VERSION=beta`. It installs the newest
+release, so once a stable release is out, it installs that.
+
 Each release zip also has a build provenance attestation. To check that a zip you downloaded was
 built by this repository's release workflow:
 

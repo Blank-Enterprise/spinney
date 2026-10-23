@@ -1,0 +1,58 @@
+name: prerelease
+
+# Run from Actions: tags main as the next beta or release candidate of the Cargo.toml version
+# (v1.1.0-beta.1, then -beta.2…) and builds and publishes it as a pre-release.
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Pre-release kind
+        type: choice
+        options: [beta, rc]
+        default: beta
+
+permissions: {}
+
+concurrency:
+  group: prerelease
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    # Only from main, so this file is main's.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the tag
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag main as the next pre-release
+        id: tag
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(bash scripts/release-tag.sh next "$CHANNEL")
+          sha=$(git rev-parse HEAD)
+          # Through the API, so git holds no token. A lightweight tag; the release names it.
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
+          echo "Tagged $sha as $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    # The ./ form: actionlint does not know the newer $/ form yet.
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
+    with:
+      tag: ${{ needs.tag.outputs.tag }}

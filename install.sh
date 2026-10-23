@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
-# Install the latest Spinney release (or SPINNEY_VERSION, e.g. v1.0.0) into /Applications.
+# Install the latest Spinney release into /Applications. SPINNEY_VERSION picks another: a tag
+# such as v1.0.0 or v1.1.0-beta.1, or "beta" for the newest release, pre-releases included.
 #   curl -fsSL https://raw.githubusercontent.com/Blank-Enterprise/spinney/main/install.sh | bash
 set -euo pipefail
+
+# The newest release's tag, pre-releases included; GitHub lists releases newest first.
+newest_release() {
+  if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+    gh api "repos/$1/releases?per_page=1" -q '.[0].tag_name' </dev/null
+  else
+    curl -fsSL "https://api.github.com/repos/$1/releases?per_page=1" \
+      | sed -nE 's/^ *"tag_name": *"([^"]+)".*/\1/p' | head -1
+  fi
+}
 
 main() {
   local REPO="${SPINNEY_REPO:-Blank-Enterprise/spinney}"
@@ -14,8 +25,12 @@ main() {
     echo "Spinney supports macOS on Apple Silicon only." >&2
     return 1
   fi
+  if [ "$VERSION" = beta ]; then
+    VERSION="$(newest_release "$REPO")" || true
+    [ -n "$VERSION" ] || { echo "Could not find the newest release of $REPO." >&2; return 1; }
+  fi
   if [ -n "$VERSION" ] && [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
-    echo "SPINNEY_VERSION must be a release tag like v1.0.0." >&2
+    echo 'SPINNEY_VERSION must be a release tag like v1.0.0, or "beta".' >&2
     return 1
   fi
   if [ -n "$VERSION" ]; then
@@ -67,7 +82,9 @@ main() {
   mv "$dest.new" "$dest"
   xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
 
-  version="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$dest/Contents/Info.plist")"
+  # SpinneyVersion has a pre-release's full version (1.1.0-beta.1); older bundles lack it.
+  version="$(/usr/libexec/PlistBuddy -c 'Print SpinneyVersion' "$dest/Contents/Info.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$dest/Contents/Info.plist")"
   echo "Installed Spinney $version to $dest"
 }
 

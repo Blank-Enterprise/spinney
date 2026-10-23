@@ -8,6 +8,12 @@ on:
       tag:
         description: Existing tag to build and release (e.g. v1.0.0)
         required: true
+  # From prerelease.yml, which creates the tag: a tag pushed with its token starts no workflow.
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
 
 permissions: {}
 
@@ -41,10 +47,9 @@ jobs:
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main || { echo "$TAG is not on main"; exit 1; }
+      # v1.1.0 must be the Cargo.toml version; v1.1.0-beta.N and -rc.N are for it, before it's out.
       - name: Tag matches the Cargo.toml version
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          [ "$version" = "${TAG#v}" ] || { echo "Cargo.toml is $version but the tag is $TAG"; exit 1; }
+        run: bash scripts/release-tag.sh check "$TAG"
       # Before the fixture identity is set, or the script flags that email in this file.
       - run: bash scripts/leak-check.sh
       - run: rustup update stable && rustup component add clippy rustfmt

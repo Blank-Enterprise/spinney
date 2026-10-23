@@ -58,6 +58,14 @@ for human and AI contributors alike. Read it before your first code change.
 CI must pass before a PR merges. A first-time contributor's CI run waits for a maintainer to
 approve it.
 
+## Releases
+
+Maintainers release by bumping `version` in `Cargo.toml`, merging to `main`, and pushing a
+`vX.Y.Z` tag on `main`. Before that, a beta or release candidate of the version in `Cargo.toml`
+needs no bump: run the **prerelease** workflow from the Actions tab (pick `beta` or `rc`), or
+`bash scripts/tag-prerelease.sh beta` locally. Either tags `main` as the next `vX.Y.Z-beta.N` or
+`vX.Y.Z-rc.N`, and the release workflow publishes it as a pre-release.
+
 ## Labels
 
 | Kind | Labels |
