@@ -291,12 +291,11 @@ fn file_list(
     merge_tool: MergeTool,
     actions: &mut Vec<Action>,
 ) {
-    let (title, button) = match list {
-        List::Conflicted => ("Conflicted", "Mark resolved"),
-        List::Unstaged => ("Unstaged", "Stage"),
-        List::Staged => ("Staged", "Unstage"),
+    let title = match list {
+        List::Conflicted => "Conflicted",
+        List::Unstaged => "Unstaged",
+        List::Staged => "Staged",
     };
-    let staged = list == List::Staged;
     ui.horizontal(|ui| {
         ui.label(theme::section(&format!("{title} · {}", files.len())));
         let all = match list {
@@ -333,70 +332,96 @@ fn file_list(
             });
         }
     });
+    let mut rows = super::offscreen::Rows::new(ui.ctx());
     for f in files {
-        // `horizontal` bounds the row height; a bare centred right-to-left layout fills it all.
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                let b = egui::Button::new(RichText::new(button).size(11.5)).small();
-                if ui.add(b).clicked() {
-                    actions.push(match list {
-                        List::Conflicted => Action::MarkResolved(f.path.clone()),
-                        _ => Action::StageFile(f.clone(), staged),
-                    });
-                }
-                let is_open = open.as_ref() == Some(&(f.path.clone(), list));
-                let (letter, color) = badge(&f.change);
-                let row = egui::Button::selectable(
-                    is_open,
-                    (
-                        RichText::new(format!(" {letter} "))
-                            .size(10.5)
-                            .strong()
-                            .color(color)
-                            .background_color(color.gamma_multiply(0.2)),
-                        RichText::new(&f.path).size(12.5),
-                    ),
-                )
-                .right_text("") // grows, keeping the content left-aligned
-                .truncate()
-                .min_size(egui::vec2(ui.available_width(), 0.0));
-                let r = ui.add(row);
-                let r = match &f.change {
-                    Change::Renamed { from } => r.on_hover_text(format!("renamed from {from}")),
-                    Change::Conflicted(c) => match conflict_hint(op, *c) {
-                        Some(hint) => r.on_hover_text(hint),
-                        None => r,
-                    },
-                    c => match c.type_label() {
-                        Some(t) => r.on_hover_text(t),
-                        None => r,
-                    },
-                };
-                if r.clicked() {
-                    actions.push(match list {
-                        List::Conflicted => Action::OpenConflict(f.path.clone()),
-                        _ => Action::OpenDiff(f.clone(), staged),
-                    });
-                }
-                if list == List::Conflicted {
-                    r.context_menu(|ui| conflict_menu(ui, f, merge_tool, actions));
-                }
-                if list == List::Unstaged {
-                    r.context_menu(|ui| {
-                        let why = discard_blocked(status, f);
-                        let r = ui
-                            .add_enabled(why.is_none(), egui::Button::new("Discard changes…"))
-                            .on_disabled_hover_text(why.unwrap_or_default());
-                        if r.clicked() {
-                            actions.push(Action::AskDiscard(Discard::File(f.clone())));
-                            ui.close();
-                        }
-                    });
-                }
-            })
+        rows.row(ui, |ui| {
+            file_row(ui, list, f, status, op, open, merge_tool, actions)
         });
     }
     ui.add_space(8.0);
+}
+
+/// One file: its badge and path, with the list's button on the right.
+#[allow(clippy::too_many_arguments)]
+fn file_row(
+    ui: &mut egui::Ui,
+    list: List,
+    f: &FileStatus,
+    status: &Status,
+    op: Option<Operation>,
+    open: &Option<(String, List)>,
+    merge_tool: MergeTool,
+    actions: &mut Vec<Action>,
+) {
+    let button = match list {
+        List::Conflicted => "Mark resolved",
+        List::Unstaged => "Stage",
+        List::Staged => "Unstage",
+    };
+    let staged = list == List::Staged;
+    // `horizontal` bounds the row height; a bare centred right-to-left layout fills it all.
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            let b = egui::Button::new(RichText::new(button).size(11.5)).small();
+            if ui.add(b).clicked() {
+                actions.push(match list {
+                    List::Conflicted => Action::MarkResolved(f.path.clone()),
+                    _ => Action::StageFile(f.clone(), staged),
+                });
+            }
+            let is_open = open
+                .as_ref()
+                .is_some_and(|(p, l)| *p == f.path && *l == list);
+            let (letter, color) = badge(&f.change);
+            let row = egui::Button::selectable(
+                is_open,
+                (
+                    RichText::new(format!(" {letter} "))
+                        .size(10.5)
+                        .strong()
+                        .color(color)
+                        .background_color(color.gamma_multiply(0.2)),
+                    RichText::new(&f.path).size(12.5),
+                ),
+            )
+            .right_text("") // grows, keeping the content left-aligned
+            .truncate()
+            .min_size(egui::vec2(ui.available_width(), 0.0));
+            let r = ui.add(row);
+            let r = match &f.change {
+                Change::Renamed { from } => r.on_hover_text(format!("renamed from {from}")),
+                Change::Conflicted(c) => match conflict_hint(op, *c) {
+                    Some(hint) => r.on_hover_text(hint),
+                    None => r,
+                },
+                c => match c.type_label() {
+                    Some(t) => r.on_hover_text(t),
+                    None => r,
+                },
+            };
+            if r.clicked() {
+                actions.push(match list {
+                    List::Conflicted => Action::OpenConflict(f.path.clone()),
+                    _ => Action::OpenDiff(f.clone(), staged),
+                });
+            }
+            if list == List::Conflicted {
+                r.context_menu(|ui| conflict_menu(ui, f, merge_tool, actions));
+            }
+            if list == List::Unstaged {
+                r.context_menu(|ui| {
+                    let why = discard_blocked(status, f);
+                    let r = ui
+                        .add_enabled(why.is_none(), egui::Button::new("Discard changes…"))
+                        .on_disabled_hover_text(why.unwrap_or_default());
+                    if r.clicked() {
+                        actions.push(Action::AskDiscard(Discard::File(f.clone())));
+                        ui.close();
+                    }
+                });
+            }
+        })
+    });
 }
 
 /// A conflicted file's menu: Open, Use mine…, Use theirs…, Mark resolved, and Open in

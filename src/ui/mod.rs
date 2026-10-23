@@ -7,6 +7,7 @@ mod graph_view;
 mod in_progress;
 mod merge_view;
 mod new_tab;
+mod offscreen;
 mod paths;
 mod sidebar;
 mod spaces;
