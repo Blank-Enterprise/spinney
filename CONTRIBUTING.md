@@ -52,6 +52,11 @@ for human and AI contributors alike. Read it before your first code change.
 - **Safety:** anything that can lose work (discard, delete, reset, force push, stash drop) must ask
   for confirmation and name what is lost. Force pushes use `--force-with-lease`, never `--force`.
 - **Testing section:** say what you checked, and plainly what you didn't check in the running app.
+- **Changelog:** if users will notice the change, add a line under **Unreleased** in
+  [CHANGELOG.md](CHANGELOG.md), under Added, Changed, Fixed, Removed or Security, and link the
+  issue. Write it for users: what they can now do or no longer hit, not how the code changed. A
+  change nobody will notice (tests, CI, refactors) gets the `skip changelog` label instead. The
+  `changelog` check reminds you.
 - **Email:** commits are public. Use your GitHub `noreply` address if you don't want your email
   published (`git config user.email <id>+<login>@users.noreply.github.com`).
 
@@ -66,6 +71,11 @@ needs no bump: run the **prerelease** workflow from the Actions tab (pick `beta`
 `bash scripts/tag-prerelease.sh beta` locally. Either tags `main` as the next `vX.Y.Z-beta.N` or
 `vX.Y.Z-rc.N`, and the release workflow publishes it as a pre-release.
 
+Release notes come from [CHANGELOG.md](CHANGELOG.md), followed by GitHub's list of merged PRs. A
+beta or release candidate uses the **Unreleased** section as it stands. For a stable release, the
+version-bump PR also runs `bash scripts/changelog.sh release X.Y.Z`, which moves Unreleased into a
+dated `X.Y.Z` section; the release workflow refuses a stable tag without one.
+
 ## Labels
 
 | Kind | Labels |
@@ -74,6 +84,7 @@ needs no bump: run the **prerelease** workflow from the Actions tab (pick `beta`
 | Priority | `priority: critical`, `high`, `medium`, `low` |
 | Size | `size: XS` (under an hour) to `size: XL` (about a week) |
 | State | `needs decision`, `blocked`, `needs QA` |
+| PRs | `skip changelog`: no CHANGELOG.md entry, since users won't notice the change |
 
 ## License
 

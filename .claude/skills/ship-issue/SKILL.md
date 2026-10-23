@@ -32,6 +32,7 @@ bash scripts/check.sh
 Everything must pass. To try UI changes, use a debug build (`cargo run`) and not `target/release` (see Pitfalls in AGENTS.md). If you couldn't look at it on screen, say so in the PR.
 
 ## 5. Commit and PR
+- **Changelog:** if users will notice the change, add a line under **Unreleased** in `CHANGELOG.md` (Added, Changed, Fixed, Removed or Security), written for users and linking the issue. Otherwise the PR gets the `skip changelog` label.
 - **Commit:** a conventional message (`feat(scope): …`) with a body saying why, and `Resolves #<n>` when it closes the issue.
 - **Push:** `git push -u origin <branch>`.
 - **Open the PR:** `gh pr create --milestone "<the issue's milestone>"`, with the body following `.github/pull_request_template.md`.

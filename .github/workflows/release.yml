@@ -50,6 +50,10 @@ jobs:
       # v1.1.0 must be the Cargo.toml version; v1.1.0-beta.N and -rc.N are for it, before it's out.
       - name: Tag matches the Cargo.toml version
         run: bash scripts/release-tag.sh check "$TAG"
+      # A stable release's own CHANGELOG.md section, or Unreleased for a beta or rc. A stable tag
+      # without a section fails here, before anything is built.
+      - name: Release notes from CHANGELOG.md
+        run: bash scripts/changelog.sh notes "$TAG" > "$RUNNER_TEMP/notes.md"
       # Before the fixture identity is set, or the script flags that email in this file.
       - run: bash scripts/leak-check.sh
       - run: rustup update stable && rustup component add clippy rustfmt
@@ -88,7 +92,9 @@ jobs:
           else
             pre=()
             [[ "$TAG" == *-* ]] && pre=(--prerelease)
-            gh release create "$TAG" "${files[@]}" --generate-notes --verify-tag "${pre[@]}"
+            # The changelog's notes, then GitHub's list of the PRs merged since the last release.
+            gh release create "$TAG" "${files[@]}" --notes-file "$RUNNER_TEMP/notes.md" \
+              --generate-notes --verify-tag "${pre[@]}"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

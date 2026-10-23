@@ -15,6 +15,9 @@ step "cargo test"
 cargo test --locked
 step "release tag rules"
 bash scripts/test-release-tag.sh >/dev/null
+step "changelog"
+bash scripts/changelog.sh check
+bash scripts/test-changelog.sh >/dev/null
 step "build on the declared rust-version"
 bash scripts/msrv-check.sh --if-installed
 if command -v cargo-deny >/dev/null 2>&1; then
