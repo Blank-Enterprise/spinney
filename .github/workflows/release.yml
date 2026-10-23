@@ -47,10 +47,7 @@ jobs:
       - run: rustup update stable && rustup component add clippy rustfmt
       # No rust-cache here: a release builds from scratch, so no cached artifact can end up in what we publish.
       - name: Builds on the declared rust-version
-        run: |
-          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
-          rustup toolchain install "$msrv" --profile minimal
-          cargo +"$msrv" check --locked --all-targets
+        run: bash scripts/msrv-check.sh --install
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-deny
@@ -66,13 +63,7 @@ jobs:
       - run: cargo test --locked
       - run: bash scripts/bundle.sh "${TAG#v}"
       - name: Installer installs the bundle
-        run: |
-          plutil -lint dist/Spinney.app/Contents/Info.plist
-          apps="$RUNNER_TEMP/apps" && mkdir -p "$apps"
-          out=$(SPINNEY_ZIP="dist/$ASSET" SPINNEY_APP_DIR="$apps" bash install.sh </dev/null)
-          echo "$out"
-          [ "$out" = "Installed Spinney ${TAG#v} to $apps/Spinney.app" ] || { echo "unexpected install result"; exit 1; }
-          lipo -archs "$apps/Spinney.app/Contents/MacOS/spinney" | grep -qw arm64
+        run: bash scripts/smoke-install.sh "${TAG#v}"
       - name: Checksum
         run: cd dist && shasum -a 256 "$ASSET" > "$ASSET.sha256" && cat "$ASSET.sha256"
       # A prerelease (v1.2.0-rc.1) is never "latest", which install.sh downloads.
