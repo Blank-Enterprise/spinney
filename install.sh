@@ -27,7 +27,7 @@ main() {
   fi
   if [ "$VERSION" = beta ]; then
     VERSION="$(newest_release "$REPO")" || true
-    [ -n "$VERSION" ] || { echo "Could not find the newest release of $REPO." >&2; return 1; }
+    [ -n "$VERSION" ] && [ "$VERSION" != null ] || { echo "Could not find the newest release of $REPO." >&2; return 1; }
   fi
   if [ -n "$VERSION" ] && [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
     echo 'SPINNEY_VERSION must be a release tag like v1.0.0, or "beta".' >&2

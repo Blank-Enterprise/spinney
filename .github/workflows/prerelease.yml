@@ -41,8 +41,10 @@ jobs:
         run: |
           tag=$(bash scripts/release-tag.sh next "$CHANNEL")
           sha=$(git rev-parse HEAD)
-          # Through the API, so git holds no token. A lightweight tag; the release names it.
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
+          # Annotated, like the other release tags, and through the API, so git holds no token.
+          object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$tag" -f message="$tag" \
+            -f object="$sha" -f type=commit -q .sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$object" >/dev/null
           echo "Tagged $sha as $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
