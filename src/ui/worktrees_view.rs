@@ -49,6 +49,9 @@ pub struct Review {
     pub commit: Option<usize>,
     /// The picked commit's files.
     pub commit_files: Vec<FileDiff>,
+    /// Each of `commit_files`' lines added and removed (None for binary), counted once when
+    /// the commit is picked rather than every frame.
+    pub commit_lines: Vec<Option<(u32, u32)>>,
 }
 
 impl Review {
@@ -97,6 +100,7 @@ impl Review {
     fn clear_commit(&mut self) {
         self.commit = None;
         self.commit_files.clear();
+        self.commit_lines.clear();
     }
 
     /// Show commit `i`'s files, or all changes since the branch point for None.
@@ -109,6 +113,7 @@ impl Review {
             return Ok(());
         };
         self.commit_files = crate::diff::commit_diff(wt, &c.sha)?;
+        self.commit_lines = self.commit_files.iter().map(review::line_counts).collect();
         self.commit = Some(i);
         Ok(())
     }
@@ -621,7 +626,7 @@ fn commit_files(ui: &mut egui::Ui, tab: &ProjectTab, c: &Commit, actions: &mut V
         .show(ui, |ui| {
             for (i, f) in review.commit_files.iter().enumerate() {
                 let open = matches!(&tab.center, Center::Review(fd, _) if fd.path == f.path);
-                let right = match review::line_counts(f) {
+                let right = match review.commit_lines.get(i).copied().flatten() {
                     Some((a, r)) => format!("+{a} −{r}"),
                     None => "binary".into(),
                 };
